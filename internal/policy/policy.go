@@ -3,6 +3,7 @@
 package policy
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
@@ -93,4 +94,42 @@ func IsRecipientFailure(enhanced string) bool {
 		return true
 	}
 	return false
+}
+
+var throttleText = regexp.MustCompile(`(?i)\brate|too many`)
+
+// IsThrottle reports whether a deferral says the receiver wants us to slow
+// down: a 421, one of the enhanced codes receivers use for rate limits
+// (4.7.0, 4.7.28 at Gmail, 4.7.650 at Outlook, 4.3.2), or a reply that talks
+// about rates or "too many". Only replies from the receiver count (code
+// 4xx); a worker's own failures (connect errors, TLS policy) never do.
+func IsThrottle(outcome string, code int, enhanced, response string) bool {
+	if outcome != protocol.OutcomeDeferred || code < 400 || code > 499 {
+		return false
+	}
+	if code == 421 {
+		return true
+	}
+	switch strings.TrimSpace(enhanced) {
+	case "4.7.0", "4.7.28", "4.7.650", "4.3.2":
+		return true
+	}
+	return throttleText.MatchString(response)
+}
+
+// ThrottleBackoff is how long direct workers leave a domain alone after its
+// n-th consecutive throttling deferral (n starts at 1): 1, 2, 4, 8, 16
+// minutes, then 30 minutes.
+func ThrottleBackoff(n int) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	if n > 6 {
+		return 30 * time.Minute
+	}
+	d := time.Duration(1<<(n-1)) * time.Minute
+	if d > 30*time.Minute {
+		d = 30 * time.Minute
+	}
+	return d
 }

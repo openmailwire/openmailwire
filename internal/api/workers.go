@@ -23,6 +23,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "public_ip is not an IP address")
 		return
 	}
+	if !protocol.ValidKind(req.Kind) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", `kind must be "direct" or "relay"`)
+		return
+	}
 	draining, err := s.Store.Heartbeat(r.Context(), workerOf(r).ID, req)
 	if err != nil {
 		s.internal(w, "heartbeat", err)
@@ -38,6 +42,10 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
 		return
 	}
+	if !protocol.ValidKind(req.Kind) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", `kind must be "direct" or "relay"`)
+		return
+	}
 	wk := workerOf(r)
 	resp := protocol.LeaseResponse{Jobs: []protocol.Job{}}
 	if wk.Draining || req.Max < 1 {
@@ -47,7 +55,10 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	if req.Max > 100 {
 		req.Max = 100
 	}
-	jobs, err := s.Store.Lease(r.Context(), wk.ID, req.Max, s.Cfg.LeaseDuration, s.Cfg.DomainConcurrency)
+	jobs, err := s.Store.LeaseJobs(r.Context(), store.LeaseOptions{
+		WorkerID: wk.ID, Kind: req.Kind, Max: req.Max, Lease: s.Cfg.LeaseDuration,
+		DomainConcurrency: s.Cfg.DomainConcurrency, RelayAfterAttempts: s.Cfg.RelayAfterAttempts,
+	})
 	if err != nil {
 		s.internal(w, "lease", err)
 		return
@@ -86,7 +97,8 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "attempt_id or outcome is invalid")
 		return
 	}
-	status, err := s.Store.Report(r.Context(), workerOf(r).ID, rep)
+	status, err := s.Store.ReportAttempt(r.Context(), workerOf(r).ID, rep,
+		store.ReportOptions{DomainConcurrency: s.Cfg.DomainConcurrency})
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "attempt not found")
