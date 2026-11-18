@@ -1,6 +1,39 @@
-# OpenMailWire
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo.svg" width="96" height="96" alt="OpenMailWire logo: an envelope with an antenna">
+  </picture>
+</p>
 
-**Open-source email sending you run yourself.** An HTTP API for transactional email, DKIM signing, and workers that deliver straight to your recipients' mail servers from your own IP addresses.
+<h1 align="center">OpenMailWire</h1>
+
+<p align="center">
+  <b>Open-source email for AI agents</b>, and for the apps they run in.<br>
+  Send from your own domains and IPs, with every delivery attempt on record.
+</p>
+
+<p align="center">
+  <a href="https://github.com/openmailwire/openmailwire/actions/workflows/ci.yml"><img src="https://github.com/openmailwire/openmailwire/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/openmailwire/openmailwire/releases"><img src="https://img.shields.io/github/v/release/openmailwire/openmailwire" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0"></a>
+</p>
+
+An HTTP API for email, DKIM signing, and workers that deliver straight to your recipients' mail servers from your own IP addresses. Built so that an AI agent can use it as safely as a developer can.
+
+## Built for AI agents
+
+Agents are becoming email's busiest senders: support agents, sales agents, agents that confirm, remind and follow up. They need more than an SMTP relay:
+
+| What an agent needs | OpenMailWire | Status |
+|---|---|---|
+| **Use email as a tool.** Send, check delivery and set up domains from Claude, Cursor or any MCP client. | an MCP server, `openmailwire mcp`, plus a remote MCP endpoint | v0.3, in progress |
+| **Limits it cannot talk its way past.** A looping agent must not spam. | API keys per agent, with send caps and recipient allowlists, enforced by the server | v0.3 |
+| **Facts, not guesses.** "Did it arrive?" needs a real answer. | a per-recipient timeline with the receiver's exact SMTP reply, and `unknown` when the truth is unknown | available |
+| **Errors it can act on.** | errors name the cause and the next step, e.g. which DNS record is missing | available |
+| **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer | v0.4 |
+| **Docs written for models.** | `llms.txt` and an OpenAPI spec served by every control plane | v0.3 |
+
+## Why run it yourself
 
 - **You own the whole path.** No per-message fees, no shared IP pool with strangers, no third party that can pause your account.
 - **Every message has a timeline.** Queued, each attempt (which worker, which IP, which mail server, TLS or not, the receiver's exact reply), and the final state.
@@ -220,6 +253,13 @@ Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (
 
 ## Roadmap
 
+**Agent-first**
+- [ ] **MCP server**: stdio (`openmailwire mcp`) and remote (`/mcp`). Tools to send, track, and add and verify domains (v0.3).
+- [ ] **Agent keys**: per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key (v0.3).
+- [ ] **`llms.txt` and OpenAPI**, served by the control plane (v0.3).
+- [ ] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, and an inbound webhook and MCP tool (v0.4).
+
+**Delivery**
 - [ ] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC.
 - [x] **Signed webhooks**, Resend-compatible (v0.2).
 - [ ] **Complaint feedback loops**: `email.complained` from Yahoo, Microsoft and other feedback loops.
