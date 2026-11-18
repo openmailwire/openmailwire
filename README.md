@@ -27,7 +27,7 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 | What an agent needs | OpenMailWire | Status |
 |---|---|---|
 | **Use email as a tool.** Send, check delivery and set up domains from Claude, Cursor or any MCP client. | an MCP server: `openmailwire mcp` (stdio) and `/mcp` (remote) | available (v0.3) |
-| **Limits it cannot talk its way past.** A looping agent must not spam. | API keys per agent, with send caps and recipient allowlists, enforced by the server | v0.4 |
+| **Limits it cannot talk its way past.** A looping agent must not spam. | API keys per agent: sending-only permission, send caps per hour and day, sender and recipient allowlists, enforced by the server | available (v0.4) |
 | **Facts, not guesses.** "Did it arrive?" needs a real answer. | a per-recipient timeline with the receiver's exact SMTP reply, and `unknown` when the truth is unknown | available |
 | **Errors it can act on.** | errors name the cause and the next step, e.g. which DNS record is missing | available |
 | **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer | v0.4 |
@@ -35,12 +35,14 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 
 ### Connect an agent (MCP)
 
-Five tools:
+Seven tools:
 
 | Tool | What it does |
 |---|---|
-| `send_email` | Queue an email. It is marked destructive, so clients ask a human before sending. |
+| `send_email` | Queue an email, now or at `scheduled_at`. It is marked destructive, so clients ask a human before sending. |
 | `get_email` | Delivery status per recipient. It can wait up to 60 s for a final answer. |
+| `list_emails` | The emails sent, newest first, with each one's latest event. A sending-only key sees only its own. |
+| `cancel_email` | Stop a scheduled email before it is sent. |
 | `list_domains` | The domains this key can send from, and whether each is verified. |
 | `add_domain` | Add a domain and get the DNS records to publish. |
 | `verify_domain` | Check those records now, by domain name or id. |
@@ -74,7 +76,14 @@ Claude Desktop, Cursor and other clients that use JSON config:
 }
 ```
 
-Give each agent its own key (`openmailwire apikey create <project-id> <agent-name>`), so you can revoke one without affecting the others.
+Give each agent its own key, so you can limit it and revoke it without affecting the others:
+
+```sh
+openmailwire apikey create <project-id> support-agent --sending-only \
+  --max-per-hour 50 --max-per-day 500 --allow-from 'support@acme.com' --allow-to '*@acme.com'
+```
+
+A sending-only key can send, read and cancel its own emails, and read domains; it cannot add domains, webhooks or keys. The limits are enforced by the server, on every path that sends, MCP included. See [API keys](#api-keys).
 
 ## Why run it yourself
 
@@ -110,8 +119,10 @@ More detail: [docs/architecture.md](docs/architecture.md).
 
 ## Features
 
-- `POST /emails`: up to 50 recipients (to, cc and bcc together), HTML and text, reply-to, custom headers, tags, `Idempotency-Key`, and per-message expiry.
-- `GET /emails/{id}`: the status of each recipient, every attempt, and the event timeline.
+- `POST /emails`: up to 50 recipients (to, cc and bcc together), HTML and text, attachments (inline images too), reply-to, custom headers, tags, `Idempotency-Key`, per-message expiry, and scheduled sends that can be canceled.
+- `POST /emails/batch`: up to 100 emails, stored all or nothing.
+- `GET /emails/{id}`: the status of each recipient, every attempt, and the event timeline. `GET /emails` lists them, newest first.
+- API keys with a permission (full or sending-only) and a sending policy: caps per hour and per day, and sender and recipient allowlists. Every email records the key that sent it.
 - Domains: add a domain, get its DNS records (DKIM 2048-bit, SPF, return-path MX, DMARC), and verify them against live DNS.
 - Delivery:
   - MX lookup with preference order, implicit MX and null MX (RFC 7505).
@@ -191,12 +202,75 @@ Authenticate with `Authorization: Bearer <api key>`. Errors use Resend's shape: 
 | `tags` | `[{name, value}]` | Letters, digits, `_` and `-`. |
 | `expires_at` | RFC 3339 time | Default 48 h, at most 7 days. OpenMailWire makes no new attempts after this. |
 | `retry_uncertain` | bool | Default `true`. When an attempt's outcome is unknown, retry it (the recipient may get two copies) or stop. Use `false` for receipts. |
+| `scheduled_at` | RFC 3339 time | Send later: in the future, at most 30 days ahead. `expires_at` then counts from `scheduled_at`. Cancel with `POST /emails/{id}/cancel`. |
+| `attachments` | `[{filename, content, content_type?, content_id?}]` | `content` is the file, base64-encoded. `content_type` defaults from the file extension. A `content_id` makes the file inline: refer to it in the HTML as `cid:<content_id>`. At most 20 files and 10 MB (decoded) in total. |
 
 Header `Idempotency-Key`: the same key with the same body returns the same `id` (with `Idempotent-Replayed: true`). The same key with a different body returns `409`.
 
+Request bodies may be up to 20 MB for `POST /emails`, `/emails/batch` and `/emails/raw`, and 4 MB elsewhere.
+
+Attachments make the message `multipart/mixed`; inline files go in a `multipart/related` part with the HTML. Both are base64-encoded and covered by the DKIM signature.
+
+### `POST /emails/batch`
+
+A JSON array of 1 to 100 emails, each shaped like a `POST /emails` body without `attachments`. Every email is validated and checked against the key's policy first, and the key's caps apply to the batch as a whole; then all are stored in one transaction. If any email is refused, none is stored, and the error message names it (`emails[2]: …`).
+
+Returns `{"data": [{"id"}, …]}` in the same order. An `Idempotency-Key` on the batch is applied to each email as `<key>:<index>`.
+
+### `GET /emails`
+
+`GET /emails?limit=20&before=<email id>&api_key_id=<key id>` lists emails newest first: `{"object": "list", "data": [{id, from, to, subject, created_at, scheduled_at, last_event, api_key_id}], "has_more", "next_before"}`. Pass `next_before` as `before` to get the next page. `limit` is 1 to 100. A sending-only key lists only its own emails.
+
 ### `GET /emails/{id}`
 
-Returns `recipients[]` (status: `queued`, `sending`, `deferred`, `delivered`, `bounced`, `expired`, `suppressed` or `unknown`), `attempts[]` (worker, source IP, MX host, outcome, SMTP code, enhanced code, response, TLS) and `events[]`.
+Returns `recipients[]` (status: `queued`, `sending`, `deferred`, `delivered`, `bounced`, `expired`, `suppressed`, `unknown` or `canceled`), `attempts[]` (worker, source IP, MX host, outcome, SMTP code, enhanced code, response, TLS), `events[]`, `scheduled_at` and `api_key_id` (the key that sent it).
+
+### `POST /emails/{id}/cancel`
+
+Cancels every recipient that is still queued and has never been attempted, typically of a scheduled email. Returns `{"object": "email", "id", "canceled": [recipients]}`, records a `canceled` event per recipient and sends the `email.canceled` webhook. Answers `409 cannot_cancel` when nothing could be canceled.
+
+### API keys
+
+Each key has a **permission**:
+
+| Permission | Can call |
+|---|---|
+| `full_access` (default) | everything |
+| `sending_access` | `POST /emails`, `POST /emails/batch`, `POST /emails/raw`; `GET /emails` and `GET /emails/{id}` for its own emails; `POST /emails/{id}/cancel` for its own emails; `GET /domains` and `GET /domains/{id}`; and `/mcp`, whose tools have the same limits |
+
+Anything else answers `403 insufficient_permission`.
+
+Each key can also have a **policy**. Every field is optional; a missing field means no limit.
+
+```json
+{
+  "max_per_hour": 100,
+  "max_per_day": 1000,
+  "allowed_recipients": ["*@acme.com", "ops@example.org"],
+  "allowed_from": ["agent@acme.com", "*@support.acme.com"]
+}
+```
+
+- `max_per_hour` and `max_per_day` count the recipients the key queued in a rolling hour and a rolling 24 hours. Suppressed and canceled recipients do not count.
+- Patterns match lowercase addresses. `*` matches any characters within the local part or within the domain part, so `*@acme.com` does not match `a@mail.acme.com`; add `*@*.acme.com` for that.
+
+Refusals:
+
+| Rule broken | Status | `name` |
+|---|---|---|
+| sender not in `allowed_from` | 403 | `sender_not_allowed` |
+| a recipient not in `allowed_recipients` | 403 | `recipient_not_allowed`; the message names the first such recipient |
+| hourly or daily cap | 429 | `rate_limit_exceeded`, with a `Retry-After` header (seconds) |
+
+Endpoints (full access only):
+
+| Method | Path | |
+|---|---|---|
+| `POST` | `/api-keys` | `{"name", "permission", "policy"}`. Returns `201` with the key's fields and its `token`, shown once. |
+| `GET` | `/api-keys` | The project's live keys: `id`, `name`, `prefix`, `permission`, `policy`, `created_at`, `last_used_at` (updated at most once a minute). |
+| `GET` | `/api-keys/{id}` | One key. |
+| `PATCH` | `/api-keys/{id}` | `{"name"?, "policy"?}`. The policy is replaced whole; `{}` removes every limit. The permission cannot change. |
+| `DELETE` | `/api-keys/{id}` | Revokes the key at once. |
 
 ### Domains
 
@@ -239,6 +313,7 @@ Event types:
 | `email.failed` | the message expired before it could be delivered |
 | `email.suppressed` | the recipient is on the suppression list, so nothing was sent |
 | `email.delivery_unknown` | the outcome is unknown and `retry_uncertain` is `false` |
+| `email.canceled` | the recipient of a scheduled email was canceled before it was sent |
 
 Every event is about **one recipient**, and `data.to` holds only that recipient. The body uses Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
 
@@ -294,11 +369,21 @@ Worker (`openmailwire worker`):
 
 Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
 
+API key admin (it reads `DATABASE_URL`):
+
+```sh
+openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N] \
+  [--allow-to PATTERN]... [--allow-from PATTERN]...
+openmailwire apikey list <project-id>
+```
+
+`--allow-to` and `--allow-from` can be repeated. The same keys can be managed over the API (`/api-keys`).
+
 ## Roadmap
 
 **Agent-first**
 - [x] **MCP server**: stdio (`openmailwire mcp`) and remote (`/mcp`). Tools to send, track, and add and verify domains (v0.3).
-- [ ] **Agent keys**: per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key (v0.4).
+- [x] **Agent keys**: sending-only keys, per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key: every email records its key, and `GET /emails?api_key_id=` lists them (v0.4).
 - [ ] **`llms.txt` and OpenAPI**, served by the control plane (v0.4).
 - [ ] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, and an inbound webhook and MCP tool (v0.5).
 
@@ -309,7 +394,7 @@ Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (
 - [ ] **MTA-STS and DANE**: enforce TLS where receivers require it.
 - [ ] **Adaptive throttling**: learn per-receiver limits from 421 deferrals.
 - [ ] **Fallback relay worker**: hand mail to another provider when your IPs are throttled.
-- [ ] Attachments, scheduled sends and a batch endpoint.
+- [x] Attachments, scheduled sends and a batch endpoint (v0.4).
 - [ ] SMTP submission (port 587) for apps that only speak SMTP.
 - [ ] Dashboard, then SDKs for Node, Python, Go and PHP.
 

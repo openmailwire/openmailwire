@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,6 +21,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/openmailwire/openmailwire/internal/api"
+	"github.com/openmailwire/openmailwire/internal/apikey"
 	"github.com/openmailwire/openmailwire/internal/config"
 	"github.com/openmailwire/openmailwire/internal/domains"
 	"github.com/openmailwire/openmailwire/internal/mcpserver"
@@ -39,7 +43,10 @@ Usage:
   openmailwire migrate                        apply database migrations
   openmailwire keygen                         print a new OMW_SECRET_KEY
   openmailwire project create <name>          create a project and its first API key
-  openmailwire apikey create <project-id> [name]
+  openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
+                       [--allow-to PATTERN]... [--allow-from PATTERN]...
+                                              create an API key, e.g. one per agent, with its limits
+  openmailwire apikey list <project-id>       list a project's live API keys
   openmailwire workers add <name>             register a worker and print its token
   openmailwire workers list
   openmailwire workers drain <name>           stop giving the worker new jobs
@@ -208,22 +215,129 @@ func projectCmd(ctx context.Context, args []string) error {
 	})
 }
 
-func apikeyCmd(ctx context.Context, args []string) error {
-	if len(args) < 2 || args[0] != "create" {
-		return errors.New("usage: openmailwire apikey create <project-id> [name]")
+const apikeyUsage = `usage:
+  openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
+                             [--allow-to PATTERN]... [--allow-from PATTERN]...
+  openmailwire apikey list <project-id>
+
+Patterns match addresses; "*" matches any characters within the local part
+or the domain part: --allow-to '*@acme.com' --allow-from agent@acme.com`
+
+// patterns collects a repeatable flag.
+type patterns []string
+
+func (p *patterns) String() string     { return strings.Join(*p, ",") }
+func (p *patterns) Set(v string) error { *p = append(*p, v); return nil }
+
+// parseInterspersed parses flags that may come before, between or after the
+// positional arguments, and returns the positional ones.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			return pos, nil
+		}
+		pos = append(pos, args[0])
+		args = args[1:]
 	}
-	name := ""
-	if len(args) > 2 {
-		name = args[2]
+}
+
+func apikeyCmd(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New(apikeyUsage)
+	}
+	switch args[0] {
+	case "create":
+		return apikeyCreate(ctx, args[1:])
+	case "list":
+		if len(args) != 2 {
+			return errors.New(apikeyUsage)
+		}
+		return apikeyList(ctx, args[1])
+	}
+	return errors.New(apikeyUsage)
+}
+
+func apikeyCreate(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("apikey create", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	sendingOnly := fs.Bool("sending-only", false, "")
+	perHour := fs.Int("max-per-hour", 0, "")
+	perDay := fs.Int("max-per-day", 0, "")
+	var allowTo, allowFrom patterns
+	fs.Var(&allowTo, "allow-to", "")
+	fs.Var(&allowFrom, "allow-from", "")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return fmt.Errorf("%v\n\n%s", err, apikeyUsage)
+	}
+	if len(pos) != 2 {
+		return errors.New(apikeyUsage)
+	}
+	projectID, name := pos[0], pos[1]
+	var policy apikey.Policy
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "max-per-hour":
+			policy.MaxPerHour = perHour
+		case "max-per-day":
+			policy.MaxPerDay = perDay
+		}
+	})
+	if len(allowTo) > 0 {
+		policy.AllowedRecipients = allowTo
+	}
+	if len(allowFrom) > 0 {
+		policy.AllowedFrom = allowFrom
+	}
+	if err := policy.Normalize(); err != nil {
+		return err
+	}
+	permission := apikey.FullAccess
+	if *sendingOnly {
+		permission = apikey.SendingAccess
 	}
 	return withStore(ctx, func(st *store.Store) error {
-		token, err := newAPIKey(ctx, st, args[1], name)
+		token, hash := secret.NewToken("omw_")
+		k, err := st.NewAPIKey(ctx, store.APIKey{
+			ProjectID: projectID, Name: name, Prefix: token[:10], Permission: permission, Policy: policy,
+		}, hash)
+		if err != nil {
+			return fmt.Errorf("create key (is %s a project id?): %w", projectID, err)
+		}
+		fmt.Printf("api key     %s\nid          %s\npermission  %s\npolicy      %s\n\nThe key is shown once. Store it now.\n",
+			token, k.ID, k.Permission, policyJSON(k.Policy))
+		return nil
+	})
+}
+
+func apikeyList(ctx context.Context, projectID string) error {
+	return withStore(ctx, func(st *store.Store) error {
+		keys, err := st.ListAPIKeys(ctx, projectID)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("api key  %s\n\nThe key is shown once. Store it now.\n", token)
-		return nil
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tPERMISSION\tPOLICY\tCREATED\tLAST USED")
+		for _, k := range keys {
+			used := "never"
+			if k.LastUsedAt != nil {
+				used = k.LastUsedAt.UTC().Format(time.RFC3339)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s…\t%s\t%s\t%s\t%s\n", k.ID, k.Name, k.Prefix, k.Permission, policyJSON(k.Policy),
+				k.CreatedAt.UTC().Format(time.RFC3339), used)
+		}
+		return tw.Flush()
 	})
+}
+
+func policyJSON(p apikey.Policy) string {
+	b, _ := json.Marshal(p)
+	return string(b)
 }
 
 func newAPIKey(ctx context.Context, st *store.Store, projectID, name string) (string, error) {

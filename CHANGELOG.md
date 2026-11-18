@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### API keys for agents
+
+Give each agent its own key, with limits the server enforces on every path that sends, MCP included.
+
+- **Permission:** `full_access` (the default) or `sending_access`. A sending key can send, read and cancel its own emails, and read domains. Anything else answers `403 insufficient_permission`.
+- **Policy** (every field optional):
+  - `max_per_hour` and `max_per_day`: recipients queued in a rolling window. Suppressed and canceled recipients do not count.
+  - `allowed_from` and `allowed_recipients`: address patterns where `*` matches within the local part or the domain part.
+- **Refusals:** `403 sender_not_allowed`, `403 recipient_not_allowed` (naming the first such recipient), and `429 rate_limit_exceeded` with a `Retry-After` header that says when enough of the window frees up. Caps are checked again under a per-key lock when the email is stored, so parallel requests cannot overshoot them.
+- **Endpoints** (full access only): `GET /api-keys`, `POST /api-keys` (the token is shown once), `GET /api-keys/{id}`, `PATCH /api-keys/{id}` (name and policy) and `DELETE /api-keys/{id}` (revokes).
+- `last_used_at` is recorded, at most once a minute.
+- **CLI:** `openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N] [--allow-to PATTERN]... [--allow-from PATTERN]...` and `openmailwire apikey list <project-id>`.
+
+### Email API
+
+- **Attachments** on `POST /emails`: `[{filename, content (base64), content_type?, content_id?}]`.
+  - Regular files make the message `multipart/mixed`.
+  - A `content_id` makes a file inline, in a `multipart/related` part with the HTML.
+  - At most 20 files and 10 MB decoded. DKIM covers them.
+- **Request bodies** may be up to 20 MB for `/emails`, `/emails/batch` and `/emails/raw` (4 MB elsewhere).
+- **Scheduled sends:** `scheduled_at` (RFC 3339, at most 30 days ahead) adds a `scheduled` event, and `expires_at` counts from it.
+- **`POST /emails/{id}/cancel`** cancels every recipient still queued and never attempted. The new delivery status `canceled` comes with a `canceled` event and the `email.canceled` webhook. Answers `409 cannot_cancel` when nothing is left to cancel.
+- **`POST /emails/batch`:** 1 to 100 emails, all validated and policy-checked first, then stored in one transaction; all or nothing. `Idempotency-Key` applies per email as `<key>:<index>`.
+- **`GET /emails`:** newest first, with `limit`, `before` (cursor) and `api_key_id` filters.
+- Every email records the key that sent it (`api_key_id`, also in `GET /emails/{id}`). A sending key sees only its own emails.
+
+### MCP
+
+- `send_email` takes `scheduled_at`.
+- New tools: `list_emails` and `cancel_email` (marked destructive).
+
+### Migration
+
+`0003_keys_and_email_api.sql` runs on start. It adds:
+- `permission`, `policy` and `last_used_at` to `api_keys`;
+- `api_key_id`, `scheduled_at` and `quota_rcpts` to `emails`, with an index on `(project_id, api_key_id, created_at)`;
+- `canceled` to the delivery statuses.
+
+Existing keys keep full access with no limits.
+
 ## v0.3.0: MCP server for AI agents
 
 OpenMailWire is now built for AI agents first.

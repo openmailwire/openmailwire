@@ -9,7 +9,7 @@ OpenMailWire has two roles, built into one binary.
 
 ## Life of a message
 
-1. **Submit.** `POST /emails` validates the request, renders the MIME message, signs it with the domain's DKIM key, and encrypts it. In one transaction it inserts the email, one *delivery* per recipient, and a `queued` event, then returns `{"id"}`. A suppressed recipient gets a `suppressed` delivery instead of a queued one.
+1. **Submit.** `POST /emails` validates the request and checks the API key's policy (allowed senders and recipients, send caps). It renders the MIME message, signs it with the domain's DKIM key, and encrypts it. In one transaction it inserts the email, one *delivery* per recipient, and a `queued` event, then returns `{"id"}`. A suppressed recipient gets a `suppressed` delivery instead of a queued one. A scheduled email's deliveries are not due until `scheduled_at`.
 2. **Lease.** A worker asks for up to N jobs. In one statement the control plane:
    - picks due deliveries (`FOR UPDATE SKIP LOCKED`), skipping recipient domains that are already at the in-flight cap;
    - marks them `sending`;
@@ -28,6 +28,7 @@ queued ──lease──▶ sending ──report──▶ delivered
    └──── deferred ◀──┤                 unknown     (lost final reply, and retry_uncertain = false)
                      └─lease expired──▶ deferred or unknown (by retry_uncertain)
 suppressed  (the address was on the project's suppression list when the email was submitted)
+canceled    (POST /emails/{id}/cancel, while the delivery was queued and never attempted)
 ```
 
 ## Outcomes, and why `unknown` exists
@@ -67,6 +68,7 @@ A unique index handles two requests that race.
 - **Encryption at rest.** DKIM private keys and message bodies are sealed with AES-256-GCM under `OMW_SECRET_KEY`. Bodies are deleted after `OMW_RETENTION`.
 - **Workers get only what they need:** signed messages, one lease at a time. They never see DKIM keys or other projects' data beyond the jobs they carry.
 - **Project isolation.** A project's API key can read only that project's messages and domains.
+- **Key permissions and policies.** A `sending_access` key can only send and read its own emails. A key's policy (allowed senders and recipients, hourly and daily caps) is enforced in one place, `authorizeSend`, by every path that queues mail. The caps are re-checked under a per-key advisory lock in the insert transaction, so concurrent requests cannot overshoot them.
 - **Signed bounce addresses.** VERP addresses carry an HMAC (a key derived from the secret key), so a future bounce processor can reject forged bounces.
 
 ## Database

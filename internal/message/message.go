@@ -1,20 +1,25 @@
 // Package message builds RFC 5322 messages: encoded non-ASCII headers,
-// quoted-printable bodies and CRLF line endings, ready for DKIM signing.
+// quoted-printable bodies, base64 attachments and CRLF line endings, ready
+// for DKIM signing.
 package message
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
-	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
-	"net/textproto"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Input struct {
@@ -28,7 +33,28 @@ type Input struct {
 	Headers   map[string]string
 	MessageID string // without angle brackets
 	Date      time.Time
+	// Attachments with a ContentID are inline (multipart/related); the
+	// others are regular attachments (multipart/mixed).
+	Attachments []Attachment
 }
+
+// Attachment is a file sent with the message, base64-encoded.
+type Attachment struct {
+	Filename string
+	// ContentType defaults to the type for the filename's extension, or
+	// application/octet-stream.
+	ContentType string
+	// ContentID makes the attachment inline: the HTML refers to it as
+	// cid:<ContentID>. Without angle brackets.
+	ContentID string
+	Data      []byte
+}
+
+// Limits on attachments.
+const (
+	MaxAttachments     = 20
+	MaxAttachmentBytes = 10 << 20 // decoded, all attachments together
+)
 
 // Headers OpenMailWire writes itself. Callers cannot set them.
 var reserved = map[string]bool{
@@ -112,42 +138,217 @@ func Build(in Input) ([]byte, error) {
 		header(&b, k, encodeText(in.Headers[k]))
 	}
 
-	const textType = `text/plain; charset="utf-8"`
-	const htmlType = `text/html; charset="utf-8"`
-	if in.Text != "" && in.HTML != "" {
-		mw := multipart.NewWriter(&b)
-		header(&b, "Content-Type", `multipart/alternative; boundary="`+mw.Boundary()+`"`)
-		b.WriteString("\r\n")
-		for _, p := range []struct{ ct, body string }{{textType, in.Text}, {htmlType, in.HTML}} {
-			w, err := mw.CreatePart(textproto.MIMEHeader{
-				"Content-Type":              {p.ct},
-				"Content-Transfer-Encoding": {"quoted-printable"},
-			})
-			if err != nil {
-				return nil, err
-			}
-			if err := writeQP(w, p.body); err != nil {
-				return nil, err
-			}
-		}
-		if err := mw.Close(); err != nil {
-			return nil, err
-		}
-		return b.Bytes(), nil
-	}
-
-	ct, body := textType, in.Text
-	if in.HTML != "" {
-		ct, body = htmlType, in.HTML
-	}
-	header(&b, "Content-Type", ct)
-	header(&b, "Content-Transfer-Encoding", "quoted-printable")
-	b.WriteString("\r\n")
-	if err := writeQP(&b, body); err != nil {
+	atts, err := attachmentParts(in.Attachments)
+	if err != nil {
 		return nil, err
 	}
+	body := bodyPart(in.Text, in.HTML)
+	var inline, regular []part
+	for i, a := range in.Attachments {
+		if a.ContentID != "" {
+			inline = append(inline, atts[i])
+		} else {
+			regular = append(regular, atts[i])
+		}
+	}
+	if len(inline) > 0 {
+		body = multipartPart("related", append([]part{body}, inline...))
+	}
+	if len(regular) > 0 {
+		body = multipartPart("mixed", append([]part{body}, regular...))
+	}
+	for _, h := range body.header {
+		header(&b, h[0], h[1])
+	}
 	b.WriteString("\r\n")
+	if err := body.write(&b); err != nil {
+		return nil, err
+	}
+	if !body.multipart {
+		b.WriteString("\r\n")
+	}
 	return b.Bytes(), nil
+}
+
+// part is one MIME entity: its headers, in order, and its body.
+type part struct {
+	header    [][2]string
+	write     func(io.Writer) error
+	multipart bool
+}
+
+const (
+	textType = `text/plain; charset="utf-8"`
+	htmlType = `text/html; charset="utf-8"`
+)
+
+func textPart(ct, body string) part {
+	return part{
+		header: [][2]string{{"Content-Type", ct}, {"Content-Transfer-Encoding", "quoted-printable"}},
+		write:  func(w io.Writer) error { return writeQP(w, body) },
+	}
+}
+
+// bodyPart is the text, the HTML, or both as multipart/alternative.
+func bodyPart(text, html string) part {
+	switch {
+	case text != "" && html != "":
+		return multipartPart("alternative", []part{textPart(textType, text), textPart(htmlType, html)})
+	case html != "":
+		return textPart(htmlType, html)
+	default:
+		return textPart(textType, text)
+	}
+}
+
+func multipartPart(subtype string, children []part) part {
+	boundary := newBoundary()
+	return part{
+		header:    [][2]string{{"Content-Type", "multipart/" + subtype + `; boundary="` + boundary + `"`}},
+		multipart: true,
+		write: func(w io.Writer) error {
+			for i, c := range children {
+				sep := "\r\n--" + boundary + "\r\n"
+				if i == 0 {
+					sep = sep[2:]
+				}
+				if _, err := io.WriteString(w, sep); err != nil {
+					return err
+				}
+				for _, h := range c.header {
+					if _, err := io.WriteString(w, h[0]+": "+h[1]+"\r\n"); err != nil {
+						return err
+					}
+				}
+				if _, err := io.WriteString(w, "\r\n"); err != nil {
+					return err
+				}
+				if err := c.write(w); err != nil {
+					return err
+				}
+			}
+			_, err := io.WriteString(w, "\r\n--"+boundary+"--\r\n")
+			return err
+		},
+	}
+}
+
+// newBoundary returns a random multipart boundary. The "=_" cannot occur
+// in quoted-printable or base64 output, so no part can contain it.
+func newBoundary() string {
+	b := make([]byte, 15)
+	rand.Read(b)
+	return "=_omw_" + hex.EncodeToString(b)
+}
+
+var contentIDRE = regexp.MustCompile("^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.@-]{1,250}$")
+
+// ValidateAttachments checks attachments against the limits and refuses
+// names, types and content IDs that cannot be written safely.
+func ValidateAttachments(atts []Attachment) error {
+	_, err := attachmentParts(atts)
+	return err
+}
+
+func attachmentParts(atts []Attachment) ([]part, error) {
+	if len(atts) > MaxAttachments {
+		return nil, fmt.Errorf("at most %d attachments per email", MaxAttachments)
+	}
+	total := 0
+	cids := map[string]bool{}
+	parts := make([]part, 0, len(atts))
+	for i, a := range atts {
+		total += len(a.Data)
+		if total > MaxAttachmentBytes {
+			return nil, fmt.Errorf("attachments total more than %d MB decoded; link large files instead", MaxAttachmentBytes>>20)
+		}
+		if err := validFilename(a.Filename); err != nil {
+			return nil, fmt.Errorf("attachments[%d]: %w", i, err)
+		}
+		ct, err := attachmentType(a)
+		if err != nil {
+			return nil, fmt.Errorf("attachments[%d]: %w", i, err)
+		}
+		disposition := "attachment"
+		h := [][2]string{{"Content-Type", ct}}
+		if a.ContentID != "" {
+			if !contentIDRE.MatchString(a.ContentID) {
+				return nil, fmt.Errorf("attachments[%d]: content_id %q may hold only letters, digits and !#$%%&'*+/=?^_`{|}~.@- (1-250 characters), without angle brackets", i, a.ContentID)
+			}
+			if cids[a.ContentID] {
+				return nil, fmt.Errorf("attachments[%d]: content_id %q is used twice", i, a.ContentID)
+			}
+			cids[a.ContentID] = true
+			disposition = "inline"
+			h = append(h, [2]string{"Content-ID", "<" + a.ContentID + ">"})
+		}
+		h = append(h,
+			[2]string{"Content-Disposition", fold(mime.FormatMediaType(disposition, map[string]string{"filename": a.Filename}))},
+			[2]string{"Content-Transfer-Encoding", "base64"})
+		data := a.Data
+		parts = append(parts, part{header: h, write: func(w io.Writer) error { return writeBase64(w, data) }})
+	}
+	return parts, nil
+}
+
+func validFilename(name string) error {
+	switch {
+	case name == "":
+		return errors.New("filename is required")
+	case len(name) > 255:
+		return errors.New("filename is longer than 255 bytes")
+	case !utf8.ValidString(name):
+		return errors.New("filename is not valid UTF-8")
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("filename contains a control character")
+		}
+	}
+	return nil
+}
+
+// attachmentType returns the Content-Type header value, with the name
+// parameter that older mail clients use.
+func attachmentType(a Attachment) (string, error) {
+	ct := a.ContentType
+	if ct == "" {
+		ct = mime.TypeByExtension(strings.ToLower(path.Ext(a.Filename)))
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+	}
+	mt, params, err := mime.ParseMediaType(ct)
+	if err != nil || !strings.Contains(mt, "/") {
+		return "", fmt.Errorf("content_type %q is not a media type like application/pdf", a.ContentType)
+	}
+	if strings.HasPrefix(mt, "multipart/") || strings.HasPrefix(mt, "message/") {
+		return "", fmt.Errorf("content_type %s cannot be sent as an attachment; use application/octet-stream", mt)
+	}
+	params["name"] = a.Filename
+	v := mime.FormatMediaType(mt, params)
+	if v == "" {
+		return "", fmt.Errorf("content_type %q is not a media type like application/pdf", a.ContentType)
+	}
+	return fold(v), nil
+}
+
+// fold puts each parameter of a header value on its own line. Unfolding
+// gives back exactly the same value.
+func fold(v string) string { return strings.ReplaceAll(v, "; ", ";\r\n ") }
+
+// writeBase64 writes data in 76-character lines (RFC 2045).
+func writeBase64(w io.Writer, data []byte) error {
+	enc := base64.StdEncoding.EncodeToString(data)
+	var b strings.Builder
+	for len(enc) > 76 {
+		b.WriteString(enc[:76])
+		b.WriteString("\r\n")
+		enc = enc[76:]
+	}
+	b.WriteString(enc)
+	_, err := io.WriteString(w, b.String())
+	return err
 }
 
 func header(b *bytes.Buffer, name, value string) {

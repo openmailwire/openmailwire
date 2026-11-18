@@ -39,9 +39,10 @@ const (
 	EmailFailed          = "email.failed"
 	EmailSuppressed      = "email.suppressed"
 	EmailDeliveryUnknown = "email.delivery_unknown"
+	EmailCanceled        = "email.canceled"
 )
 
-var Types = []string{EmailSent, EmailDelivered, EmailDeliveryDelayed, EmailBounced, EmailFailed, EmailSuppressed, EmailDeliveryUnknown}
+var Types = []string{EmailSent, EmailDelivered, EmailDeliveryDelayed, EmailBounced, EmailFailed, EmailSuppressed, EmailDeliveryUnknown, EmailCanceled}
 
 func ValidType(t string) bool {
 	for _, v := range Types {
@@ -70,6 +71,8 @@ func ExternalType(internal string) string {
 		return EmailSuppressed
 	case "unknown":
 		return EmailDeliveryUnknown
+	case "canceled":
+		return EmailCanceled
 	}
 	return ""
 }

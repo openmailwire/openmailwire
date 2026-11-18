@@ -2,17 +2,17 @@ package api
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/mail"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/openmailwire/openmailwire/internal/dkimkey"
 	"github.com/openmailwire/openmailwire/internal/message"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/store"
@@ -21,6 +21,8 @@ import (
 const (
 	maxRecipients = 50
 	maxExpiry     = 7 * 24 * time.Hour
+	maxSchedule   = 30 * 24 * time.Hour
+	maxBatch      = 100
 )
 
 // strList accepts "a@b.c" or ["a@b.c", …], like Resend.
@@ -47,29 +49,181 @@ type tag struct {
 	Value string `json:"value"`
 }
 
+type attachmentRequest struct {
+	Filename    string `json:"filename"`
+	Content     string `json:"content"` // base64
+	ContentType string `json:"content_type"`
+	ContentID   string `json:"content_id"`
+}
+
 type sendRequest struct {
-	From           string            `json:"from"`
-	To             strList           `json:"to"`
-	Cc             strList           `json:"cc"`
-	Bcc            strList           `json:"bcc"`
-	ReplyTo        strList           `json:"reply_to"`
-	Subject        string            `json:"subject"`
-	HTML           string            `json:"html"`
-	Text           string            `json:"text"`
-	Headers        map[string]string `json:"headers"`
-	Tags           []tag             `json:"tags"`
-	ExpiresAt      *time.Time        `json:"expires_at"`
-	RetryUncertain *bool             `json:"retry_uncertain"`
+	From           string              `json:"from"`
+	To             strList             `json:"to"`
+	Cc             strList             `json:"cc"`
+	Bcc            strList             `json:"bcc"`
+	ReplyTo        strList             `json:"reply_to"`
+	Subject        string              `json:"subject"`
+	HTML           string              `json:"html"`
+	Text           string              `json:"text"`
+	Headers        map[string]string   `json:"headers"`
+	Tags           []tag               `json:"tags"`
+	ExpiresAt      *time.Time          `json:"expires_at"`
+	ScheduledAt    *time.Time          `json:"scheduled_at"`
+	RetryUncertain *bool               `json:"retry_uncertain"`
+	Attachments    []attachmentRequest `json:"attachments"`
 }
 
 var tagRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
 
-func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	pid := projectID(r)
-	body, err := io.ReadAll(r.Body)
+// sendPlan is a validated send request, ready to render.
+type sendPlan struct {
+	req            sendRequest
+	from           string // the sender address, lowercase
+	fromDomain     string
+	recipients     []string
+	tags           map[string]string
+	attachments    []message.Attachment
+	retryUncertain bool
+	scheduled      *time.Time
+	expires        time.Time
+}
+
+// validateSend checks a send request without touching the database.
+func validateSend(req sendRequest, now time.Time, defaultExpiry time.Duration) (*sendPlan, *policyError) {
+	from, err := mail.ParseAddress(req.From)
 	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body is too large")
+		return nil, invalid("from: %v", err)
+	}
+	p := &sendPlan{req: req, from: strings.ToLower(from.Address), tags: map[string]string{}, retryUncertain: true}
+	p.fromDomain = domainOf(p.from)
+	switch {
+	case len(req.To) == 0:
+		return nil, invalid("to is required")
+	case strings.TrimSpace(req.Subject) == "":
+		return nil, invalid("subject is required")
+	case len(req.Subject) > 998:
+		return nil, invalid("subject is longer than 998 bytes")
+	case req.HTML == "" && req.Text == "":
+		return nil, invalid("html or text is required")
+	}
+	if p.recipients, err = envelope(req.To, req.Cc, req.Bcc); err != nil {
+		return nil, invalid("%v", err)
+	}
+	for _, a := range req.ReplyTo {
+		if _, err := mail.ParseAddress(a); err != nil {
+			return nil, invalid("reply_to %q: %v", a, err)
+		}
+	}
+	if err := message.ValidateHeaders(req.Headers); err != nil {
+		return nil, invalid("%v", err)
+	}
+	for _, t := range req.Tags {
+		if !tagRE.MatchString(t.Name) || !tagRE.MatchString(t.Value) {
+			return nil, invalid("tag names and values may contain only letters, digits, _ and - (1-256 characters)")
+		}
+		p.tags[t.Name] = t.Value
+	}
+	if p.attachments, err = decodeAttachments(req.Attachments); err != nil {
+		return nil, invalid("%v", err)
+	}
+
+	start := now
+	if req.ScheduledAt != nil {
+		at := req.ScheduledAt.UTC()
+		if !at.After(now) || at.After(now.Add(maxSchedule)) {
+			return nil, invalid("scheduled_at must be in the future and at most 30 days ahead (RFC 3339, e.g. %s)",
+				now.Add(time.Hour).Format(time.RFC3339))
+		}
+		p.scheduled, start = &at, at
+	}
+	p.expires = start.Add(defaultExpiry)
+	if req.ExpiresAt != nil {
+		if !req.ExpiresAt.After(start) || req.ExpiresAt.After(start.Add(maxExpiry)) {
+			if p.scheduled != nil {
+				return nil, invalid("expires_at must be after scheduled_at and within 7 days of it")
+			}
+			return nil, invalid("expires_at must be in the future and within 7 days")
+		}
+		p.expires = req.ExpiresAt.UTC()
+	}
+	if req.RetryUncertain != nil {
+		p.retryUncertain = *req.RetryUncertain
+	}
+	return p, nil
+}
+
+// decodeAttachments decodes base64 content and checks the limits.
+func decodeAttachments(in []attachmentRequest) ([]message.Attachment, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	if len(in) > message.MaxAttachments {
+		return nil, fmt.Errorf("at most %d attachments per email", message.MaxAttachments)
+	}
+	out := make([]message.Attachment, 0, len(in))
+	total := 0
+	for i, a := range in {
+		if a.Content == "" {
+			return nil, fmt.Errorf("attachments[%d]: content is required (the file, base64-encoded)", i)
+		}
+		data, err := decodeBase64(a.Content)
+		if err != nil {
+			return nil, fmt.Errorf("attachments[%d]: content is not valid base64: %v", i, err)
+		}
+		if total += len(data); total > message.MaxAttachmentBytes {
+			return nil, fmt.Errorf("attachments total more than %d MB decoded; link large files instead", message.MaxAttachmentBytes>>20)
+		}
+		out = append(out, message.Attachment{
+			Filename: a.Filename, ContentType: a.ContentType,
+			ContentID: strings.TrimSuffix(strings.TrimPrefix(a.ContentID, "<"), ">"), Data: data,
+		})
+	}
+	return out, message.ValidateAttachments(out)
+}
+
+// decodeBase64 accepts standard base64, with or without padding and line
+// breaks.
+func decodeBase64(s string) ([]byte, error) {
+	s = strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s)%4 != 0 {
+		return base64.RawStdEncoding.DecodeString(strings.TrimRight(s, "="))
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// newEmail renders and signs the message for a validated plan. The caller
+// sets the idempotency key and request hash; queue sets the project and key.
+func (s *Server) newEmail(p *sendPlan, dom store.Domain, now time.Time) (store.NewEmail, *policyError) {
+	id := secret.UUID()
+	req := p.req
+	raw, err := message.Build(message.Input{
+		From: req.From, To: req.To, Cc: req.Cc, ReplyTo: req.ReplyTo,
+		Subject: req.Subject, Text: req.Text, HTML: req.HTML, Headers: req.Headers,
+		MessageID: id + "@" + dom.Name, Date: now, Attachments: p.attachments,
+	})
+	if err != nil {
+		return store.NewEmail{}, invalid("%v", err)
+	}
+	signed, pe := s.signMessage(dom, raw)
+	if pe != nil {
+		return store.NewEmail{}, pe
+	}
+	return store.NewEmail{
+		ID: id, DomainID: dom.ID, From: req.From, To: req.To, Cc: req.Cc, Bcc: req.Bcc, Subject: req.Subject,
+		MessageID: id + "@" + dom.Name, ReturnPath: dom.ReturnPath, Raw: s.Sealer.Seal(signed),
+		Tags: p.tags, RetryUncertain: p.retryUncertain, ExpiresAt: p.expires, ScheduledAt: p.scheduled,
+		Recipients: p.recipients,
+	}, nil
+}
+
+func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody(w, r)
+	if !ok {
 		return
 	}
 	var req sendRequest
@@ -77,134 +231,170 @@ func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
 		return
 	}
-	idem := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	if len(idem) > 256 {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "Idempotency-Key is longer than 256 characters")
-		return
-	}
-
-	from, err := mail.ParseAddress(req.From)
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "from: "+err.Error())
-		return
-	}
-	fromDomain := strings.ToLower(domainOf(from.Address))
-	switch {
-	case len(req.To) == 0:
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "to is required")
-		return
-	case strings.TrimSpace(req.Subject) == "":
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "subject is required")
-		return
-	case len(req.Subject) > 998:
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "subject is longer than 998 bytes")
-		return
-	case req.HTML == "" && req.Text == "":
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "html or text is required")
-		return
-	}
-	recipients, err := envelope(req.To, req.Cc, req.Bcc)
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
-		return
-	}
-	if pe := s.authorizeSend(r, strings.ToLower(from.Address), recipients); pe != nil {
+	idem, pe := idempotencyKey(r)
+	if pe != nil {
 		pe.write(w)
 		return
 	}
-	for _, a := range req.ReplyTo {
-		if _, err := mail.ParseAddress(a); err != nil {
-			writeError(w, http.StatusUnprocessableEntity, "validation_error", fmt.Sprintf("reply_to %q: %v", a, err))
-			return
-		}
-	}
-	if err := message.ValidateHeaders(req.Headers); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	hash := sha256.Sum256(body)
+	if s.replayed(w, r, idem, hash[:]) {
 		return
-	}
-	tags := map[string]string{}
-	for _, t := range req.Tags {
-		if !tagRE.MatchString(t.Name) || !tagRE.MatchString(t.Value) {
-			writeError(w, http.StatusUnprocessableEntity, "validation_error", "tag names and values may contain only letters, digits, _ and - (1-256 characters)")
-			return
-		}
-		tags[t.Name] = t.Value
 	}
 	now := time.Now().UTC()
-	expires := now.Add(s.Cfg.DefaultExpiry)
-	if req.ExpiresAt != nil {
-		if !req.ExpiresAt.After(now) || req.ExpiresAt.After(now.Add(maxExpiry)) {
-			writeError(w, http.StatusUnprocessableEntity, "validation_error", "expires_at must be in the future and within 7 days")
-			return
-		}
-		expires = req.ExpiresAt.UTC()
-	}
-	retryUncertain := true
-	if req.RetryUncertain != nil {
-		retryUncertain = *req.RetryUncertain
-	}
-
-	dom, err := s.Store.DomainByName(ctx, pid, fromDomain)
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusForbidden, "domain_not_found",
-			fmt.Sprintf("the domain %s is not added to this project; add it with POST /domains", fromDomain))
+	plan, pe := validateSend(req, now, s.Cfg.DefaultExpiry)
+	if pe != nil {
+		pe.write(w)
 		return
 	}
-	if err != nil {
-		s.internal(w, "domain lookup", err)
+	if pe := s.authorizeSend(r, plan.from, plan.recipients); pe != nil {
+		pe.write(w)
 		return
 	}
-	if dom.Status != "verified" && !s.Cfg.AllowUnverified {
-		writeError(w, http.StatusForbidden, "domain_not_verified",
-			fmt.Sprintf("the domain %s is not verified yet; publish its DNS records and call POST /domains/%s/verify", dom.Name, dom.ID))
+	dom, pe := s.senderDomain(r.Context(), projectID(r), plan.fromDomain)
+	if pe != nil {
+		pe.write(w)
 		return
 	}
-	der, err := s.Sealer.Open(dom.DKIMPrivate)
-	if err != nil {
-		s.internal(w, "unseal dkim key", err)
+	e, pe := s.newEmail(plan, dom, now)
+	if pe != nil {
+		pe.write(w)
 		return
 	}
-	key, err := dkimkey.ParsePrivate(der)
-	if err != nil {
-		s.internal(w, "parse dkim key", err)
+	e.IdempotencyKey, e.RequestHash = idem, hash[:]
+	out, pe := s.queue(r, []store.NewEmail{e})
+	if pe != nil {
+		pe.write(w)
 		return
 	}
-
-	id := secret.UUID()
-	raw, err := message.Build(message.Input{
-		From: req.From, To: req.To, Cc: req.Cc, ReplyTo: req.ReplyTo,
-		Subject: req.Subject, Text: req.Text, HTML: req.HTML, Headers: req.Headers,
-		MessageID: id + "@" + dom.Name, Date: now,
-	})
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
-		return
-	}
-	signed, err := dkimkey.Sign(raw, dom.Name, dom.Selector, key)
-	if err != nil {
-		s.internal(w, "dkim sign", err)
-		return
-	}
-	hash := sha256.Sum256(body)
-	gotID, existing, err := s.Store.InsertEmail(ctx, store.NewEmail{
-		ID: id, ProjectID: pid, DomainID: dom.ID, From: req.From,
-		To: req.To, Cc: req.Cc, Bcc: req.Bcc, Subject: req.Subject,
-		MessageID: id + "@" + dom.Name, ReturnPath: dom.ReturnPath,
-		IdempotencyKey: idem, RequestHash: hash[:], Raw: s.Sealer.Seal(signed),
-		Tags: tags, RetryUncertain: retryUncertain, ExpiresAt: expires, Recipients: recipients,
-	})
-	if errors.Is(err, store.ErrConflict) {
-		writeError(w, http.StatusConflict, "idempotency_conflict", "this Idempotency-Key was already used with a different request")
-		return
-	}
-	if err != nil {
-		s.internal(w, "insert email", err)
-		return
-	}
-	if existing {
+	if out[0].Replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": gotID})
+	writeJSON(w, http.StatusOK, map[string]string{"id": out[0].ID})
+}
+
+// sendBatch queues up to 100 emails, all or none. Every item is validated
+// and checked against the key's policy before anything is stored; the caps
+// apply to the batch as a whole.
+func (s *Server) sendBatch(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(body, &items); err != nil || len(items) == 0 || len(items) > maxBatch {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error",
+			fmt.Sprintf("the body must be a JSON array of 1 to %d emails, each shaped like a POST /emails body", maxBatch))
+		return
+	}
+	idem, pe := idempotencyKey(r)
+	if pe != nil {
+		pe.write(w)
+		return
+	}
+	ctx, key := r.Context(), apiKeyOf(r)
+	hashes := make([][]byte, len(items))
+	for i, raw := range items {
+		h := sha256.Sum256(raw)
+		hashes[i] = h[:]
+	}
+	if idem != "" && s.batchReplayed(w, r, idem, hashes) {
+		return
+	}
+
+	now := time.Now().UTC()
+	plans := make([]*sendPlan, len(items))
+	var all []string
+	for i, raw := range items {
+		prefix := fmt.Sprintf("emails[%d]: ", i)
+		var req sendRequest
+		if err := decodeStrict(raw, &req); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error", prefix+err.Error())
+			return
+		}
+		if req.Attachments != nil {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error",
+				prefix+"attachments are not supported in a batch; send emails with attachments one at a time with POST /emails")
+			return
+		}
+		plan, pe := validateSend(req, now, s.Cfg.DefaultExpiry)
+		if pe == nil {
+			pe = allowedBy(key.Policy, plan.from, plan.recipients)
+		}
+		if pe != nil {
+			pe.prefixed(prefix).write(w)
+			return
+		}
+		plans[i] = plan
+		all = append(all, plan.recipients...)
+	}
+	if pe := s.checkCaps(ctx, key, all); pe != nil {
+		pe.write(w)
+		return
+	}
+
+	doms := map[string]store.Domain{}
+	es := make([]store.NewEmail, len(plans))
+	for i, plan := range plans {
+		prefix := fmt.Sprintf("emails[%d]: ", i)
+		dom, seen := doms[plan.fromDomain]
+		if !seen {
+			var pe *policyError
+			if dom, pe = s.senderDomain(ctx, key.ProjectID, plan.fromDomain); pe != nil {
+				pe.prefixed(prefix).write(w)
+				return
+			}
+			doms[plan.fromDomain] = dom
+		}
+		e, pe := s.newEmail(plan, dom, now)
+		if pe != nil {
+			pe.prefixed(prefix).write(w)
+			return
+		}
+		if idem != "" {
+			e.IdempotencyKey, e.RequestHash = idem+":"+strconv.Itoa(i), hashes[i]
+		}
+		es[i] = e
+	}
+	out, pe := s.queue(r, es)
+	if pe != nil {
+		pe.write(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, batchResponse(out))
+}
+
+func batchResponse(out []store.Inserted) map[string]any {
+	data := make([]map[string]string, len(out))
+	for i, o := range out {
+		data[i] = map[string]string{"id": o.ID}
+	}
+	return map[string]any{"data": data}
+}
+
+// batchReplayed answers a batch whose every item was already stored under
+// <idem>:<index> with the same body. Partly stored batches cannot exist
+// (batches are all or nothing), so anything else goes on to queue, which
+// applies the idempotency rules per item.
+func (s *Server) batchReplayed(w http.ResponseWriter, r *http.Request, idem string, hashes [][]byte) bool {
+	out := make([]store.Inserted, len(hashes))
+	for i, h := range hashes {
+		id, err := s.Store.FindIdempotent(r.Context(), projectID(r), idem+":"+strconv.Itoa(i), h)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return false
+		case errors.Is(err, store.ErrConflict):
+			writeError(w, http.StatusConflict, "idempotency_conflict", fmt.Sprintf(
+				"this Idempotency-Key was already used with a different request (emails[%d] differs)", i))
+			return true
+		case err != nil:
+			s.internal(w, "find idempotent", err)
+			return true
+		}
+		out[i] = store.Inserted{ID: id, Replayed: true}
+	}
+	w.Header().Set("Idempotent-Replayed", "true")
+	writeJSON(w, http.StatusOK, batchResponse(out))
+	return true
 }
 
 // envelope validates and deduplicates every recipient address.
@@ -253,22 +443,24 @@ func isASCII(s string) bool {
 }
 
 type emailResponse struct {
-	Object     string                `json:"object"`
-	ID         string                `json:"id"`
-	From       string                `json:"from"`
-	To         []string              `json:"to"`
-	Cc         []string              `json:"cc"`
-	Bcc        []string              `json:"bcc"`
-	Subject    string                `json:"subject"`
-	MessageID  string                `json:"message_id"`
-	CreatedAt  time.Time             `json:"created_at"`
-	ExpiresAt  time.Time             `json:"expires_at"`
-	LastEvent  string                `json:"last_event"`
-	Tags       map[string]string     `json:"tags"`
-	BodyPurged bool                  `json:"body_purged"`
-	Recipients []store.RecipientView `json:"recipients"`
-	Attempts   []store.AttemptView   `json:"attempts"`
-	Events     []store.EventView     `json:"events"`
+	Object      string                `json:"object"`
+	ID          string                `json:"id"`
+	APIKeyID    *string               `json:"api_key_id"`
+	From        string                `json:"from"`
+	To          []string              `json:"to"`
+	Cc          []string              `json:"cc"`
+	Bcc         []string              `json:"bcc"`
+	Subject     string                `json:"subject"`
+	MessageID   string                `json:"message_id"`
+	CreatedAt   time.Time             `json:"created_at"`
+	ScheduledAt *time.Time            `json:"scheduled_at"`
+	ExpiresAt   time.Time             `json:"expires_at"`
+	LastEvent   string                `json:"last_event"`
+	Tags        map[string]string     `json:"tags"`
+	BodyPurged  bool                  `json:"body_purged"`
+	Recipients  []store.RecipientView `json:"recipients"`
+	Attempts    []store.AttemptView   `json:"attempts"`
+	Events      []store.EventView     `json:"events"`
 }
 
 func (s *Server) getEmail(w http.ResponseWriter, r *http.Request) {
@@ -278,6 +470,9 @@ func (s *Server) getEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, err := s.Store.GetEmail(r.Context(), projectID(r), id)
+	if own := ownKeyOnly(r); err == nil && own != "" && (v.APIKeyID == nil || *v.APIKeyID != own) {
+		err = store.ErrNotFound // a sending_access key sees only its own emails
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "email not found")
 		return
@@ -287,9 +482,9 @@ func (s *Server) getEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := emailResponse{
-		Object: "email", ID: v.ID, From: v.From, To: v.To, Cc: v.Cc, Bcc: v.Bcc, Subject: v.Subject,
-		MessageID: "<" + v.MessageID + ">", CreatedAt: v.CreatedAt, ExpiresAt: v.ExpiresAt, Tags: v.Tags,
-		BodyPurged: v.BodyPurged, Recipients: v.Recipients, Attempts: v.Attempts, Events: v.Events,
+		Object: "email", ID: v.ID, APIKeyID: v.APIKeyID, From: v.From, To: v.To, Cc: v.Cc, Bcc: v.Bcc, Subject: v.Subject,
+		MessageID: "<" + v.MessageID + ">", CreatedAt: v.CreatedAt, ScheduledAt: v.ScheduledAt, ExpiresAt: v.ExpiresAt,
+		Tags: v.Tags, BodyPurged: v.BodyPurged, Recipients: v.Recipients, Attempts: v.Attempts, Events: v.Events,
 	}
 	if n := len(v.Events); n > 0 {
 		resp.LastEvent = v.Events[n-1].Type
@@ -298,4 +493,77 @@ func (s *Server) getEmail(w http.ResponseWriter, r *http.Request) {
 		resp.Attempts = []store.AttemptView{}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// listEmails pages through the project's emails, newest first.
+func (s *Server) listEmails(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 20
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 100 {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error", "limit must be a number from 1 to 100")
+			return
+		}
+		limit = n
+	}
+	before, keyID := q.Get("before"), q.Get("api_key_id")
+	if before != "" && !validID(before) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "before must be an email id, as next_before returns")
+		return
+	}
+	if keyID != "" && !validID(keyID) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "api_key_id must be an API key id (GET /api-keys)")
+		return
+	}
+	if own := ownKeyOnly(r); own != "" {
+		if keyID != "" && keyID != own {
+			writeError(w, http.StatusForbidden, "insufficient_permission",
+				"this API key has sending_access, so it can list only its own emails; leave out api_key_id")
+			return
+		}
+		keyID = own
+	}
+	list, more, err := s.Store.ListEmails(r.Context(), store.ListEmailsQuery{
+		ProjectID: projectID(r), APIKeyID: keyID, Before: before, Limit: limit,
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error",
+			"before names no email in this list; pass the next_before value of the previous page")
+		return
+	}
+	if err != nil {
+		s.internal(w, "list emails", err)
+		return
+	}
+	var next *string
+	if more {
+		next = &list[len(list)-1].ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": list, "has_more": more, "next_before": next})
+}
+
+// cancelEmail cancels the recipients of an email that have not been
+// attempted yet, typically a scheduled send.
+func (s *Server) cancelEmail(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		writeError(w, http.StatusNotFound, "not_found", "email not found")
+		return
+	}
+	canceled, err := s.Store.CancelEmail(r.Context(), projectID(r), id, ownKeyOnly(r))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "email not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, "cancel email", err)
+		return
+	}
+	if len(canceled) == 0 {
+		writeError(w, http.StatusConflict, "cannot_cancel", fmt.Sprintf(
+			"nothing to cancel: only recipients still queued and never attempted can be canceled, and this email has none left; see GET /emails/%s", id))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "email", "id": id, "canceled": canceled})
 }
