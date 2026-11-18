@@ -1,0 +1,61 @@
+# Local development: PostgreSQL, the control plane, a worker, and Mailpit as a
+# fake inbox. No email leaves your machine: the worker sends everything to
+# Mailpit (http://localhost:8025).
+#
+#   1. echo "OMW_SECRET_KEY=$(docker compose run --rm --no-deps control keygen)" > .env
+#   2. docker compose up -d
+#   3. docker compose exec control openmailwire project create demo        # API key
+#   4. docker compose exec control openmailwire workers add local-1        # worker token
+#      echo "OMW_WORKER_TOKEN=omwk_…" >> .env
+#   5. docker compose --profile worker up -d worker
+#   6. Add a domain and send (README.md, "Quick start"). For local tests:
+#      docker compose exec control openmailwire domains force-verify example.com
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: openmailwire
+      POSTGRES_PASSWORD: openmailwire
+      POSTGRES_DB: openmailwire
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "openmailwire"]
+      interval: 2s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:8025:8025"
+
+  control:
+    build: .
+    command: ["serve"]
+    environment:
+      DATABASE_URL: postgres://openmailwire:openmailwire@postgres:5432/openmailwire?sslmode=disable
+      OMW_SECRET_KEY: ${OMW_SECRET_KEY:-}
+      OMW_LISTEN: ":8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["worker"]
+    profiles: ["worker"]
+    environment:
+      OMW_CONTROL_URL: http://control:8080
+      OMW_WORKER_TOKEN: ${OMW_WORKER_TOKEN:-}
+      OMW_SMTP_OVERRIDE: mailpit:1025
+      OMW_EHLO: worker.local
+      OMW_STATE_DIR: /home/openmailwire/state
+    depends_on:
+      - control
+      - mailpit
+
+volumes:
+  pgdata:

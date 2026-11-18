@@ -1,0 +1,302 @@
+// Package e2e runs the control plane and a worker together against a real
+// PostgreSQL and a scripted SMTP server.
+//
+//	OMW_TEST_DATABASE_URL=postgres://… go test ./internal/e2e/
+//
+// The test empties every OpenMailWire table in that database. Point it at a
+// throwaway database only.
+package e2e
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/emersion/go-msgauth/dkim"
+
+	"github.com/openmailwire/openmailwire/internal/api"
+	"github.com/openmailwire/openmailwire/internal/config"
+	"github.com/openmailwire/openmailwire/internal/protocol"
+	"github.com/openmailwire/openmailwire/internal/secret"
+	"github.com/openmailwire/openmailwire/internal/smtptest"
+	"github.com/openmailwire/openmailwire/internal/store"
+	"github.com/openmailwire/openmailwire/internal/worker"
+)
+
+// dns answers with whatever the test publishes.
+type dns struct{ txt map[string][]string }
+
+func (d *dns) LookupTXT(_ context.Context, name string) ([]string, error) {
+	if v, ok := d.txt[name]; ok {
+		return v, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+func (d *dns) LookupMX(_ context.Context, name string) ([]*net.MX, error) {
+	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+type harness struct {
+	t      *testing.T
+	st     *store.Store
+	url    string
+	apiKey string
+}
+
+func (h *harness) call(method, path, idem string, body any) (int, map[string]any) {
+	h.t.Helper()
+	var rd io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		rd = bytes.NewReader(b)
+	}
+	req, _ := http.NewRequest(method, h.url+path, rd)
+	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	if idem != "" {
+		req.Header.Set("Idempotency-Key", idem)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func (h *harness) waitStatus(id, rcpt, want string) map[string]any {
+	h.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	var last map[string]any
+	for time.Now().Before(deadline) {
+		_, last = h.call("GET", "/emails/"+id, "", nil)
+		recips, _ := last["recipients"].([]any)
+		for _, r := range recips {
+			m := r.(map[string]any)
+			if m["email"] == rcpt && m["status"] == want {
+				return last
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	b, _ := json.MarshalIndent(last, "", "  ")
+	h.t.Fatalf("%s for %s never reached %q; last view:\n%s", id, rcpt, want, b)
+	return nil
+}
+
+func TestEndToEnd(t *testing.T) {
+	dbURL := os.Getenv("OMW_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("OMW_TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	st, err := store.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(ctx); err != nil { // second run must be a no-op
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `TRUNCATE projects, workers CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+
+	pid, err := st.CreateProject(ctx, "e2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey, keyHash := secret.NewToken("omw_")
+	if err := st.CreateAPIKey(ctx, pid, "e2e", apiKey[:10], keyHash); err != nil {
+		t.Fatal(err)
+	}
+	workerToken, workerHash := secret.NewToken("omwk_")
+	workerID, err := st.CreateWorker(ctx, "w1", workerHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte(strings.Repeat("k", 32))
+	sealer, _ := secret.NewSealer(key)
+	resolver := &dns{txt: map[string][]string{}}
+	srv := &api.Server{
+		Store: st, Sealer: sealer, MACKey: secret.Derive(key, "openmailwire/verp"), Resolver: resolver, Log: log, Version: "test",
+		Cfg: config.Control{
+			ReturnPathLabel: "bounce", SPFInclude: "_spf.openmailwire.test",
+			DefaultExpiry: time.Hour, LeaseDuration: time.Minute, DomainConcurrency: 5, Retention: time.Hour,
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	h := &harness{t: t, st: st, url: ts.URL, apiKey: apiKey}
+
+	// Add a domain: it starts pending and sending from it is refused.
+	code, dom := h.call("POST", "/domains", "", map[string]string{"name": "Acme.test"})
+	if code != 201 || dom["status"] != "pending" || dom["name"] != "acme.test" {
+		t.Fatalf("create domain: %d %v", code, dom)
+	}
+	domID := dom["id"].(string)
+	send := map[string]any{
+		"from": "Acme <login@acme.test>", "to": "ok@example.test",
+		"subject": "کد ورود: 482913", "text": "Your code is 482913.", "html": "<p>Your code is <b>482913</b>.</p>",
+	}
+	if code, body := h.call("POST", "/emails", "", send); code != 403 || body["name"] != "domain_not_verified" {
+		t.Fatalf("unverified domain sent: %d %v", code, body)
+	}
+
+	// Publish the records it asked for, then verify.
+	var dkimPub string
+	for _, r := range dom["records"].([]any) {
+		rec := r.(map[string]any)
+		resolver.txt[rec["name"].(string)] = append(resolver.txt[rec["name"].(string)], rec["value"].(string))
+		if rec["record"] == "DKIM" {
+			dkimPub = rec["value"].(string)
+		}
+	}
+	code, dom = h.call("POST", "/domains/"+domID+"/verify", "", nil)
+	if code != 200 || dom["status"] != "verified" {
+		t.Fatalf("verify: %d %v", code, dom)
+	}
+
+	smtp, err := smtptest.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer smtp.Close()
+	smtp.ReplyToRcpt("gone@example.test", "550 5.1.1 no such user")
+	smtp.DropAfterData("lost@example.test")
+
+	// Same idempotency key and body: one message. Different body: conflict.
+	code, first := h.call("POST", "/emails", "login-42", send)
+	if code != 200 {
+		t.Fatalf("send: %d %v", code, first)
+	}
+	id := first["id"].(string)
+	if _, again := h.call("POST", "/emails", "login-42", send); again["id"] != id {
+		t.Fatalf("idempotent replay returned %v, want %s", again["id"], id)
+	}
+	changed := map[string]any{}
+	for k, v := range send {
+		changed[k] = v
+	}
+	changed["text"] = "different"
+	if code, body := h.call("POST", "/emails", "login-42", changed); code != 409 {
+		t.Fatalf("idempotency conflict: %d %v", code, body)
+	}
+
+	// Start a worker that delivers everything to the scripted server.
+	runner := worker.NewRunner(config.Worker{
+		ControlURL: ts.URL, Token: workerToken, EHLO: "w1.openmailwire.test", PublicIP: "203.0.113.7",
+		SMTPOverride: smtp.Addr, StateDir: t.TempDir(), Concurrency: 4,
+		PollInterval: 50 * time.Millisecond, JobTimeout: 30 * time.Second,
+	}, log, "test")
+	wctx, stopWorker := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(wctx) }()
+
+	view := h.waitStatus(id, "ok@example.test", "delivered")
+	attempts := view["attempts"].([]any)
+	if len(attempts) != 1 {
+		t.Fatalf("want 1 attempt, got %d", len(attempts))
+	}
+	a := attempts[0].(map[string]any)
+	if a["worker"] != "w1" || a["source_ip"] != "203.0.113.7" || a["outcome"] != "delivered" || !strings.Contains(a["response"].(string), "queued as") {
+		t.Fatalf("attempt record: %v", a)
+	}
+
+	// The receiver got one signed message whose DKIM signature verifies
+	// against the DNS record the API published.
+	msgs := smtp.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("receiver got %d messages", len(msgs))
+	}
+	if !strings.HasPrefix(msgs[0].MailFrom, "b-") || !strings.HasSuffix(msgs[0].MailFrom, "@bounce.acme.test") {
+		t.Fatalf("envelope sender %q", msgs[0].MailFrom)
+	}
+	vs, err := dkim.VerifyWithOptions(bytes.NewReader(msgs[0].Data), &dkim.VerifyOptions{
+		LookupTXT: func(domain string) ([]string, error) {
+			if strings.HasSuffix(domain, "._domainkey.acme.test") {
+				return []string{dkimPub}, nil
+			}
+			return nil, errors.New("not found")
+		},
+	})
+	if err != nil || len(vs) != 1 || vs[0].Err != nil {
+		t.Fatalf("dkim: %v %+v", err, vs)
+	}
+
+	// A mailbox that does not exist bounces and is suppressed next time.
+	_, b := h.call("POST", "/emails", "", map[string]any{"from": "login@acme.test", "to": "gone@example.test", "subject": "x", "text": "x"})
+	h.waitStatus(b["id"].(string), "gone@example.test", "bounced")
+	_, b = h.call("POST", "/emails", "", map[string]any{"from": "login@acme.test", "to": "gone@example.test", "subject": "x", "text": "x"})
+	h.waitStatus(b["id"].(string), "gone@example.test", "suppressed")
+
+	// The connection drops after the body: the outcome is unknown and, by
+	// default, the message is retried later rather than lost.
+	_, b = h.call("POST", "/emails", "", map[string]any{"from": "login@acme.test", "to": "lost@example.test", "subject": "x", "text": "x"})
+	lost := h.waitStatus(b["id"].(string), "lost@example.test", "deferred")
+	la := lost["attempts"].([]any)[0].(map[string]any)
+	if la["outcome"] != protocol.OutcomeUnknown {
+		t.Fatalf("lost reply attempt: %v", la)
+	}
+
+	stopWorker()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	// A worker that vanishes: its lease expires, the sweeper records an
+	// unknown outcome and reschedules; a late "delivered" report still wins.
+	_, b = h.call("POST", "/emails", "", map[string]any{"from": "login@acme.test", "to": "slow@example.test", "subject": "x", "text": "x"})
+	slowID := b["id"].(string)
+	jobs, err := st.Lease(ctx, workerID, 10, time.Millisecond, 5)
+	if err != nil || len(jobs) == 0 {
+		t.Fatalf("lease: %v %d", err, len(jobs))
+	}
+	var slow store.LeasedJob
+	for _, j := range jobs {
+		if j.Rcpt == "slow@example.test" {
+			slow = j
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := st.Sweep(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	h.waitStatus(slowID, "slow@example.test", "deferred")
+	if _, err := st.Report(ctx, workerID, protocol.Report{AttemptID: slow.AttemptID, Outcome: protocol.OutcomeDelivered, SMTPCode: 250, Response: "250 ok"}); err != nil {
+		t.Fatal(err)
+	}
+	h.waitStatus(slowID, "slow@example.test", "delivered")
+	// Replaying the same report changes nothing.
+	if s, err := st.Report(ctx, workerID, protocol.Report{AttemptID: slow.AttemptID, Outcome: protocol.OutcomeBounced, SMTPCode: 550}); err != nil || s != "delivered" {
+		t.Fatalf("replayed report: %q %v", s, err)
+	}
+
+	// Another project cannot read this project's email.
+	otherPID, _ := st.CreateProject(ctx, "other")
+	otherKey, otherHash := secret.NewToken("omw_")
+	st.CreateAPIKey(ctx, otherPID, "", otherKey[:10], otherHash)
+	other := &harness{t: t, st: st, url: ts.URL, apiKey: otherKey}
+	if code, _ := other.call("GET", "/emails/"+id, "", nil); code != 404 {
+		t.Fatalf("cross-project read: %d", code)
+	}
+}

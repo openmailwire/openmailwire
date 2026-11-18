@@ -1,0 +1,4 @@
+bin/
+openmailwire-worker-state/
+.env
+.git/

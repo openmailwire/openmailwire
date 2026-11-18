@@ -1,0 +1,5 @@
+bin/
+openmailwire-worker-state/
+.env
+*.test
+coverage.out
