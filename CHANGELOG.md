@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### SDKs for Node.js, Python, Go and PHP
+
+Client libraries in [`sdks/`](sdks), one directory each, MIT licensed (the server stays AGPL-3.0) so that apps under any licence can embed them:
+- `sdks/node`: TypeScript, ESM, no runtime dependencies, global `fetch`, Node 18+. Package `openmailwire`.
+- `sdks/python`: standard library only (`urllib`), type hints, Python 3.9+. Package `openmailwire`.
+- `sdks/go`: its own module, `github.com/openmailwire/openmailwire/sdks/go`; standard library only, context-aware, Go 1.22+.
+- `sdks/php`: PHP 8.1+, curl, PSR-4. Package `openmailwire/openmailwire`.
+
+**Each one covers:**
+- emails: send (idempotency key, attachments, `scheduled_at`), get, list, cancel, batch and raw MIME;
+- domains: create, list, get, verify, delete;
+- webhooks: create, list, get, delete;
+- API keys: create, list, get, update, delete;
+- inboxes and messages: create, list and delete inboxes; list, read and reply to messages; download attachments;
+- `waitForDelivery` (polls until no recipient is queued, sending or deferred) and `waitForReply` (polls the inboxes for messages answering a sent email);
+- `verifyWebhook`: both the `svix-*` and `webhook-*` headers, several `v1,` signatures, constant-time comparison, a 5-minute timestamp tolerance.
+
+**Configuration** comes from `OMW_API_URL` (default `http://localhost:8080`) and `OMW_API_KEY` when not passed in. **Errors** are typed and carry the API's `statusCode`, `name` and `message`, plus `Retry-After` for 429s.
+
+Each SDK has its own README and tests against a local mock server; the new workflow `.github/workflows/sdks.yml` runs them when `sdks/` changes. Nothing is published to npm, PyPI or Packagist yet.
+
 ## v0.3.0: MCP server for AI agents
 
 OpenMailWire is now built for AI agents first.

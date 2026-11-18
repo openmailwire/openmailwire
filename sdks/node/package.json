@@ -1,0 +1,49 @@
+{
+  "name": "openmailwire",
+  "version": "0.1.0",
+  "description": "Node.js and TypeScript client for OpenMailWire, open-source email for AI agents",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmailwire/openmailwire.git",
+    "directory": "sdks/node"
+  },
+  "homepage": "https://github.com/openmailwire/openmailwire/tree/main/sdks/node#readme",
+  "bugs": "https://github.com/openmailwire/openmailwire/issues",
+  "keywords": [
+    "email",
+    "openmailwire",
+    "smtp",
+    "ai-agents",
+    "webhooks",
+    "resend"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "5.9.3"
+  }
+}
