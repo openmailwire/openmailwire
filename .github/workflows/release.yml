@@ -33,8 +33,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Notes: only this version's section of CHANGELOG.md.
+          awk -v tag="## ${GITHUB_REF_NAME}" 'index($0, tag) == 1 {p = 1; next} /^## / && p {exit} p' CHANGELOG.md > notes.md
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file CHANGELOG.md --verify-tag
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
 
   image:

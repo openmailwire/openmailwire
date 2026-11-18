@@ -10,8 +10,12 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -19,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +35,7 @@ import (
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/smtptest"
 	"github.com/openmailwire/openmailwire/internal/store"
+	"github.com/openmailwire/openmailwire/internal/webhook"
 	"github.com/openmailwire/openmailwire/internal/worker"
 )
 
@@ -45,6 +51,70 @@ func (d *dns) LookupTXT(_ context.Context, name string) ([]string, error) {
 
 func (d *dns) LookupMX(_ context.Context, name string) ([]*net.MX, error) {
 	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+type received struct {
+	header  http.Header
+	body    []byte
+	payload struct {
+		Type string `json:"type"`
+		Data struct {
+			EmailID string   `json:"email_id"`
+			To      []string `json:"to"`
+			Bounce  struct {
+				Type string `json:"type"`
+			} `json:"bounce"`
+		} `json:"data"`
+	}
+}
+
+// receiver records every webhook it is sent.
+type receiver struct {
+	mu  sync.Mutex
+	got []received
+}
+
+func (rc *receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var rec received
+	rec.header = r.Header.Clone()
+	rec.body, _ = io.ReadAll(r.Body)
+	json.Unmarshal(rec.body, &rec.payload)
+	rc.mu.Lock()
+	rc.got = append(rc.got, rec)
+	rc.mu.Unlock()
+}
+
+func (rc *receiver) find(typ, rcpt string) (received, bool) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	for _, r := range rc.got {
+		if r.payload.Type == typ && len(r.payload.Data.To) == 1 && r.payload.Data.To[0] == rcpt {
+			return r, true
+		}
+	}
+	return received{}, false
+}
+
+func (rc *receiver) count() int {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return len(rc.got)
+}
+
+func verifySvix(whsec, id, ts string, body []byte, header string) bool {
+	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(whsec, "whsec_"))
+	if err != nil || id == "" || ts == "" {
+		return false
+	}
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(id + "." + ts + "." + string(body)))
+	want := base64.StdEncoding.EncodeToString(m.Sum(nil))
+	for _, part := range strings.Fields(header) {
+		if v, ok := strings.CutPrefix(part, "v1,"); ok && hmac.Equal([]byte(v), []byte(want)) {
+			return true
+		}
+	}
+	return false
 }
 
 type harness struct {
@@ -142,6 +212,7 @@ func TestEndToEnd(t *testing.T) {
 		Cfg: config.Control{
 			ReturnPathLabel: "bounce", SPFInclude: "_spf.openmailwire.test",
 			DefaultExpiry: time.Hour, LeaseDuration: time.Minute, DomainConcurrency: 5, Retention: time.Hour,
+			WebhookAllowHTTP: true, WebhookAllowPrivate: true,
 		},
 	}
 	ts := httptest.NewServer(srv.Handler())
@@ -175,6 +246,21 @@ func TestEndToEnd(t *testing.T) {
 	if code != 200 || dom["status"] != "verified" {
 		t.Fatalf("verify: %d %v", code, dom)
 	}
+
+	// A webhook receiver, registered before anything is sent.
+	hooks := &receiver{}
+	hookSrv := httptest.NewServer(hooks)
+	defer hookSrv.Close()
+	code, hook := h.call("POST", "/webhooks", "", map[string]any{"endpoint": hookSrv.URL + "/omw"})
+	if code != 201 || !strings.HasPrefix(fmt.Sprint(hook["signing_secret"]), "whsec_") {
+		t.Fatalf("create webhook: %d %v", code, hook)
+	}
+	whsec := hook["signing_secret"].(string)
+	if code, body := h.call("POST", "/webhooks", "", map[string]any{"endpoint": "https://x.test", "events": []string{"email.nope"}}); code != 422 {
+		t.Fatalf("unknown event type accepted: %d %v", code, body)
+	}
+	dispatcher := &webhook.Dispatcher{Store: st, Sealer: sealer, HTTP: webhook.NewHTTPClient(true), Log: log, UserAgent: "test"}
+	go dispatcher.Run(ctx, 50*time.Millisecond)
 
 	smtp, err := smtptest.Start()
 	if err != nil {
@@ -289,6 +375,41 @@ func TestEndToEnd(t *testing.T) {
 	// Replaying the same report changes nothing.
 	if s, err := st.Report(ctx, workerID, protocol.Report{AttemptID: slow.AttemptID, Outcome: protocol.OutcomeBounced, SMTPCode: 550}); err != nil || s != "delivered" {
 		t.Fatalf("replayed report: %q %v", s, err)
+	}
+
+	// Every webhook arrives signed, per recipient, with Resend's field names.
+	want := []struct{ typ, rcpt string }{
+		{"email.sent", "ok@example.test"},
+		{"email.delivered", "ok@example.test"},
+		{"email.bounced", "gone@example.test"},
+		{"email.suppressed", "gone@example.test"},
+		{"email.delivery_delayed", "lost@example.test"},
+		{"email.delivered", "slow@example.test"},
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for _, w := range want {
+		for {
+			got, ok := hooks.find(w.typ, w.rcpt)
+			if ok {
+				if !verifySvix(whsec, got.header.Get("svix-id"), got.header.Get("svix-timestamp"), got.body, got.header.Get("svix-signature")) {
+					t.Fatalf("%s for %s: bad signature", w.typ, w.rcpt)
+				}
+				if got.header.Get("webhook-signature") != got.header.Get("svix-signature") {
+					t.Fatal("standard-webhooks headers missing")
+				}
+				if w.typ == "email.bounced" && got.payload.Data.Bounce.Type != "Permanent" {
+					t.Fatalf("bounce payload: %s", got.body)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no %s webhook for %s; got %d webhooks", w.typ, w.rcpt, hooks.count())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if _, view := h.call("GET", "/webhooks/"+hook["id"].(string), "", nil); len(view["recent_deliveries"].([]any)) == 0 {
+		t.Fatalf("webhook view has no deliveries: %v", view)
 	}
 
 	// Another project cannot read this project's email.

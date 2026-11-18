@@ -7,7 +7,7 @@
 - **It is honest about uncertainty.** If a connection drops after the message body was sent but before the receiver replied, the attempt is recorded as `unknown`. It is not quietly marked sent or failed.
 - **The API is shaped like Resend's.** `POST /emails` takes `from`, `to`, `subject`, `html` and `text`, so existing code moves with a base-URL change.
 
-> **Status: alpha (v0.1).** The send → sign → queue → deliver → report path works end to end and is covered by tests. It has not been run at volume yet. Read the [roadmap](#roadmap) before you send production login mail through it.
+> **Status: alpha (v0.2).** The send → sign → queue → deliver → report path works end to end and is covered by tests. It has not been run at volume yet. Read the [roadmap](#roadmap) before you send production login mail through it.
 
 ## How it works
 
@@ -32,7 +32,7 @@
 
 More detail: [docs/architecture.md](docs/architecture.md).
 
-## Features in v0.1
+## Features
 
 - `POST /emails`: up to 50 recipients (to, cc and bcc together), HTML and text, reply-to, custom headers, tags, `Idempotency-Key`, and per-message expiry.
 - `GET /emails/{id}`: the status of each recipient, every attempt, and the event timeline.
@@ -46,6 +46,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Recipient failures (5.1.x) are suppressed automatically. Policy blocks (5.7.x) never suppress recipients.
 - Each project has its own API keys, domains, messages and suppression list.
 - Bounce addresses (VERP) carry an HMAC, ready for bounce processing.
+- Signed webhooks, verifiable by handlers written for Resend. They are retried for about a day and blocked from internal networks.
 - Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
 - One static binary, `openmailwire`, plays both roles: `serve` or `worker`.
 
@@ -142,6 +143,33 @@ The records you publish:
 
 Mail is sent with the envelope sender `b-<delivery>-<mac>@bounce.example.com`. DMARC passes through the DKIM signature, which is aligned with your `From` domain.
 
+### Webhooks
+
+| Method | Path | |
+|---|---|---|
+| `POST` | `/webhooks` | `{"endpoint": "https://…", "events": ["email.bounced", …]}`. Leave out `events` (or pass `[]`) to get every type. Returns `signing_secret` (`whsec_…`) once. |
+| `GET` | `/webhooks` | Lists webhooks. |
+| `GET` | `/webhooks/{id}` | One webhook with its 20 most recent deliveries. |
+| `DELETE` | `/webhooks/{id}` | |
+
+Event types:
+
+| Type | Sent when |
+|---|---|
+| `email.sent` | the message is accepted and queued |
+| `email.delivered` | the receiving server accepted it |
+| `email.delivery_delayed` | a temporary failure, or an unknown outcome that will be retried |
+| `email.bounced` | a permanent failure |
+| `email.failed` | the message expired before it could be delivered |
+| `email.suppressed` | the recipient is on the suppression list, so nothing was sent |
+| `email.delivery_unknown` | the outcome is unknown and `retry_uncertain` is `false` |
+
+Every event is about **one recipient**, and `data.to` holds only that recipient. The body uses Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
+
+Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's Svix headers (`svix-id`, `svix-timestamp`, `svix-signature`) and once in the [Standard Webhooks](https://www.standardwebhooks.com) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`). A handler written for Resend webhooks verifies them unchanged.
+
+Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed. Endpoints must use `https` and resolve to public addresses (checked when connecting). That way a webhook cannot be used to reach the control plane's internal network.
+
 ## Running in production
 
 Delivering mail yourself is mostly about IP reputation and DNS hygiene, not code. Read [docs/production.md](docs/production.md) before you send real mail. In short:
@@ -170,6 +198,8 @@ Control plane (`openmailwire serve`):
 | `OMW_DOMAIN_CONCURRENCY` | `10` | In-flight deliveries per recipient domain, across all workers. |
 | `OMW_DNS_SERVER` | system | e.g. `1.1.1.1:53`, for domain checks. |
 | `OMW_ALLOW_UNVERIFIED` | `false` | Development only. |
+| `OMW_WEBHOOK_ALLOW_HTTP` | `false` | Development only: accept `http://` webhook endpoints. |
+| `OMW_WEBHOOK_ALLOW_PRIVATE` | `false` | Development only: allow webhook endpoints on localhost or private networks. |
 
 Worker (`openmailwire worker`):
 
@@ -191,7 +221,8 @@ Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (
 ## Roadmap
 
 - [ ] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC.
-- [ ] **Signed webhooks**: `email.delivered`, `email.bounced`, `email.complained` and more, Resend-compatible.
+- [x] **Signed webhooks**, Resend-compatible (v0.2).
+- [ ] **Complaint feedback loops**: `email.complained` from Yahoo, Microsoft and other feedback loops.
 - [ ] **MTA-STS and DANE**: enforce TLS where receivers require it.
 - [ ] **Adaptive throttling**: learn per-receiver limits from 421 deferrals.
 - [ ] **Fallback relay worker**: hand mail to another provider when your IPs are throttled.

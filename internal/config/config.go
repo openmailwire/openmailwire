@@ -25,6 +25,10 @@ type Control struct {
 	LeaseDuration     time.Duration
 	DomainConcurrency int
 	DNSServer         string
+	// Webhook endpoints must use https and public addresses unless these
+	// are set (development only).
+	WebhookAllowHTTP    bool
+	WebhookAllowPrivate bool
 }
 
 // DatabaseURL returns DATABASE_URL or an error when it is unset.
@@ -68,6 +72,12 @@ func LoadControl() (Control, error) {
 		return c, err
 	}
 	if c.DomainConcurrency, err = envInt("OMW_DOMAIN_CONCURRENCY", 10); err != nil {
+		return c, err
+	}
+	if c.WebhookAllowHTTP, err = envBool("OMW_WEBHOOK_ALLOW_HTTP", false); err != nil {
+		return c, err
+	}
+	if c.WebhookAllowPrivate, err = envBool("OMW_WEBHOOK_ALLOW_PRIVATE", false); err != nil {
 		return c, err
 	}
 	return c, nil

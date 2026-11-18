@@ -20,6 +20,7 @@ import (
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/smtptest"
 	"github.com/openmailwire/openmailwire/internal/store"
+	"github.com/openmailwire/openmailwire/internal/webhook"
 	"github.com/openmailwire/openmailwire/internal/worker"
 )
 
@@ -133,6 +134,15 @@ func serve(ctx context.Context, log *slog.Logger) error {
 			}
 		}
 	}()
+	if cfg.WebhookAllowHTTP || cfg.WebhookAllowPrivate {
+		log.Warn("webhook endpoints may use plain http or private addresses. Never use this in production.")
+	}
+	dispatcher := &webhook.Dispatcher{
+		Store: st, Sealer: sealer, HTTP: webhook.NewHTTPClient(cfg.WebhookAllowPrivate),
+		Log: log, UserAgent: "openmailwire-webhooks/" + version,
+	}
+	go dispatcher.Run(ctx, time.Second)
+
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

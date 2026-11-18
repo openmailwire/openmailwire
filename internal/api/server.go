@@ -38,6 +38,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /domains/{id}", s.withProject(s.getDomain))
 	mux.Handle("POST /domains/{id}/verify", s.withProject(s.verifyDomain))
 	mux.Handle("DELETE /domains/{id}", s.withProject(s.deleteDomain))
+	mux.Handle("POST /webhooks", s.withProject(s.createWebhook))
+	mux.Handle("GET /webhooks", s.withProject(s.listWebhooks))
+	mux.Handle("GET /webhooks/{id}", s.withProject(s.getWebhook))
+	mux.Handle("DELETE /webhooks/{id}", s.withProject(s.deleteWebhook))
 
 	mux.Handle("POST /internal/worker/heartbeat", s.withWorker(s.heartbeat))
 	mux.Handle("POST /internal/worker/lease", s.withWorker(s.lease))

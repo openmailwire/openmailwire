@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.2.0: signed webhooks
+
+**New endpoints:** `POST /webhooks`, `GET /webhooks`, `GET /webhooks/{id}` (with its 20 most recent deliveries) and `DELETE /webhooks/{id}`.
+
+**Events:**
+- `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.bounced` and `email.failed`;
+- `email.suppressed` and `email.delivery_unknown`, which Resend doesn't have.
+
+Each event is about one recipient, and `data.to` holds only that recipient.
+
+**Payloads** use Resend's field names, plus `data.delivery` with the SMTP code, enhanced code, response, MX host and attempt ID.
+
+**Signing:** every request carries both the Svix headers (Resend's scheme) and the Standard Webhooks headers, so an existing Resend webhook handler verifies it unchanged.
+
+**Delivery:**
+- Webhooks go through a durable outbox in PostgreSQL, built from a cursor over the event timeline, so each event is sent once per webhook.
+- Failures are retried about 8 times over roughly a day.
+- Finished deliveries are purged after `OMW_RETENTION`.
+
+**Endpoint safety:**
+- Endpoints must use https.
+- Connections to loopback, private, link-local and CGNAT addresses are refused after DNS resolution, and redirects are not followed.
+- `OMW_WEBHOOK_ALLOW_HTTP` and `OMW_WEBHOOK_ALLOW_PRIVATE` relax this for development.
+
+**Migration:** `0002_webhooks.sql` runs on start. It starts from the latest event, so old events are not replayed.
+
 ## v0.1.0: first public release
 
 OpenMailWire is open-source email sending you run yourself: an HTTP API, DKIM signing, and workers that deliver straight to recipients' mail servers from your own IPs.

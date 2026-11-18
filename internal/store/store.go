@@ -743,6 +743,12 @@ func (s *Store) Sweep(ctx context.Context, retention time.Duration) error {
 		                  AND d.status IN ('queued', 'sending', 'deferred'))`, retention.Seconds()); err != nil {
 		return fmt.Errorf("purge: %w", err)
 	}
+	// Finished webhook deliveries hold addresses and subjects; keep them only
+	// as long as message bodies.
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM webhook_deliveries
+		WHERE status <> 'pending' AND created_at < now() - make_interval(secs => $1)`, retention.Seconds()); err != nil {
+		return fmt.Errorf("purge webhook deliveries: %w", err)
+	}
 	return nil
 }
 
