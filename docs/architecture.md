@@ -15,7 +15,7 @@ OpenMailWire has two roles, built into one binary.
    - marks them `sending`;
    - creates a fresh attempt ID with an expiring lease;
    - returns the signed message and a VERP envelope sender.
-3. **Deliver.** The worker resolves MX records (preference order, implicit MX, null MX) and connects on port 25. It offers STARTTLS when the server supports it and records `none`, `opportunistic` or `verified`. Then it runs MAIL, RCPT and DATA. The final reply text, which usually contains the receiver's queue ID, is kept.
+3. **Deliver.** The worker resolves MX records (preference order, implicit MX, null MX) and connects on port 25. It offers STARTTLS when the server supports it and records `none`, `opportunistic` or `verified`. When the domain publishes an MTA-STS policy in `enforce` mode, or the MX host has DNSSEC-signed TLSA records (DANE), TLS is required and must check out (`verified+mta-sts`, `dane`); otherwise the attempt is deferred with `4.7.5`. Then it runs MAIL, RCPT and DATA. The final reply text, which usually contains the receiver's queue ID, is kept.
 4. **Report.** The worker writes the outcome to its outbox, posts it, and deletes it once the control plane has accepted it. The control plane records the attempt, applies the policy (below), and appends an event.
 5. **Sweep.** Every 15 seconds the control plane reclaims expired leases, expires overdue deliveries, and purges message bodies past retention.
 
@@ -58,8 +58,10 @@ A unique index handles two requests that race.
 
 ## Concurrency and fairness
 
-- The per-recipient-domain cap (`OMW_DOMAIN_CONCURRENCY`) is enforced centrally when leasing, so adding workers never multiplies the rate a receiver sees.
+- The per-recipient-domain cap (`OMW_DOMAIN_CONCURRENCY`) is enforced centrally when leasing, so adding workers never multiplies the rate a receiver sees. Leases are serialized with an advisory lock, so two workers leasing at once cannot both take a domain's last slot.
 - A slow receiver ties up only its own cap, not the whole queue.
+- **Adaptive throttling.** `receiver_state` holds a lower limit for domains that asked us to slow down. A throttling deferral from a direct worker halves the domain's limit (minimum 1) and sets `backoff_until` to 1, 2, 4… up to 30 minutes after the n-th consecutive throttle; direct workers skip the domain until then. Each delivery raises the limit by one, up to the cap. Attempts already in flight when the domain throttled us belong to the same burst: they neither halve the limit again nor raise it.
+- **Relay routing.** Workers have a kind, `direct` or `relay`. Relay workers lease only deliveries with at least `OMW_RELAY_AFTER_ATTEMPTS` attempts or whose domain is in backoff; while a relay worker is live (heartbeat in the last 2 minutes), direct workers do not lease those. Relay attempts count against their own per-domain cap and never change `receiver_state`, because the receiver sees the smarthost's IPs, not ours.
 
 ## Security model
 

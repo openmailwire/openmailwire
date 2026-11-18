@@ -105,6 +105,8 @@ Give each agent its own key (`openmailwire apikey create <project-id> <agent-nam
 - The **control plane** owns the API, the PostgreSQL queue, DKIM keys and every scheduling decision. A message is committed to the database before the API answers.
 - **Workers** are stateless senders. They run anywhere with outbound port 25 and a clean IP. They pull jobs, look up MX records, speak SMTP with opportunistic TLS, and report the outcome. They never hold DKIM keys.
 - Each recipient gets an expiring **lease** and a unique **attempt ID**. If a worker disappears, its lease expires and the attempt is recorded as `unknown`. Workers write each report to a local outbox before sending it, so an outcome survives a crash or a control-plane outage.
+- The control plane **learns each receiver's limits**. A "slow down" deferral halves that domain's concurrency and pauses it; deliveries raise it again.
+- An optional **relay worker** hands mail to another provider's smarthost when your own IPs could not deliver it.
 
 More detail: [docs/architecture.md](docs/architecture.md).
 
@@ -117,7 +119,11 @@ More detail: [docs/architecture.md](docs/architecture.md).
   - MX lookup with preference order, implicit MX and null MX (RFC 7505).
   - IPv4-only by default.
   - Opportunistic STARTTLS, recording whether the certificate verified.
+  - **MTA-STS** (RFC 8461): where a receiving domain publishes an `enforce` policy, mail goes only to the MX hosts it names, over TLS with a valid certificate, or waits (`4.7.5`). Policies in `testing` mode are recorded, not enforced.
+  - **DANE** (RFC 7672), with a validating resolver (`OMW_DNSSEC_RESOLVER`): an MX host with DNSSEC-signed TLSA records gets TLS only with a matching certificate.
   - A per-domain concurrency cap shared by all workers.
+  - **Adaptive throttling**: a deferral that means "slow down" (421, `4.7.28`, `4.7.650`, "too many", "rate") halves the domain's concurrency and pauses it for 1, 2, 4… up to 30 minutes. Each delivery raises the limit by one again.
+  - **Fallback relay worker**: deliveries that failed twice on your IPs, or whose domain is paused, can go out through another provider's smarthost (STARTTLS and `AUTH PLAIN`). The message is unchanged, so DKIM still verifies.
 - Retries: a backoff schedule (1 min → 4 h), with expiry instead of endless retries.
 - Recipient failures (5.1.x) are suppressed automatically. Policy blocks (5.7.x) never suppress recipients.
 - Each project has its own API keys, domains, messages and suppression list.
@@ -198,6 +204,18 @@ Header `Idempotency-Key`: the same key with the same body returns the same `id` 
 
 Returns `recipients[]` (status: `queued`, `sending`, `deferred`, `delivered`, `bounced`, `expired`, `suppressed` or `unknown`), `attempts[]` (worker, source IP, MX host, outcome, SMTP code, enhanced code, response, TLS) and `events[]`.
 
+An attempt's `tls` is one of:
+
+| `tls` | Meaning |
+|---|---|
+| `none` | no TLS: the server did not offer STARTTLS |
+| `opportunistic` | encrypted, but the certificate did not verify |
+| `verified` | encrypted, with a certificate valid for the MX host |
+| `verified+mta-sts` | as `verified`, and required by the domain's MTA-STS policy |
+| `dane` | encrypted, with a certificate that matches the MX host's TLSA records |
+
+Events also show what the control plane learned from an attempt: `throttled` (the receiver asked us to slow down; `data` has the domain's new `limit` and `backoff_until`) and `throttle_relaxed` (a delivery raised the limit again). When a domain's MTA-STS policy is in `testing` mode and enforce mode would have refused the attempt, the attempt's event (`delivered`, `deferred`, …) says why in `data.tls_policy`.
+
 ### Domains
 
 | Method | Path | |
@@ -271,7 +289,8 @@ Control plane (`openmailwire serve`):
 | `OMW_DEFAULT_EXPIRY` | `48h` | |
 | `OMW_RETENTION` | `72h` | Message bodies are deleted this long after their last delivery. |
 | `OMW_LEASE` | `15m` | Must exceed the workers' `OMW_JOB_TIMEOUT`. |
-| `OMW_DOMAIN_CONCURRENCY` | `10` | In-flight deliveries per recipient domain, across all workers. |
+| `OMW_DOMAIN_CONCURRENCY` | `10` | In-flight deliveries per recipient domain, across all workers. Adaptive throttling lowers it for a domain that asks us to slow down, and raises it back up to this value. |
+| `OMW_RELAY_AFTER_ATTEMPTS` | `2` | While a relay worker is live, deliveries with this many attempts go to it instead of direct workers. |
 | `OMW_DNS_SERVER` | system | e.g. `1.1.1.1:53`, for domain checks. |
 | `OMW_ALLOW_UNVERIFIED` | `false` | Development only. |
 | `OMW_WEBHOOK_ALLOW_HTTP` | `false` | Development only: accept `http://` webhook endpoints. |
@@ -290,9 +309,23 @@ Worker (`openmailwire worker`):
 | `OMW_IPV4_ONLY` | `true` | Receivers reject IPv6 senders without IPv6 reverse DNS and SPF. |
 | `OMW_JOB_TIMEOUT` | `10m` | |
 | `OMW_STATE_DIR` | `./openmailwire-worker-state` | Holds the report outbox. |
-| `OMW_SMTP_OVERRIDE` | none | Development only: send everything to this `host:port`. |
+| `OMW_SMTP_OVERRIDE` | none | Development only: send everything to this `host:port`. MTA-STS and DANE do not apply. |
+| `OMW_DNSSEC_RESOLVER` | none | `host:port` of a DNSSEC-validating resolver the worker trusts, e.g. a local Unbound on `127.0.0.1:53`. Turns on DANE. |
 
-Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
+MTA-STS needs no setting: workers look up `_mta-sts.<domain>` and fetch the policy over HTTPS (no redirects, 64 KB at most), cached by its `id` and `max_age`.
+
+A **relay worker** is an ordinary worker with `OMW_RELAY_HOST` set. It needs its own token (`openmailwire workers add relay-1`).
+
+| Variable | Default | |
+|---|---|---|
+| `OMW_RELAY_HOST` | none | The smarthost, e.g. `smtp.provider.example`. Makes this worker a relay. |
+| `OMW_RELAY_PORT` | `587` | |
+| `OMW_RELAY_TLS` | `starttls` | `starttls` (required, never plaintext) or `implicit` (TLS from the first byte, usually port 465). The smarthost's certificate must be valid. |
+| `OMW_RELAY_USERNAME`, `OMW_RELAY_PASSWORD` | none | Credentials for `AUTH PLAIN`. Leave both empty for a smarthost that admits your IP. |
+
+Relay workers take only deliveries that already had `OMW_RELAY_AFTER_ATTEMPTS` attempts, or whose domain is paused by throttling. While one is live (a heartbeat in the last 2 minutes), direct workers leave those deliveries to it. Without one, nothing changes.
+
+Worker admin: `openmailwire workers list` (with each worker's kind, `direct` or `relay`), `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
 
 ## Roadmap
 
@@ -306,9 +339,9 @@ Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (
 - [ ] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC.
 - [x] **Signed webhooks**, Resend-compatible (v0.2).
 - [ ] **Complaint feedback loops**: `email.complained` from Yahoo, Microsoft and other feedback loops.
-- [ ] **MTA-STS and DANE**: enforce TLS where receivers require it.
-- [ ] **Adaptive throttling**: learn per-receiver limits from 421 deferrals.
-- [ ] **Fallback relay worker**: hand mail to another provider when your IPs are throttled.
+- [x] **MTA-STS and DANE**: enforce TLS where receivers require it (v0.6).
+- [x] **Adaptive throttling**: learn per-receiver limits from 421 deferrals (v0.6).
+- [x] **Fallback relay worker**: hand mail to another provider when your IPs are throttled (v0.6).
 - [ ] Attachments, scheduled sends and a batch endpoint.
 - [ ] SMTP submission (port 587) for apps that only speak SMTP.
 - [ ] Dashboard, then SDKs for Node, Python, Go and PHP.

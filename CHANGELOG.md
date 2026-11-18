@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Delivery quality (v0.6)
+
+**MTA-STS (RFC 8461).** Workers discover a recipient domain's policy (`_mta-sts.<domain>` TXT), fetch it over HTTPS (no redirects, at most 64 KB) and cache it by `id` and `max_age`.
+- `enforce`: only the MX hosts the policy names, only over TLS with a certificate valid for the host. Otherwise the attempt is deferred with `4.7.5` and a response naming the policy. The attempt's `tls` is `verified+mta-sts`.
+- `testing`: delivery goes on; the attempt's event notes in `data.tls_policy` what enforce mode would have refused.
+
+**DANE (RFC 7672),** with `OMW_DNSSEC_RESOLVER` set to a validating resolver. TLSA records at `_25._tcp.<mx>` are trusted only when the resolver sets the AD bit, and only for MX hosts whose address is signed. With usable records (DANE-EE or DANE-TA), TLS is required and the certificate must match; otherwise the attempt is deferred with `4.7.5`. The attempt's `tls` is `dane`. DANE takes precedence over MTA-STS.
+
+**Adaptive throttling.** The control plane learns per-receiver limits.
+- A throttling deferral (421, `4.7.0`, `4.7.28`, `4.7.650`, `4.3.2`, or a reply about "rate" or "too many") halves the domain's concurrency and pauses direct workers for 1, 2, 4… up to 30 minutes.
+- Each delivery raises the limit by one, up to `OMW_DOMAIN_CONCURRENCY`.
+- New timeline events `throttled` and `throttle_relaxed`, recorded before the attempt's own event. They are not webhooks.
+- Leases now hold a domain to its limit even within one request, and are serialized so concurrent workers cannot overshoot it.
+
+**Fallback relay worker.** A worker with `OMW_RELAY_HOST` (and `OMW_RELAY_PORT`, `OMW_RELAY_TLS`, `OMW_RELAY_USERNAME`, `OMW_RELAY_PASSWORD`) hands mail to a smarthost over STARTTLS or implicit TLS, with `AUTH PLAIN`. It takes deliveries with `OMW_RELAY_AFTER_ATTEMPTS` attempts (default 2) or whose domain is paused; while it is live, direct workers leave those to it. Messages pass unchanged, so DKIM still verifies.
+
+**Worker protocol.** `HeartbeatRequest` and `LeaseRequest` gain `kind` (`direct`, the default when empty, or `relay`); `Report` gains `tls_policy`. Upgrade the control plane before the workers: an older control plane refuses relay workers and testing-mode notes.
+
+**Operations.** `openmailwire workers list` shows each worker's kind. The worker starts leasing only after its first heartbeat.
+
+**Migration:** `0005_delivery.sql` adds `receiver_state` and `workers.kind`.
+
+**New dependency:** `github.com/miekg/dns` (DANE lookups with the DO and AD bits).
+
+**For tests:** `internal/smtptest` gains STARTTLS (`EnableSTARTTLS`, `RequireTLS`), implicit TLS (`StartImplicitTLS`), `AUTH PLAIN` (`RequireAuth`), replies per recipient domain (`ReplyToDomain`), `RcptCount`, and throwaway certificates (`NewCA`, `SelfSigned`).
+
 ## v0.3.0: MCP server for AI agents
 
 OpenMailWire is now built for AI agents first.
