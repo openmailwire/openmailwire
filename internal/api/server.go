@@ -47,10 +47,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /internal/worker/lease", s.withWorker(s.lease))
 	mux.Handle("POST /internal/worker/report", s.withWorker(s.report))
 
+	var root http.Handler
+	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
 	})
-	return http.MaxBytesHandler(mux, 4<<20)
+	root = http.MaxBytesHandler(mux, 4<<20)
+	return root
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

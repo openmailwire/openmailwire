@@ -10,13 +10,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/openmailwire/openmailwire/internal/api"
 	"github.com/openmailwire/openmailwire/internal/config"
 	"github.com/openmailwire/openmailwire/internal/domains"
+	"github.com/openmailwire/openmailwire/internal/mcpserver"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/smtptest"
 	"github.com/openmailwire/openmailwire/internal/store"
@@ -26,8 +30,8 @@ import (
 
 var version = "dev"
 
-const usage = `openmailwire — open-source email sending: an HTTP API, DKIM, and workers that
-deliver straight to recipients' mail servers from your own IPs.
+const usage = `openmailwire — open-source email for AI agents and the apps they run in: an
+HTTP API, an MCP server, DKIM, and workers that deliver from your own IPs.
 
 Usage:
   openmailwire serve                          run the control plane (API, queue, scheduler)
@@ -41,6 +45,7 @@ Usage:
   openmailwire workers drain <name>           stop giving the worker new jobs
   openmailwire workers resume <name>
   openmailwire domains force-verify <domain>  mark a domain verified without DNS (development only)
+  openmailwire mcp                            MCP server on stdio for AI agents (needs OMW_API_URL, OMW_API_KEY)
   openmailwire dev-sink [addr]                local SMTP sink that prints what it receives (development only)
   openmailwire version
 
@@ -80,6 +85,8 @@ func main() {
 		err = domainsCmd(ctx, args)
 	case "dev-sink":
 		err = devSink(ctx, args)
+	case "mcp":
+		err = runMCP(ctx)
 	case "version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -267,6 +274,22 @@ func workersCmd(ctx context.Context, args []string) error {
 		}
 		return nil
 	})
+}
+
+// runMCP serves the MCP tools on stdin/stdout, acting through a control
+// plane's HTTP API with one API key. Logs go to stderr; stdout carries the
+// protocol.
+func runMCP(ctx context.Context) error {
+	base := os.Getenv("OMW_API_URL")
+	if base == "" {
+		base = "http://localhost:8080"
+	}
+	key := os.Getenv("OMW_API_KEY")
+	if !strings.HasPrefix(key, "omw_") {
+		return errors.New("OMW_API_KEY is not set; create one with `openmailwire apikey create <project-id> <name>`")
+	}
+	srv := mcpserver.New(&mcpserver.APIClient{Base: base, Key: key, HTTP: &http.Client{Timeout: 90 * time.Second}}, version)
+	return srv.Run(ctx, &mcp.StdioTransport{})
 }
 
 // devSink accepts SMTP on localhost and prints each message, for running a

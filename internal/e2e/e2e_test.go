@@ -28,9 +28,11 @@ import (
 	"time"
 
 	"github.com/emersion/go-msgauth/dkim"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/openmailwire/openmailwire/internal/api"
 	"github.com/openmailwire/openmailwire/internal/config"
+	"github.com/openmailwire/openmailwire/internal/mcpserver"
 	"github.com/openmailwire/openmailwire/internal/protocol"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/smtptest"
@@ -115,6 +117,36 @@ func verifySvix(whsec, id, ts string, body []byte, header string) bool {
 		}
 	}
 	return false
+}
+
+type bearer struct{ key string }
+
+func (b bearer) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+b.key)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+func callTool(t *testing.T, s *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	res, err := s.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if res.IsError {
+		t.Fatalf("%s returned an error: %s", name, textOf(res))
+	}
+	return res
+}
+
+func textOf(res *mcp.CallToolResult) string {
+	var parts []string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			parts = append(parts, tc.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 type harness struct {
@@ -342,6 +374,72 @@ func TestEndToEnd(t *testing.T) {
 	la := lost["attempts"].([]any)[0].(map[string]any)
 	if la["outcome"] != protocol.OutcomeUnknown {
 		t.Fatalf("lost reply attempt: %v", la)
+	}
+
+	// An AI agent does the same work through MCP, first in process (as with
+	// `openmailwire mcp` on stdio), then over the remote /mcp endpoint.
+	agentSrv := mcpserver.New(&mcpserver.APIClient{Base: ts.URL, Key: apiKey, HTTP: http.DefaultClient}, "test")
+	cT, sT := mcp.NewInMemoryTransports()
+	if _, err := agentSrv.Connect(ctx, sT, nil); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := mcp.NewClient(&mcp.Implementation{Name: "e2e-agent", Version: "1"}, nil).Connect(ctx, cT, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	tl, err := agent.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolNames := map[string]*mcp.Tool{}
+	for _, tool := range tl.Tools {
+		toolNames[tool.Name] = tool
+	}
+	for _, n := range []string{"send_email", "get_email", "list_domains", "add_domain", "verify_domain"} {
+		if toolNames[n] == nil {
+			t.Fatalf("tool %s missing; have %v", n, toolNames)
+		}
+	}
+	if a := toolNames["send_email"].Annotations; a == nil || a.DestructiveHint == nil || !*a.DestructiveHint {
+		t.Fatal("send_email must be marked destructive so clients ask before sending")
+	}
+	sent := callTool(t, agent, "send_email", map[string]any{
+		"from": "Agent <agent@acme.test>", "to": []string{"agent-ok@example.test"},
+		"subject": "Sent by an agent", "text": "hello from an agent", "idempotency_key": "agent-1",
+	})
+	var sentOut struct {
+		ID string `json:"id"`
+	}
+	sentJSON, _ := json.Marshal(sent.StructuredContent)
+	json.Unmarshal(sentJSON, &sentOut)
+	if sentOut.ID == "" {
+		t.Fatalf("send_email returned no id: %s", sentJSON)
+	}
+	if got := textOf(callTool(t, agent, "get_email", map[string]any{"id": sentOut.ID, "wait_seconds": 10})); !strings.Contains(got, "agent-ok@example.test: delivered") {
+		t.Fatalf("get_email: %s", got)
+	}
+	bad, err := agent.CallTool(ctx, &mcp.CallToolParams{Name: "send_email", Arguments: map[string]any{
+		"from": "x@not-added.test", "to": []string{"a@example.test"}, "subject": "x", "text": "x",
+	}})
+	if err != nil || !bad.IsError || !strings.Contains(textOf(bad), "domain_not_found") {
+		t.Fatalf("an API error must reach the agent as a tool error: %v %+v", err, bad)
+	}
+	if got := textOf(callTool(t, agent, "verify_domain", map[string]any{"domain": "acme.test"})); !strings.Contains(got, "acme.test is verified") {
+		t.Fatalf("verify_domain: %s", got)
+	}
+
+	remote, err := mcp.NewClient(&mcp.Implementation{Name: "e2e-remote", Version: "1"}, nil).Connect(ctx,
+		&mcp.StreamableClientTransport{Endpoint: ts.URL + "/mcp", HTTPClient: &http.Client{Transport: bearer{apiKey}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	if got := textOf(callTool(t, remote, "list_domains", map[string]any{})); !strings.Contains(got, "acme.test: verified") {
+		t.Fatalf("remote list_domains: %s", got)
+	}
+	if resp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{}`)); err != nil || resp.StatusCode != 401 {
+		t.Fatalf("remote MCP without a key must be refused: %v %v", err, resp.StatusCode)
 	}
 
 	stopWorker()

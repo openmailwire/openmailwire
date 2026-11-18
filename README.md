@@ -26,12 +26,55 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 
 | What an agent needs | OpenMailWire | Status |
 |---|---|---|
-| **Use email as a tool.** Send, check delivery and set up domains from Claude, Cursor or any MCP client. | an MCP server, `openmailwire mcp`, plus a remote MCP endpoint | v0.3, in progress |
-| **Limits it cannot talk its way past.** A looping agent must not spam. | API keys per agent, with send caps and recipient allowlists, enforced by the server | v0.3 |
+| **Use email as a tool.** Send, check delivery and set up domains from Claude, Cursor or any MCP client. | an MCP server: `openmailwire mcp` (stdio) and `/mcp` (remote) | available (v0.3) |
+| **Limits it cannot talk its way past.** A looping agent must not spam. | API keys per agent, with send caps and recipient allowlists, enforced by the server | v0.4 |
 | **Facts, not guesses.** "Did it arrive?" needs a real answer. | a per-recipient timeline with the receiver's exact SMTP reply, and `unknown` when the truth is unknown | available |
 | **Errors it can act on.** | errors name the cause and the next step, e.g. which DNS record is missing | available |
 | **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer | v0.4 |
-| **Docs written for models.** | `llms.txt` and an OpenAPI spec served by every control plane | v0.3 |
+| **Docs written for models.** | `llms.txt` and an OpenAPI spec served by every control plane | v0.4 |
+
+### Connect an agent (MCP)
+
+Five tools:
+
+| Tool | What it does |
+|---|---|
+| `send_email` | Queue an email. It is marked destructive, so clients ask a human before sending. |
+| `get_email` | Delivery status per recipient. It can wait up to 60 s for a final answer. |
+| `list_domains` | The domains this key can send from, and whether each is verified. |
+| `add_domain` | Add a domain and get the DNS records to publish. |
+| `verify_domain` | Check those records now, by domain name or id. |
+
+Every tool calls the HTTP API with the agent's own API key, so the agent has exactly that key's permissions. API errors reach the agent word for word, for example `domain_not_verified … publish its DNS records and call verify_domain`.
+
+**Remote:** every control plane serves MCP at `/mcp`, authenticated with an API key. Claude Code:
+
+```sh
+claude mcp add --transport http openmailwire https://mail.example.com/mcp \
+  --header "Authorization: Bearer omw_…"
+```
+
+**Local (stdio):** run the binary next to the agent.
+
+```sh
+claude mcp add openmailwire -e OMW_API_URL=https://mail.example.com -e OMW_API_KEY=omw_… -- openmailwire mcp
+```
+
+Claude Desktop, Cursor and other clients that use JSON config:
+
+```json
+{
+  "mcpServers": {
+    "openmailwire": {
+      "command": "openmailwire",
+      "args": ["mcp"],
+      "env": { "OMW_API_URL": "https://mail.example.com", "OMW_API_KEY": "omw_…" }
+    }
+  }
+}
+```
+
+Give each agent its own key (`openmailwire apikey create <project-id> <agent-name>`), so you can revoke one without affecting the others.
 
 ## Why run it yourself
 
@@ -40,7 +83,7 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 - **It is honest about uncertainty.** If a connection drops after the message body was sent but before the receiver replied, the attempt is recorded as `unknown`. It is not quietly marked sent or failed.
 - **The API is shaped like Resend's.** `POST /emails` takes `from`, `to`, `subject`, `html` and `text`, so existing code moves with a base-URL change.
 
-> **Status: alpha (v0.2).** The send → sign → queue → deliver → report path works end to end and is covered by tests. It has not been run at volume yet. Read the [roadmap](#roadmap) before you send production login mail through it.
+> **Status: alpha (v0.3).** The send → sign → queue → deliver → report path works end to end and is covered by tests. It has not been run at volume yet. Read the [roadmap](#roadmap) before you send production login mail through it.
 
 ## How it works
 
@@ -254,10 +297,10 @@ Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (
 ## Roadmap
 
 **Agent-first**
-- [ ] **MCP server**: stdio (`openmailwire mcp`) and remote (`/mcp`). Tools to send, track, and add and verify domains (v0.3).
-- [ ] **Agent keys**: per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key (v0.3).
-- [ ] **`llms.txt` and OpenAPI**, served by the control plane (v0.3).
-- [ ] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, and an inbound webhook and MCP tool (v0.4).
+- [x] **MCP server**: stdio (`openmailwire mcp`) and remote (`/mcp`). Tools to send, track, and add and verify domains (v0.3).
+- [ ] **Agent keys**: per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key (v0.4).
+- [ ] **`llms.txt` and OpenAPI**, served by the control plane (v0.4).
+- [ ] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, and an inbound webhook and MCP tool (v0.5).
 
 **Delivery**
 - [ ] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC.

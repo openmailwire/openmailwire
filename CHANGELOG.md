@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0: MCP server for AI agents
+
+OpenMailWire is now built for AI agents first.
+
+**Two ways for an agent to connect:**
+- `openmailwire mcp` runs a Model Context Protocol server on stdio for Claude Desktop, Claude Code, Cursor and other MCP clients. Set `OMW_API_URL` and `OMW_API_KEY`.
+- Every control plane also serves MCP at `/mcp` (streamable HTTP, stateless), authenticated with an API key.
+
+**Tools:**
+- `send_email`: marked destructive, so clients ask a human before sending.
+- `get_email`: can wait up to 60 s for every recipient's final status.
+- `list_domains`, `add_domain` (returns the DNS records to publish) and `verify_domain` (by name or id).
+
+**How it behaves:**
+- Every tool calls the HTTP API with the agent's key, so an agent has exactly that key's permissions and validation.
+- API errors reach the agent word for word, with the cause and the next step.
+- Server instructions teach the agent the safe flow: verified domain, idempotency key, then check delivery. They also tell it never to retry bounced or suppressed recipients.
+
+**New dependency:** the official Go MCP SDK (`github.com/modelcontextprotocol/go-sdk` v1.8.0).
+
 ## v0.2.0: signed webhooks
 
 **New endpoints:** `POST /webhooks`, `GET /webhooks`, `GET /webhooks/{id}` (with its 20 most recent deliveries) and `DELETE /webhooks/{id}`.
