@@ -152,6 +152,25 @@ Each SDK has its own README and tests against a local mock server; the new workf
 
 **Dependencies:** `github.com/emersion/go-smtp` (SMTP server), and `golang.org/x/text` (already in the module graph) to decode the character sets received mail uses.
 
+### Web dashboard
+
+The control plane serves a dashboard at `/dashboard/` (`/dashboard` redirects there). Sign in with an API key; it is kept in the tab's `sessionStorage` only.
+
+**Pages:**
+- **Emails:** the list with "Load more", open by ID, a test-send form, and an email's per-recipient status with a timeline of attempts (worker, IP, MX, TLS, SMTP reply) and events. It refreshes itself until every recipient is final.
+- **Domains:** add, a records table with copy buttons, verify and delete.
+- **Webhooks:** create (the signing secret is shown once), delete, and recent deliveries.
+- **API keys:** create with permission and policy (caps, allowlists), revoke; the token is shown once.
+- **Inboxes:** add and delete, messages, thread view, attachments and reply.
+- Endpoints the server doesn't have yet show "Not available on this server version"; a key without the permission sees "This key can't manage …".
+
+**Security:**
+- A strict Content-Security-Policy on every dashboard response (no inline code, same-origin connections only, no framing, no form posts), plus `nosniff`, `no-referrer` and `no-store` on the page.
+- API data is only ever inserted as text. Inbound HTML is shown as source and attachments always download. A Node test fails if an HTML sink appears in the scripts.
+- No build step, no framework, no CDN: plain HTML, CSS and JavaScript modules embedded with `go:embed` (`internal/dashboard`).
+
+Usable at phone width and in dark mode.
+
 ## v0.3.0: MCP server for AI agents
 
 OpenMailWire is now built for AI agents first.
