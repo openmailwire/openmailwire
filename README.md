@@ -146,6 +146,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
 - `GET /openapi.json` (OpenAPI 3.1) and `GET /llms.txt` (a guide for models), served without a key.
 - One static binary, `openmailwire`, plays every role: `serve`, `worker` or `submission`.
+- SDKs for Node.js/TypeScript, Python, Go and PHP ([`sdks/`](sdks)), MIT licensed.
 
 ## Quick start (local, no email leaves your machine)
 
@@ -465,6 +466,28 @@ Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's 
 
 Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed. Endpoints must use `https` and resolve to public addresses (checked when connecting). That way a webhook cannot be used to reach the control plane's internal network.
 
+## SDKs
+
+Client libraries live in [`sdks/`](sdks): Node.js/TypeScript, Python, Go and PHP. Each covers the whole API (emails, domains, webhooks, API keys, inboxes and messages), can wait for delivery or for a reply, and verifies webhook signatures. They use only each language's standard library (curl for PHP), and they are MIT licensed so that apps under any licence can embed them. They are not published to npm, PyPI or Packagist yet; each README says how to install from this repository.
+
+| Language | Install | Docs |
+|---|---|---|
+| Node.js / TypeScript | `npm install openmailwire` | [sdks/node](sdks/node) |
+| Python | `pip install openmailwire` | [sdks/python](sdks/python) |
+| Go | `go get github.com/openmailwire/openmailwire/sdks/go` | [sdks/go](sdks/go) |
+| PHP | `composer require openmailwire/openmailwire` | [sdks/php](sdks/php) |
+
+```ts
+import { OpenMailWire } from "openmailwire";
+
+const omw = new OpenMailWire(); // OMW_API_URL and OMW_API_KEY
+const { id } = await omw.emails.send(
+  { from: "Acme <hello@example.com>", to: "you@example.org", subject: "Hi", text: "Hello" },
+  { idempotencyKey: "welcome-42" },
+);
+const email = await omw.waitForDelivery(id, 120_000); // every recipient final
+```
+
 ## Running in production
 
 Delivering mail yourself is mostly about IP reputation and DNS hygiene, not code. Read [docs/production.md](docs/production.md) before you send real mail. In short:
@@ -551,7 +574,8 @@ openmailwire apikey list <project-id>
 - [ ] **Fallback relay worker**: hand mail to another provider when your IPs are throttled.
 - [x] Attachments, scheduled sends and a batch endpoint (v0.4).
 - [x] **SMTP submission** on ports 587 and 465, and `POST /emails/raw`, for apps that only speak SMTP (v0.5).
-- [ ] Dashboard, then SDKs for Node, Python, Go and PHP.
+- [ ] Dashboard.
+- [x] **SDKs** for Node, Python, Go and PHP, MIT licensed ([`sdks/`](sdks); not published yet) (v0.5).
 
 ## Compared with…
 
@@ -572,3 +596,5 @@ Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Re
 ## License
 
 [AGPL-3.0](LICENSE). You can run, modify and self-host OpenMailWire freely. If you offer a modified OpenMailWire to others as a network service, you must publish your changes under the same license.
+
+The client SDKs in [`sdks/`](sdks) are MIT licensed instead, so they can be embedded in applications under any license.

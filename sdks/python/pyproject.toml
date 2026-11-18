@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmailwire"
+version = "0.1.0"
+description = "Python client for OpenMailWire, open-source email for AI agents"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "The OpenMailWire Authors" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["email", "openmailwire", "smtp", "ai-agents", "webhooks", "resend"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/openmailwire/openmailwire/tree/main/sdks/python"
+Source = "https://github.com/openmailwire/openmailwire"
+Issues = "https://github.com/openmailwire/openmailwire/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+openmailwire = ["py.typed"]

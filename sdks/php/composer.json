@@ -1,0 +1,44 @@
+{
+    "name": "openmailwire/openmailwire",
+    "description": "PHP client for OpenMailWire, open-source email for AI agents",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["email", "openmailwire", "smtp", "ai-agents", "webhooks", "resend"],
+    "homepage": "https://github.com/openmailwire/openmailwire/tree/main/sdks/php",
+    "support": {
+        "issues": "https://github.com/openmailwire/openmailwire/issues",
+        "source": "https://github.com/openmailwire/openmailwire"
+    },
+    "authors": [
+        {
+            "name": "The OpenMailWire Authors"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5 || ^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "OpenMailWire\\": "src/"
+        },
+        "files": [
+            "src/functions.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "OpenMailWire\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
