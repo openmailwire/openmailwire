@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0: API keys for agents, attachments, scheduling, batch
 
 ### API keys for agents
 
