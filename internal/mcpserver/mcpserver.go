@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +25,9 @@ const instructions = `OpenMailWire sends email from domains that have been verif
 1. Call list_domains to see which sender domains are ready (status "verified").
 2. Call send_email from an address on a verified domain. Always pass an idempotency_key and reuse it if you retry, so the email is sent at most once.
 3. Call get_email with wait_seconds to learn what happened to each recipient: delivered, deferred (will be retried), bounced (the address is bad), suppressed (it bounced before), expired, or unknown (the receiving server may or may not have it).
+To send later, pass scheduled_at to send_email; cancel_email stops a scheduled email before it is sent. list_emails shows what was sent, newest first.
 To send from a new domain: add_domain, have the DNS records it returns published, then verify_domain.
+Your API key may limit what you can do: which senders and recipients are allowed, how many recipients per hour or day, and whether you may manage domains. A refusal names the rule; on rate_limit_exceeded, wait as long as it says before retrying.
 Only send email the user has asked for. Do not retry a bounced or suppressed recipient.`
 
 // APIClient calls an OpenMailWire control plane.
@@ -108,6 +112,7 @@ func New(c *APIClient, version string) *mcp.Server {
 		Title: "Send an email",
 		Description: "Queue an email for delivery and return its id. The sender's domain must be verified (see list_domains). " +
 			"Pass idempotency_key and reuse it on retries so the same email is never sent twice. " +
+			"Set scheduled_at to send it later (up to 30 days ahead); cancel_email can stop it until then. " +
 			"Delivery happens in the background: call get_email with the returned id to see the result.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: ptr(true)},
 	}, t.sendEmail)
@@ -119,6 +124,22 @@ func New(c *APIClient, version string) *mcp.Server {
 			"Set wait_seconds (up to 60) to wait until every recipient has a final status.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: ptr(false)},
 	}, t.getEmail)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  "list_emails",
+		Title: "List sent emails",
+		Description: "List emails sent with this project (with a sending-only key: only the emails this key sent), newest first, " +
+			"with each one's latest event. Pass before (the next_before it returns) to see older ones.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: ptr(false)},
+	}, t.listEmails)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  "cancel_email",
+		Title: "Cancel a scheduled email",
+		Description: "Cancel the recipients of an email that have not been attempted yet, typically a scheduled send. " +
+			"Recipients already being delivered or finished are not affected. This cannot be undone.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: ptr(false)},
+	}, t.cancelEmail)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_domains",
@@ -160,6 +181,7 @@ type SendInput struct {
 	Tags           map[string]string `json:"tags,omitempty" jsonschema:"labels echoed in webhooks; letters, digits, underscore and hyphen only"`
 	IdempotencyKey string            `json:"idempotency_key,omitempty" jsonschema:"a unique key for this email; reuse it when retrying so the email is sent at most once"`
 	ExpiresAt      string            `json:"expires_at,omitempty" jsonschema:"RFC 3339 time after which no new delivery attempts are made, useful for one-time codes"`
+	ScheduledAt    string            `json:"scheduled_at,omitempty" jsonschema:"RFC 3339 time to send the email at, in the future and at most 30 days ahead; leave it out to send now"`
 }
 
 type SendOutput struct {
@@ -184,6 +206,9 @@ func (t *tools) sendEmail(ctx context.Context, _ *mcp.CallToolRequest, in SendIn
 	if in.ExpiresAt != "" {
 		body["expires_at"] = in.ExpiresAt
 	}
+	if in.ScheduledAt != "" {
+		body["scheduled_at"] = in.ScheduledAt
+	}
 	if len(in.Tags) > 0 {
 		var tags []map[string]string
 		for k, v := range in.Tags {
@@ -201,7 +226,83 @@ func (t *tools) sendEmail(ctx context.Context, _ *mcp.CallToolRequest, in SendIn
 	if err := t.c.do(ctx, http.MethodPost, "/emails", body, header, &resp); err != nil {
 		return nil, SendOutput{}, err
 	}
-	return nil, SendOutput{ID: resp.ID, Next: "call get_email with this id and wait_seconds to see the delivery result"}, nil
+	next := "call get_email with this id and wait_seconds to see the delivery result"
+	if in.ScheduledAt != "" {
+		next = "the email is scheduled; call cancel_email with this id to stop it before then, or get_email to check on it"
+	}
+	return nil, SendOutput{ID: resp.ID, Next: next}, nil
+}
+
+type ListEmailsInput struct {
+	Limit  int    `json:"limit,omitempty" jsonschema:"how many emails to return, 1 to 100 (default 20)"`
+	Before string `json:"before,omitempty" jsonschema:"an email id: list only emails older than it (the next_before of the previous call)"`
+}
+
+type emailSummary struct {
+	ID          string   `json:"id"`
+	From        string   `json:"from"`
+	To          []string `json:"to"`
+	Subject     string   `json:"subject"`
+	CreatedAt   string   `json:"created_at"`
+	ScheduledAt *string  `json:"scheduled_at"`
+	LastEvent   string   `json:"last_event"`
+}
+
+func (t *tools) listEmails(ctx context.Context, _ *mcp.CallToolRequest, in ListEmailsInput) (*mcp.CallToolResult, any, error) {
+	q := url.Values{}
+	if in.Limit != 0 {
+		q.Set("limit", strconv.Itoa(in.Limit))
+	}
+	if in.Before != "" {
+		if !uuidRE.MatchString(in.Before) {
+			return nil, nil, errors.New("before must be an email id, as returned in next_before")
+		}
+		q.Set("before", in.Before)
+	}
+	path := "/emails"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var resp struct {
+		Data       []emailSummary `json:"data"`
+		HasMore    bool           `json:"has_more"`
+		NextBefore *string        `json:"next_before"`
+	}
+	if err := t.c.do(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
+		return nil, nil, err
+	}
+	if len(resp.Data) == 0 {
+		return text("No emails."), nil, nil
+	}
+	var b strings.Builder
+	for _, e := range resp.Data {
+		fmt.Fprintf(&b, "- %s at %s: %q from %s to %s, last event %s", e.ID, e.CreatedAt, e.Subject, e.From, strings.Join(e.To, ", "), e.LastEvent)
+		if e.ScheduledAt != nil {
+			fmt.Fprintf(&b, ", scheduled for %s", *e.ScheduledAt)
+		}
+		b.WriteString("\n")
+	}
+	if resp.HasMore && resp.NextBefore != nil {
+		fmt.Fprintf(&b, "More emails are older: call list_emails with before=%s.\n", *resp.NextBefore)
+	}
+	return text(b.String()), nil, nil
+}
+
+type CancelEmailInput struct {
+	ID string `json:"id" jsonschema:"the email id returned by send_email"`
+}
+
+func (t *tools) cancelEmail(ctx context.Context, _ *mcp.CallToolRequest, in CancelEmailInput) (*mcp.CallToolResult, any, error) {
+	if !uuidRE.MatchString(in.ID) {
+		return nil, nil, errors.New("id must be the email id returned by send_email")
+	}
+	var resp struct {
+		Canceled []string `json:"canceled"`
+	}
+	if err := t.c.do(ctx, http.MethodPost, "/emails/"+in.ID+"/cancel", nil, nil, &resp); err != nil {
+		return nil, nil, err
+	}
+	return text(fmt.Sprintf("Canceled email %s for: %s. Nothing will be sent to them.", in.ID, strings.Join(resp.Canceled, ", "))), nil, nil
 }
 
 type GetEmailInput struct {

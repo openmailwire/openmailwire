@@ -31,17 +31,27 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
 
+	// withProject admits every key, sending_access included; withFullAccess
+	// only full_access keys.
 	mux.Handle("POST /emails", s.withProject(s.sendEmail))
+	mux.Handle("POST /emails/batch", s.withProject(s.sendBatch))
+	mux.Handle("GET /emails", s.withProject(s.listEmails))
 	mux.Handle("GET /emails/{id}", s.withProject(s.getEmail))
-	mux.Handle("POST /domains", s.withProject(s.createDomain))
+	mux.Handle("POST /emails/{id}/cancel", s.withProject(s.cancelEmail))
+	mux.Handle("POST /domains", s.withFullAccess(s.createDomain))
 	mux.Handle("GET /domains", s.withProject(s.listDomains))
 	mux.Handle("GET /domains/{id}", s.withProject(s.getDomain))
-	mux.Handle("POST /domains/{id}/verify", s.withProject(s.verifyDomain))
-	mux.Handle("DELETE /domains/{id}", s.withProject(s.deleteDomain))
-	mux.Handle("POST /webhooks", s.withProject(s.createWebhook))
-	mux.Handle("GET /webhooks", s.withProject(s.listWebhooks))
-	mux.Handle("GET /webhooks/{id}", s.withProject(s.getWebhook))
-	mux.Handle("DELETE /webhooks/{id}", s.withProject(s.deleteWebhook))
+	mux.Handle("POST /domains/{id}/verify", s.withFullAccess(s.verifyDomain))
+	mux.Handle("DELETE /domains/{id}", s.withFullAccess(s.deleteDomain))
+	mux.Handle("POST /webhooks", s.withFullAccess(s.createWebhook))
+	mux.Handle("GET /webhooks", s.withFullAccess(s.listWebhooks))
+	mux.Handle("GET /webhooks/{id}", s.withFullAccess(s.getWebhook))
+	mux.Handle("DELETE /webhooks/{id}", s.withFullAccess(s.deleteWebhook))
+	mux.Handle("POST /api-keys", s.withFullAccess(s.createAPIKey))
+	mux.Handle("GET /api-keys", s.withFullAccess(s.listAPIKeys))
+	mux.Handle("GET /api-keys/{id}", s.withFullAccess(s.getAPIKey))
+	mux.Handle("PATCH /api-keys/{id}", s.withFullAccess(s.updateAPIKey))
+	mux.Handle("DELETE /api-keys/{id}", s.withFullAccess(s.deleteAPIKey))
 
 	mux.Handle("POST /internal/worker/heartbeat", s.withWorker(s.heartbeat))
 	mux.Handle("POST /internal/worker/lease", s.withWorker(s.lease))
@@ -53,7 +63,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
 	})
-	root = http.MaxBytesHandler(mux, 4<<20)
+	root = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := *r
+		r2.Body = http.MaxBytesReader(w, r.Body, bodyLimit(r))
+		mux.ServeHTTP(w, &r2)
+	})
 	return root
 }
 

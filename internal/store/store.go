@@ -144,27 +144,6 @@ func (s *Store) CreateProject(ctx context.Context, name string) (string, error) 
 	return id, err
 }
 
-func (s *Store) CreateAPIKey(ctx context.Context, projectID, name, prefix string, hash []byte) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO api_keys (project_id, name, prefix, token_hash) VALUES ($1, $2, $3, $4)`,
-		projectID, name, prefix, hash)
-	return err
-}
-
-// APIKey is the authenticated caller of the public API. Fields that key
-// policies need (permission, limits, allowlists) are added here.
-type APIKey struct {
-	ID        string
-	ProjectID string
-}
-
-// KeyForToken returns the live API key with this token hash.
-func (s *Store) KeyForToken(ctx context.Context, hash []byte) (APIKey, error) {
-	var k APIKey
-	err := s.Pool.QueryRow(ctx, `SELECT id::text, project_id::text FROM api_keys
-		WHERE token_hash = $1 AND revoked_at IS NULL`, hash).Scan(&k.ID, &k.ProjectID)
-	return k, noRows(err)
-}
-
 // ---- workers ----
 
 type Worker struct {
@@ -345,6 +324,7 @@ type NewEmail struct {
 	ID             string
 	ProjectID      string
 	DomainID       string
+	APIKeyID       string // the key that queued it
 	From           string
 	To, Cc, Bcc    []string
 	Subject        string
@@ -356,29 +336,128 @@ type NewEmail struct {
 	Tags           map[string]string
 	RetryUncertain bool
 	ExpiresAt      time.Time
-	Recipients     []string // envelope recipients, lowercased and deduplicated
+	ScheduledAt    *time.Time // the first delivery attempt; nil means now
+	Recipients     []string   // envelope recipients, lowercased and deduplicated
 }
+
+// Inserted is the outcome of storing one NewEmail.
+type Inserted struct {
+	ID       string
+	Replayed bool // an earlier request with the same idempotency key and body
+}
+
+// errIdemRace means a concurrent request with the same idempotency key
+// committed first.
+var errIdemRace = errors.New("idempotency key race")
 
 // InsertEmail commits the message and one delivery per recipient in one
 // transaction. With an idempotency key, a repeat of the same request returns
 // the first ID (existing = true); a different request with the same key
 // returns ErrConflict.
 func (s *Store) InsertEmail(ctx context.Context, e NewEmail) (id string, existing bool, err error) {
-	if e.IdempotencyKey != "" {
-		id, err := s.findIdempotent(ctx, e.ProjectID, e.IdempotencyKey, e.RequestHash)
-		if err == nil {
-			return id, true, nil
+	out, err := s.InsertEmails(ctx, []NewEmail{e}, nil)
+	if err != nil {
+		return "", false, err
+	}
+	return out[0].ID, out[0].Replayed, nil
+}
+
+// InsertEmails stores every email, or none, in one transaction, with the
+// idempotency rules of InsertEmail applied to each. With caps, the key's
+// send caps are checked again under a per-key lock, so concurrent requests
+// cannot overshoot them together; a refusal is a *CapError.
+func (s *Store) InsertEmails(ctx context.Context, es []NewEmail, caps *SendCaps) ([]Inserted, error) {
+	for try := 0; ; try++ {
+		out, err := s.insertEmails(ctx, es, caps)
+		if errors.Is(err, errIdemRace) && try < 2 {
+			continue // the winner's rows are visible now
 		}
-		if !errors.Is(err, ErrNotFound) {
-			return "", false, err
+		return out, err
+	}
+}
+
+func (s *Store) insertEmails(ctx context.Context, es []NewEmail, caps *SendCaps) ([]Inserted, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	capped := caps != nil && caps.active()
+	if capped {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7461230, hashtext($1))`, caps.KeyID); err != nil {
+			return nil, err
 		}
 	}
+
+	out := make([]Inserted, len(es))
+	type todo struct {
+		i          int
+		suppressed map[string]bool
+	}
+	var work []todo
+	counted := 0
+	for i, e := range es {
+		if e.IdempotencyKey != "" {
+			id, err := findIdempotent(ctx, tx, e.ProjectID, e.IdempotencyKey, e.RequestHash)
+			if err == nil {
+				out[i] = Inserted{ID: id, Replayed: true}
+				continue
+			}
+			if !errors.Is(err, ErrNotFound) {
+				return nil, err
+			}
+		}
+		sup, err := suppressedAmong(ctx, tx, e.ProjectID, e.Recipients)
+		if err != nil {
+			return nil, err
+		}
+		work = append(work, todo{i, sup})
+		counted += len(e.Recipients) - len(sup)
+	}
+	if capped && counted > 0 {
+		ce, err := checkCaps(ctx, tx, *caps, counted)
+		if err != nil {
+			return nil, err
+		}
+		if ce != nil {
+			return nil, ce
+		}
+	}
+	for _, w := range work {
+		if err := insertEmail(ctx, tx, es[w.i], w.suppressed); err != nil {
+			return nil, err
+		}
+		out[w.i] = Inserted{ID: es[w.i].ID}
+	}
+	return out, tx.Commit(ctx)
+}
+
+func suppressedAmong(ctx context.Context, tx pgx.Tx, projectID string, rcpts []string) (map[string]bool, error) {
+	suppressed := map[string]bool{}
+	rows, err := tx.Query(ctx, `SELECT address FROM suppressions WHERE project_id = $1 AND address = ANY($2)`,
+		projectID, rcpts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		suppressed[a] = true
+	}
+	return suppressed, rows.Err()
+}
+
+func insertEmail(ctx context.Context, tx pgx.Tx, e NewEmail, suppressed map[string]bool) error {
 	if e.Tags == nil {
 		e.Tags = map[string]string{}
 	}
 	tags, err := json.Marshal(e.Tags)
 	if err != nil {
-		return "", false, err
+		return err
 	}
 	nonNil := func(l []string) []string {
 		if l == nil {
@@ -386,75 +465,68 @@ func (s *Store) InsertEmail(ctx context.Context, e NewEmail) (id string, existin
 		}
 		return l
 	}
-
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
-		return "", false, err
+	quota := 0
+	for _, rcpt := range e.Recipients {
+		if !suppressed[rcpt] {
+			quota++
+		}
 	}
-	defer tx.Rollback(ctx)
 
 	tag, err := tx.Exec(ctx, `INSERT INTO emails (id, project_id, domain_id, from_addr, to_addrs, cc_addrs, bcc_addrs,
-			subject, message_id, return_path, idempotency_key, request_hash, raw, tags, retry_uncertain, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			subject, message_id, return_path, idempotency_key, request_hash, raw, tags, retry_uncertain, expires_at,
+			api_key_id, scheduled_at, quota_rcpts)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		ON CONFLICT (project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
 		e.ID, e.ProjectID, nullString(e.DomainID), e.From, nonNil(e.To), nonNil(e.Cc), nonNil(e.Bcc),
 		e.Subject, e.MessageID, e.ReturnPath, nullString(e.IdempotencyKey), e.RequestHash, e.Raw, tags,
-		e.RetryUncertain, e.ExpiresAt)
+		e.RetryUncertain, e.ExpiresAt, nullString(e.APIKeyID), e.ScheduledAt, quota)
 	if err != nil {
-		return "", false, err
+		return err
 	}
 	if tag.RowsAffected() == 0 {
-		// A concurrent request with the same key won the race.
-		tx.Rollback(ctx)
-		id, err := s.findIdempotent(ctx, e.ProjectID, e.IdempotencyKey, e.RequestHash)
-		return id, err == nil, err
+		return errIdemRace
 	}
 
-	suppressed := map[string]bool{}
-	rows, err := tx.Query(ctx, `SELECT address FROM suppressions WHERE project_id = $1 AND address = ANY($2)`,
-		e.ProjectID, e.Recipients)
-	if err != nil {
-		return "", false, err
+	var scheduledData []byte
+	if e.ScheduledAt != nil {
+		scheduledData, _ = json.Marshal(map[string]any{"scheduled_at": e.ScheduledAt.UTC()})
 	}
-	for rows.Next() {
-		var a string
-		if err := rows.Scan(&a); err != nil {
-			rows.Close()
-			return "", false, err
-		}
-		suppressed[a] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return "", false, err
-	}
-
 	for _, rcpt := range e.Recipients {
 		status := "queued"
 		if suppressed[rcpt] {
 			status = "suppressed"
 		}
 		var deliveryID string
-		if err := tx.QueryRow(ctx, `INSERT INTO deliveries (email_id, rcpt, rcpt_domain, status)
-			VALUES ($1, $2, $3, $4) RETURNING id::text`,
-			e.ID, rcpt, domainOf(rcpt), status).Scan(&deliveryID); err != nil {
-			return "", false, err
+		if err := tx.QueryRow(ctx, `INSERT INTO deliveries (email_id, rcpt, rcpt_domain, status, next_attempt_at)
+			VALUES ($1, $2, $3, $4, COALESCE($5, now())) RETURNING id::text`,
+			e.ID, rcpt, domainOf(rcpt), status, e.ScheduledAt).Scan(&deliveryID); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO events (email_id, delivery_id, type) VALUES ($1, $2, $3)`,
 			e.ID, deliveryID, status); err != nil {
-			return "", false, err
+			return err
+		}
+		if status == "queued" && scheduledData != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO events (email_id, delivery_id, type, data) VALUES ($1, $2, 'scheduled', $3)`,
+				e.ID, deliveryID, scheduledData); err != nil {
+				return err
+			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return "", false, err
-	}
-	return e.ID, false, nil
+	return nil
 }
 
-func (s *Store) findIdempotent(ctx context.Context, projectID, key string, hash []byte) (string, error) {
+// FindIdempotent returns the email stored with this idempotency key:
+// ErrNotFound when there is none, ErrConflict when it was stored for a
+// different request body.
+func (s *Store) FindIdempotent(ctx context.Context, projectID, key string, hash []byte) (string, error) {
+	return findIdempotent(ctx, s.Pool, projectID, key, hash)
+}
+
+func findIdempotent(ctx context.Context, q querier, projectID, key string, hash []byte) (string, error) {
 	var id string
 	var h []byte
-	err := s.Pool.QueryRow(ctx, `SELECT id::text, request_hash FROM emails WHERE project_id = $1 AND idempotency_key = $2`,
+	err := q.QueryRow(ctx, `SELECT id::text, request_hash FROM emails WHERE project_id = $1 AND idempotency_key = $2`,
 		projectID, key).Scan(&id, &h)
 	if err != nil {
 		return "", noRows(err)
@@ -473,19 +545,21 @@ func domainOf(addr string) string {
 }
 
 type EmailView struct {
-	ID         string
-	From       string
-	To, Cc     []string
-	Bcc        []string
-	Subject    string
-	MessageID  string
-	Tags       map[string]string
-	CreatedAt  time.Time
-	ExpiresAt  time.Time
-	BodyPurged bool
-	Recipients []RecipientView
-	Attempts   []AttemptView
-	Events     []EventView
+	ID          string
+	APIKeyID    *string // nil for emails queued before keys were recorded
+	From        string
+	To, Cc      []string
+	Bcc         []string
+	Subject     string
+	MessageID   string
+	Tags        map[string]string
+	CreatedAt   time.Time
+	ScheduledAt *time.Time
+	ExpiresAt   time.Time
+	BodyPurged  bool
+	Recipients  []RecipientView
+	Attempts    []AttemptView
+	Events      []EventView
 }
 
 type RecipientView struct {
@@ -524,9 +598,10 @@ type EventView struct {
 func (s *Store) GetEmail(ctx context.Context, projectID, id string) (EmailView, error) {
 	var v EmailView
 	err := s.Pool.QueryRow(ctx, `SELECT id::text, from_addr, to_addrs, cc_addrs, bcc_addrs, subject, message_id,
-			tags, created_at, expires_at, raw IS NULL
+			tags, created_at, expires_at, raw IS NULL, api_key_id::text, scheduled_at
 		FROM emails WHERE project_id = $1 AND id = $2`, projectID, id).
-		Scan(&v.ID, &v.From, &v.To, &v.Cc, &v.Bcc, &v.Subject, &v.MessageID, &v.Tags, &v.CreatedAt, &v.ExpiresAt, &v.BodyPurged)
+		Scan(&v.ID, &v.From, &v.To, &v.Cc, &v.Bcc, &v.Subject, &v.MessageID, &v.Tags, &v.CreatedAt, &v.ExpiresAt, &v.BodyPurged,
+			&v.APIKeyID, &v.ScheduledAt)
 	if err != nil {
 		return v, noRows(err)
 	}
