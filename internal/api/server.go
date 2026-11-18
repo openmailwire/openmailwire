@@ -35,6 +35,7 @@ func (s *Server) Handler() http.Handler {
 	// only full_access keys.
 	mux.Handle("POST /emails", s.withProject(s.sendEmail))
 	mux.Handle("POST /emails/batch", s.withProject(s.sendBatch))
+	mux.Handle("POST /emails/raw", s.withProject(s.sendRaw))
 	mux.Handle("GET /emails", s.withProject(s.listEmails))
 	mux.Handle("GET /emails/{id}", s.withProject(s.getEmail))
 	mux.Handle("POST /emails/{id}/cancel", s.withProject(s.cancelEmail))

@@ -121,6 +121,8 @@ More detail: [docs/architecture.md](docs/architecture.md).
 
 - `POST /emails`: up to 50 recipients (to, cc and bcc together), HTML and text, attachments (inline images too), reply-to, custom headers, tags, `Idempotency-Key`, per-message expiry, and scheduled sends that can be canceled.
 - `POST /emails/batch`: up to 100 emails, stored all or nothing.
+- `POST /emails/raw`: send a complete message you built yourself (any MIME structure). OpenMailWire removes `Bcc`, adds `Message-ID` and `Date` if missing, and signs it.
+- SMTP submission (`openmailwire submission`) on ports 587 and 465, for apps that only speak SMTP. Clients log in with an API key.
 - `GET /emails/{id}`: the status of each recipient, every attempt, and the event timeline. `GET /emails` lists them, newest first.
 - API keys with a permission (full or sending-only) and a sending policy: caps per hour and per day, and sender and recipient allowlists. Every email records the key that sent it.
 - Domains: add a domain, get its DNS records (DKIM 2048-bit, SPF, return-path MX, DMARC), and verify them against live DNS.
@@ -135,7 +137,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Bounce addresses (VERP) carry an HMAC, ready for bounce processing.
 - Signed webhooks, verifiable by handlers written for Resend. They are retried for about a day and blocked from internal networks.
 - Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
-- One static binary, `openmailwire`, plays both roles: `serve` or `worker`.
+- One static binary, `openmailwire`, plays every role: `serve`, `worker` or `submission`.
 
 ## Quick start (local, no email leaves your machine)
 
@@ -185,6 +187,106 @@ curl localhost:8080/emails/ed01a077-… -H "Authorization: Bearer omw_…"
 
 With Docker, `docker compose up` starts PostgreSQL, the control plane and [Mailpit](https://mailpit.axllent.org) (a web inbox at http://localhost:8025). See the comments in `docker-compose.yml`.
 
+## Send over SMTP
+
+Some apps can only send through an SMTP server: WordPress, Ghost, Grafana, Jira, printers, older code. `openmailwire submission` is an SMTP submission server for them. A client logs in with an API key, and each message goes to the control plane's [`POST /emails/raw`](#post-emailsraw) with that key. It gets the same checks, key limits, DKIM signature and per-recipient timeline as a message sent through the API.
+
+```sh
+OMW_API_URL=https://mail.example.com \
+OMW_TLS_CERT=/etc/openmailwire/tls/fullchain.pem \
+OMW_TLS_KEY=/etc/openmailwire/tls/privkey.pem \
+OMW_SUBMISSION_HOSTNAME=smtp.example.com \
+OMW_SUBMISSION_TLS_LISTEN=:465 \
+  openmailwire submission          # :587 with STARTTLS, plus :465 with implicit TLS
+```
+
+Settings for the app:
+
+| Setting | Value |
+|---|---|
+| Server | your submission host, e.g. `smtp.example.com` |
+| Port and security | `587` with STARTTLS (often labelled "TLS"), or `465` with implicit TLS ("SSL/TLS") if you enabled it |
+| Authentication | `PLAIN` or `LOGIN` |
+| Username | anything; it is ignored. The app's name is a good choice. |
+| Password | an API key (`omw_…`). Give each app its own, so you can revoke one alone. |
+| From address | an address on a verified domain of the key's project |
+
+**WordPress** (WP Mail SMTP, mailer "Other SMTP"): SMTP Host `smtp.example.com`, Encryption `TLS`, SMTP Port `587`, Authentication on, SMTP Username `wordpress`, SMTP Password `omw_…`. Set From Email to an address on your verified domain.
+
+**Node.js** (Nodemailer):
+
+```js
+const transport = nodemailer.createTransport({
+  host: "smtp.example.com", port: 587, secure: false, requireTLS: true,
+  auth: { user: "my-app", pass: process.env.OMW_API_KEY },
+});
+await transport.sendMail({ from: "hello@example.com", to: "you@example.org", subject: "Hi", text: "Sent over SMTP" });
+```
+
+**Python** (standard library):
+
+```python
+import os, smtplib
+from email.message import EmailMessage
+
+msg = EmailMessage()
+msg["From"], msg["To"], msg["Subject"] = "hello@example.com", "you@example.org", "Hi"
+msg.set_content("Sent over SMTP")
+with smtplib.SMTP("smtp.example.com", 587) as s:
+    s.starttls()
+    s.login("my-app", os.environ["OMW_API_KEY"])
+    s.send_message(msg)
+```
+
+**Django:** `EMAIL_HOST = "smtp.example.com"`, `EMAIL_PORT = 587`, `EMAIL_USE_TLS = True`, `EMAIL_HOST_USER = "django"`, `EMAIL_HOST_PASSWORD = os.environ["OMW_API_KEY"]`.
+
+**Rails:**
+
+```ruby
+config.action_mailer.smtp_settings = {
+  address: "smtp.example.com", port: 587, authentication: :plain, enable_starttls_auto: true,
+  user_name: "rails", password: ENV["OMW_API_KEY"]
+}
+```
+
+**Postfix**, to relay a whole server's outgoing mail:
+
+```
+# /etc/postfix/main.cf
+relayhost = [smtp.example.com]:587
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd   # [smtp.example.com]:587 postfix:omw_…
+smtp_sasl_security_options = noanonymous
+smtp_tls_security_level = encrypt
+```
+
+**Test from a shell** with [swaks](https://jetmore.org/john/code/swaks/):
+
+```sh
+swaks --server smtp.example.com:587 --tls --auth PLAIN --auth-user test --auth-password omw_… \
+  --from hello@example.com --to you@example.org --header "Subject: test"
+```
+
+How it behaves:
+- **TLS first.** On port 587, `AUTH` is neither offered nor accepted until the client has run `STARTTLS`.
+- **The key is checked at login,** so a wrong or revoked key gets `535 5.7.8` straight away. After three failed logins the server closes the connection.
+- **Recipients** are the envelope recipients (`RCPT TO`). The `Bcc` header is removed, `Message-ID` and `Date` are added when missing, and the message is DKIM-signed. Nothing else is changed.
+- **The envelope sender** (`MAIL FROM`) is not used for delivery. Mail leaves with the domain's return path, so bounces come back to OpenMailWire.
+- **Limits:** 14 MB per message (announced with `SIZE`) and 50 recipients. Further recipients get `452`, and the client sends them in another transaction.
+- **Retries are safe.** When a message carries its own `Message-ID` and `Date`, a byte-identical resubmission (say, after a timeout) returns the first copy's ID instead of sending it again.
+- **Replies** tell the app what happened:
+
+  | API answer | SMTP reply |
+  |---|---|
+  | queued | `250 2.0.0 queued as <email id>`; look it up with `GET /emails/{id}` |
+  | invalid or revoked key | `535 5.7.8` |
+  | refused (domain not added or not verified, key policy) | `550 5.7.1` and the API's message, e.g. `the From domain example.com is not verified yet; publish its DNS records and call POST /domains/…/verify` |
+  | malformed message | `554 5.6.0` and the reason, e.g. a line longer than 998 bytes |
+  | key's sending cap reached | `451 4.7.1` and the API's message; the app retries later |
+  | control plane error or unreachable | `451 4.3.0`; the app retries later |
+
+The submission server keeps no state and holds no DKIM keys. Run it wherever apps can reach it, with `OMW_API_URL` pointing at the control plane. TLS certificates: see [docs/production.md](docs/production.md#5-smtp-submission).
+
 ## API
 
 Authenticate with `Authorization: Bearer <api key>`. Errors use Resend's shape: `{"statusCode": 422, "name": "validation_error", "message": "…"}`.
@@ -220,6 +322,38 @@ Returns `{"data": [{"id"}, …]}` in the same order. An `Idempotency-Key` on the
 ### `GET /emails`
 
 `GET /emails?limit=20&before=<email id>&api_key_id=<key id>` lists emails newest first: `{"object": "list", "data": [{id, from, to, subject, created_at, scheduled_at, last_event, api_key_id}], "has_more", "next_before"}`. Pass `next_before` as `before` to get the next page. `limit` is 1 to 100. A sending-only key lists only its own emails.
+### `POST /emails/raw`
+
+Sends a complete RFC 5322 message that you built yourself, for example with your language's MIME library. Use it for structures `POST /emails` does not cover, or to move existing code that already writes MIME. The SMTP submission server uses it too.
+
+| Field | Type | Notes |
+|---|---|---|
+| `raw` | string | Required. The whole message, header and body, base64-encoded. The request may be up to 20 MB, so the message can be about 15 MB. |
+| `rcpts` | string[] | The envelope recipients. If you leave it out, every address in `To`, `Cc` and `Bcc` gets the message. 50 at most. |
+| `mail_from` | string | Optional envelope sender. It is only checked for syntax: mail always leaves with the domain's return path, so bounces come back to OpenMailWire. |
+
+What OpenMailWire changes, and nothing else:
+- removes `Bcc` (and `Resent-Bcc`);
+- adds `Message-ID` and `Date` when they are missing;
+- turns bare LF or CR line endings into CRLF;
+- adds a `DKIM-Signature` for the `From` domain on top. Signatures already in the message stay.
+
+The `From` header must hold exactly one address, on a domain that is added to the project and verified. Lines longer than 998 bytes are refused (`422`); encode such content with quoted-printable or base64, which mail libraries do for you. API key limits apply as for `POST /emails`, and so does `Idempotency-Key`.
+
+```sh
+curl -X POST localhost:8080/emails/raw \
+  -H "Authorization: Bearer omw_…" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: weekly-report-2026-47' \
+  -d "{\"raw\": \"$(base64 < message.eml | tr -d '\n')\"}"
+# {"id":"5b0c…"}
+```
+
+| Status | `name` | When |
+|---|---|---|
+| `422` | `validation_error` | not base64, no or several `From` addresses, a malformed header, a line over 998 bytes, no recipients |
+| `403` | `domain_not_found`, `domain_not_verified` | the `From` domain is not in this project, or not verified yet |
+| `409` | `idempotency_conflict` | the `Idempotency-Key` was used with a different request |
+| `413` | `payload_too_large` | the request is over 20 MB |
 
 ### `GET /emails/{id}`
 
@@ -367,6 +501,17 @@ Worker (`openmailwire worker`):
 | `OMW_STATE_DIR` | `./openmailwire-worker-state` | Holds the report outbox. |
 | `OMW_SMTP_OVERRIDE` | none | Development only: send everything to this `host:port`. |
 
+SMTP submission (`openmailwire submission`):
+
+| Variable | Default | |
+|---|---|---|
+| `OMW_API_URL` | `http://localhost:8080` | The control plane. Use `https://` when it runs on another machine. |
+| `OMW_TLS_CERT`, `OMW_TLS_KEY` | none (required) | PEM certificate chain and private key. Re-read when the files change, so renewals need no restart. |
+| `OMW_SUBMISSION_LISTEN` | `:587` | STARTTLS; clients must use it before `AUTH`. |
+| `OMW_SUBMISSION_TLS_LISTEN` | none | e.g. `:465`, for implicit TLS. |
+| `OMW_SUBMISSION_HOSTNAME` | hostname | Announced in the greeting. Use the name on the certificate. |
+| `OMW_SUBMISSION_MAX_SIZE` | `14MB` | The largest message. 14MB is also the maximum, because `/emails/raw` takes 20 MB of base64. |
+
 Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
 
 API key admin (it reads `DATABASE_URL`):
@@ -395,7 +540,7 @@ openmailwire apikey list <project-id>
 - [ ] **Adaptive throttling**: learn per-receiver limits from 421 deferrals.
 - [ ] **Fallback relay worker**: hand mail to another provider when your IPs are throttled.
 - [x] Attachments, scheduled sends and a batch endpoint (v0.4).
-- [ ] SMTP submission (port 587) for apps that only speak SMTP.
+- [x] **SMTP submission** on ports 587 and 465, and `POST /emails/raw`, for apps that only speak SMTP (v0.5).
 - [ ] Dashboard, then SDKs for Node, Python, Go and PHP.
 
 ## Compared with…

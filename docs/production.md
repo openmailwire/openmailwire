@@ -46,7 +46,37 @@ Even before bounce processing ships, the return-path domain needs an MX (or an A
 - **Never** set `OMW_ALLOW_UNVERIFIED=true`.
 - **One instance** of `openmailwire serve` for now. Several can share a database safely (leases use `SKIP LOCKED` and migrations take an advisory lock), but that setup is not tested yet.
 
-## 5. Warm-up and day-to-day
+## 5. SMTP submission
+
+Run `openmailwire submission` only if some of your apps cannot call the HTTP API. It holds no DKIM keys and no database connection: give it `OMW_API_URL` (the control plane, over HTTPS when it is on another machine) and a TLS certificate.
+
+**The TLS certificate**
+- Clients send an API key as their SMTP password, so the server refuses `AUTH` until the connection is encrypted. The certificate is required, not optional.
+- Use a certificate from a public CA for the exact name apps connect to, e.g. `smtp.example.com`, and set `OMW_SUBMISSION_HOSTNAME` to that name. Most mail clients and libraries refuse self-signed certificates, or need an "allow insecure" switch you should not turn on.
+- Point `OMW_TLS_CERT` at the **full chain** (Let's Encrypt's `fullchain.pem`, not `cert.pem`). Clients that only know the root CA cannot verify a certificate served without its intermediates.
+- Port 25 is not involved, so get the certificate with an HTTP-01 challenge on port 80 of that host, or a DNS-01 challenge, e.g. `certbot certonly --standalone -d smtp.example.com`.
+- **Renewal needs no restart.** The files are checked on each TLS handshake and reloaded when they change. If a reload fails, for example because the new certificate is written but the key is not yet, the old certificate stays in use until both files match.
+- `/etc/letsencrypt/live` is readable by root only. Do not run OpenMailWire as root to reach it; copy the two files from a certbot deploy hook instead:
+
+  ```sh
+  # /etc/letsencrypt/renewal-hooks/deploy/openmailwire.sh
+  install -m 0640 -o root -g openmailwire "$RENEWED_LINEAGE/fullchain.pem" /etc/openmailwire/tls/fullchain.pem
+  install -m 0640 -o root -g openmailwire "$RENEWED_LINEAGE/privkey.pem"   /etc/openmailwire/tls/privkey.pem
+  ```
+
+- TLS 1.2 is the minimum version.
+
+**Ports and DNS**
+- Ports 587 and 465 are below 1024. Either grant the binary the capability (`AmbientCapabilities=CAP_NET_BIND_SERVICE` in its systemd unit), or listen on a high port (`OMW_SUBMISSION_LISTEN=:2587`) and publish it as 587 from Docker or your firewall.
+- Publish an A record for the submission name. You can also publish `_submission._tcp` and `_submissions._tcp` SRV records (RFC 6186) for clients that configure themselves.
+- Home and office networks often block outbound port 25, but rarely 587 or 465.
+
+**Abuse**
+- A connection is closed after three failed logins. Each failure is logged as `submission: authentication failed` with the client's IP, so fail2ban or a firewall rule can block repeat offenders.
+- Logs carry the key prefix, recipient domains and size, never addresses or content.
+- Each app's key has the limits you give it (send caps, allowed senders and recipients). A leaked SMTP password is an API key: revoke it like one.
+
+## 6. Warm-up and day-to-day
 
 - **Start small.** New IPs and domains have no reputation. Begin with your most-wanted mail (sign-in codes, receipts) at low volume and grow week by week.
 - **Watch the attempt timeline.** Sudden 421/4.7.x deferrals from one receiver mean slow down. Bounces with 5.7.x mean authentication or reputation, which recipient suppression cannot fix.
