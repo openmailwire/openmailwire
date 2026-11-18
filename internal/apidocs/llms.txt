@@ -15,7 +15,7 @@ This guide is for language models that call the OpenMailWire HTTP API. The compl
 
 - Send `Authorization: Bearer omw_…` with every request. Only `/health`, `/openapi.json` and `/llms.txt` are public.
 - A key belongs to one project and sees only that project's data.
-- `full_access` keys may call everything. `sending_access` keys may only: send (`POST /emails`, `/emails/batch`, `/emails/raw`); list, read and cancel the emails they sent; read domains; list inboxes, read messages and reply. Anything else answers `403 insufficient_permission`.
+- `full_access` keys may call everything. `sending_access` keys may only: send (`POST /emails`, `/emails/batch`, `/emails/raw`); list, read and cancel the emails they sent; read domains; list inboxes, read messages and their attachments, and reply. Anything else answers `403 insufficient_permission`.
 - A key may carry a policy that the server enforces: recipient caps per hour and per day, allowed recipient patterns, allowed sender patterns. Work within it. Never look for another key or another address to get around a refusal.
 - Never print, log or forward the key. It belongs only in the `Authorization` header.
 
@@ -67,11 +67,13 @@ API keys (full access):
 Inboxes and messages:
 - `POST /inboxes`: create `{"address"}` on one of the project's domains. Full access.
 - `GET /inboxes`: list inboxes.
+- `GET /inboxes/{id}`: one inbox.
 - `DELETE /inboxes/{id}`: delete an inbox. Full access.
 - `GET /inboxes/{id}/messages`: list received messages, newest first: `?limit&before&thread_id`.
 - `GET /messages/{id}`: read one message: bodies, threading headers, attachment list.
-- `GET /messages/{id}/attachments/{index}`: download one attachment's bytes. Full access.
-- `POST /messages/{id}/reply`: reply `{"text", "html"}` from the inbox, threaded. Returns `{"id"}` of the sent email.
+- `GET /messages/{id}/attachments/{index}`: download one attachment's bytes.
+- `POST /messages/{id}/reply`: reply `{"text", "html"}` from the inbox, threaded. Returns `{"id", "thread_id"}`: the sent email and its thread.
+- `GET /emails/{id}/replies`: received messages that answer one of your emails (what `wait_for_reply` polls).
 
 Meta (no key):
 - `GET /health`: `{"status":"ok","version"}`.
@@ -135,7 +137,7 @@ Register an https endpoint with `POST /webhooks`. Events:
 - `email.delivery_unknown`: outcome unknown and not retried (`retry_uncertain: false`).
 - `email.canceled`: canceled before its first attempt.
 - `email.complained`: the recipient marked it as spam. Never send to them again.
-- `email.received`: a message arrived in an inbox; `data.id` is the message id for `GET /messages/{id}`.
+- `email.received`: a message arrived in an inbox; `data.email_id` is the message id for `GET /messages/{id}`, `data.inbox` the address, `data.in_reply_to_email_id` the email it answers.
 
 Email events are about one recipient: `data.to` holds only that address. They use Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
 

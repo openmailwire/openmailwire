@@ -61,9 +61,11 @@ var publicRoutes = []route{
 	{"POST", "/inboxes", full},
 	{"GET", "/inboxes", sending},
 	{"DELETE", "/inboxes/{id}", full},
+	{"GET", "/inboxes/{id}", sending},
+	{"GET", "/emails/{id}/replies", sending},
 	{"GET", "/inboxes/{id}/messages", sending},
 	{"GET", "/messages/{id}", sending},
-	{"GET", "/messages/{id}/attachments/{index}", full},
+	{"GET", "/messages/{id}/attachments/{index}", sending},
 	{"POST", "/messages/{id}/reply", sending},
 }
 

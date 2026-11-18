@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +26,7 @@ import (
 	"github.com/openmailwire/openmailwire/internal/apikey"
 	"github.com/openmailwire/openmailwire/internal/config"
 	"github.com/openmailwire/openmailwire/internal/domains"
+	"github.com/openmailwire/openmailwire/internal/inbound"
 	"github.com/openmailwire/openmailwire/internal/mcpserver"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/smtptest"
@@ -41,6 +44,7 @@ Usage:
   openmailwire serve                          run the control plane (API, queue, scheduler)
   openmailwire worker                         run a delivery worker
   openmailwire submission                     SMTP submission on 587/465 for apps that only speak SMTP
+  openmailwire inbound                        run an inbound SMTP node (inboxes, bounces, complaints)
   openmailwire migrate                        apply database migrations
   openmailwire keygen                         print a new OMW_SECRET_KEY
   openmailwire project create <name>          create a project and its first API key
@@ -78,6 +82,8 @@ func main() {
 		err = runWorker(ctx, log)
 	case "submission":
 		err = runSubmission(ctx, log)
+	case "inbound":
+		err = runInbound(ctx, log)
 	case "migrate":
 		err = withStore(ctx, func(st *store.Store) error { return nil })
 		if err == nil {
@@ -148,6 +154,9 @@ func serve(ctx context.Context, log *slog.Logger) error {
 				if err := st.Sweep(ctx, cfg.Retention); err != nil && ctx.Err() == nil {
 					log.Error("sweep", "err", err)
 				}
+				if err := st.SweepInbound(ctx, cfg.InboundRetention); err != nil && ctx.Err() == nil {
+					log.Error("sweep inbound", "err", err)
+				}
 			}
 		}
 	}()
@@ -186,6 +195,42 @@ func runWorker(ctx context.Context, log *slog.Logger) error {
 	log.Info("worker starting", "control", cfg.ControlURL, "kind", kind, "ehlo", cfg.EHLO, "public_ip", cfg.PublicIP,
 		"concurrency", cfg.Concurrency, "dane", cfg.DNSSECResolver != "", "version", version)
 	return worker.NewRunner(cfg, log, version).Run(ctx)
+}
+
+// runInbound runs an inbound SMTP node. It holds no data: every recipient is
+// checked with the control plane and every message is stored there.
+func runInbound(ctx context.Context, log *slog.Logger) error {
+	cfg, err := config.LoadInbound()
+	if err != nil {
+		return err
+	}
+	var tlsConfig *tls.Config
+	if cfg.TLSCert != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return fmt.Errorf("OMW_TLS_CERT/OMW_TLS_KEY: %w", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	} else {
+		log.Warn("OMW_TLS_CERT is not set: STARTTLS is off, so senders deliver to this node in plain text")
+	}
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+	srv := inbound.New(inbound.Config{Hostname: cfg.Hostname, TLS: tlsConfig, MaxSize: cfg.MaxSize},
+		&inbound.Client{URL: cfg.ControlURL, Token: cfg.Token, HTTP: &http.Client{Timeout: 3 * time.Minute}}, log)
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if srv.Shutdown(sctx) != nil {
+			srv.Close()
+		}
+	}()
+	log.Info("inbound SMTP listening", "addr", cfg.Listen, "hostname", cfg.Hostname, "starttls", tlsConfig != nil,
+		"max_size", cfg.MaxSize, "control", cfg.ControlURL, "version", version)
+	return srv.Serve(ln)
 }
 
 func withStore(ctx context.Context, fn func(*store.Store) error) error {

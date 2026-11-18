@@ -2028,6 +2028,36 @@
             "$ref": "#/components/responses/NotFound"
           }
         }
+      },
+      "get": {
+        "operationId": "getInbox",
+        "tags": [
+          "Inboxes"
+        ],
+        "summary": "Get an inbox",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The inbox.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inbox"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
       }
     },
     "/inboxes/{id}/messages": {
@@ -2210,9 +2240,7 @@
         "description": "Returns the attachment's raw bytes, with its content type.\n\nNeeds a `full_access` key.",
         "security": [
           {
-            "apiKey": [
-              "full_access"
-            ]
+            "apiKey": []
           }
         ],
         "responses": {
@@ -2281,13 +2309,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EmailId"
+                  "$ref": "#/components/schemas/ReplyQueued"
                 },
                 "examples": {
                   "queued": {
                     "summary": "Queued",
                     "value": {
-                      "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94"
+                      "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "thread_id": "3f2b8c1e-6a4d-4e0f-9b7a-1c2d3e4f5a6b"
                     }
                   }
                 }
@@ -2308,6 +2337,44 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/emails/{id}/replies": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EmailId"
+        }
+      ],
+      "get": {
+        "operationId": "listEmailReplies",
+        "tags": [
+          "Inboxes"
+        ],
+        "summary": "List the replies to an email",
+        "description": "Messages received in the project's inboxes that answer this email (by `In-Reply-To`/`References`). A `sending_access` key sees replies only to emails it sent. Agents use it to wait for an answer.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The replies.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmailReplies"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           }
         }
       }
@@ -3090,7 +3157,7 @@
           "Webhook events"
         ],
         "summary": "A message arrived in an inbox",
-        "description": "One of the project's inboxes received a message. Read it with `GET /messages/{id}` using `data.id`. When it answers one of our emails, `data.in_reply_to_email_id` names that email.\n\nVerify the signature headers before trusting the body.",
+        "description": "One of the project's inboxes received a message. Read it with `GET /messages/{id}` using `data.email_id`. When it answers one of our emails, `data.in_reply_to_email_id` names that email.\n\nVerify the signature headers before trusting the body.",
         "security": [],
         "parameters": [
           {
@@ -3126,7 +3193,6 @@
                     "type": "email.received",
                     "created_at": "2026-11-18T11:02:04Z",
                     "data": {
-                      "id": "7f1e3d5c-9b2a-4c8e-a6d4-2f0e8c6a4b1d",
                       "inbox_id": "2b4d6f8a-1c3e-4a5b-9d7f-0e2c4a6b8d1f",
                       "from": "Jane Doe <jane@example.org>",
                       "to": [
@@ -3135,7 +3201,9 @@
                       "subject": "Re: Your order #1042",
                       "thread_id": "5b2e9c41-7d0a-4c1e-8f3b-6a9d2e1c0b57",
                       "in_reply_to_email_id": "5b2e9c41-7d0a-4c1e-8f3b-6a9d2e1c0b57",
-                      "received_at": "2026-11-18T11:02:04Z"
+                      "email_id": "7f1e3d5c-9b2a-4c8e-a6d4-2f0e8c6a4b1d",
+                      "created_at": "2026-11-18T11:02:04Z",
+                      "inbox": "support@acme.com"
                     }
                   }
                 }
@@ -4288,10 +4356,11 @@
         "type": "object",
         "description": "An address that receives mail for an agent.",
         "required": [
-          "object",
-          "id",
           "address",
-          "created_at"
+          "created_at",
+          "domain_id",
+          "id",
+          "object"
         ],
         "properties": {
           "object": {
@@ -4308,6 +4377,11 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "domain_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The domain the address is on."
           }
         }
       },
@@ -4678,6 +4752,20 @@
           },
           "delivery": {
             "$ref": "#/components/schemas/DeliveryDetail"
+          },
+          "complaint": {
+            "type": "object",
+            "description": "`email.complained` only.",
+            "properties": {
+              "feedback_type": {
+                "type": "string",
+                "description": "From the ARF report, e.g. `abuse`."
+              },
+              "user_agent": {
+                "type": "string",
+                "description": "The feedback loop that sent it."
+              }
+            }
           }
         }
       },
@@ -4705,25 +4793,27 @@
       },
       "MessageReceivedData": {
         "type": "object",
+        "description": "The data of `email.received`. Field names follow the other email events; `email_id` is the received message's id.",
         "required": [
-          "id",
-          "inbox_id",
+          "email_id",
+          "created_at",
           "from",
           "to",
           "subject",
-          "thread_id",
-          "in_reply_to_email_id",
-          "received_at"
+          "inbox_id",
+          "inbox",
+          "thread_id"
         ],
         "properties": {
-          "id": {
+          "email_id": {
             "type": "string",
             "format": "uuid",
             "description": "The received message. Read it with `GET /messages/{id}`."
           },
-          "inbox_id": {
+          "created_at": {
             "type": "string",
-            "format": "uuid"
+            "format": "date-time",
+            "description": "When it was received."
           },
           "from": {
             "type": "string"
@@ -4732,26 +4822,39 @@
             "type": "array",
             "items": {
               "type": "string"
+            },
+            "description": "The To addresses; the inbox address when the inbox was only in Bcc."
+          },
+          "cc": {
+            "type": "array",
+            "items": {
+              "type": "string"
             }
           },
           "subject": {
             "type": "string"
           },
-          "thread_id": {
+          "message_id": {
+            "type": "string",
+            "description": "The message's own Message-ID header, with angle brackets."
+          },
+          "inbox_id": {
             "type": "string",
             "format": "uuid"
           },
-          "in_reply_to_email_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "uuid",
-            "description": "The email of ours it answers, if any."
-          },
-          "received_at": {
+          "inbox": {
             "type": "string",
-            "format": "date-time"
+            "description": "The inbox address."
+          },
+          "thread_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The thread it belongs to."
+          },
+          "in_reply_to_email_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The email of ours it answers, when there is one; omitted otherwise."
           }
         }
       },
@@ -4773,6 +4876,55 @@
           },
           "data": {
             "$ref": "#/components/schemas/MessageReceivedData"
+          }
+        }
+      },
+      "ReplyQueued": {
+        "type": "object",
+        "required": [
+          "id",
+          "thread_id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The sent email; follow it with `GET /emails/{id}`."
+          },
+          "thread_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The thread the reply belongs to."
+          }
+        }
+      },
+      "EmailReplies": {
+        "type": "object",
+        "required": [
+          "object",
+          "email_id",
+          "thread_id",
+          "data"
+        ],
+        "properties": {
+          "object": {
+            "const": "list"
+          },
+          "email_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "thread_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The email's thread."
+          },
+          "data": {
+            "type": "array",
+            "description": "Received messages that answer the email, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/MessageSummary"
+            }
           }
         }
       }

@@ -1,0 +1,110 @@
+Delivered-To: b-7a1b2c3d4e5f40718293a4b5c6d7e8f9-a1b2c3d4e5@bounce.acme.test
+Return-Path: <>
+Received: by mail-sor-f69.google.com with SMTP id 5b1f17b1804b1-47b2c3d4e5fso1234567f8f.2
+        for <b-7a1b2c3d4e5f40718293a4b5c6d7e8f9-a1b2c3d4e5@bounce.acme.test>; Tue, 17 Nov 2026 01:20:31 -0800 (PST)
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=1e100.net; s=20230601; t=1763371231; x=1763976031;
+        h=message-id:date:from:to:subject; bh=frcCV1k9oG9oKj3dpUqdJg1PxRT2RSN/XKdLCPjaYaY=;
+        b=ZmFrZQ==
+X-Failed-Recipients: missing.person@gmail.com
+Content-Type: multipart/report; boundary="000000000000c5b8a1062f3e9b11"; report-type=delivery-status
+From: Mail Delivery Subsystem <mailer-daemon@googlemail.com>
+To: b-7a1b2c3d4e5f40718293a4b5c6d7e8f9-a1b2c3d4e5@bounce.acme.test
+Auto-Submitted: auto-replied
+Subject: Delivery Status Notification (Failure)
+References: <7a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9@acme.test>
+In-Reply-To: <7a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9@acme.test>
+Message-ID: <6739a1df.050a0220.1c2b3d.abcdGMR@mx.google.com>
+Date: Tue, 17 Nov 2026 01:20:31 -0800 (PST)
+
+--000000000000c5b8a1062f3e9b11
+Content-Type: multipart/related; boundary="000000000000c5c2a4062f3e9b15"
+
+--000000000000c5c2a4062f3e9b15
+Content-Type: multipart/alternative; boundary="000000000000c5c2a5062f3e9b16"
+
+--000000000000c5c2a5062f3e9b16
+Content-Type: text/plain; charset="UTF-8"
+
+
+** Address not found **
+
+Your message wasn't delivered to missing.person@gmail.com because the address couldn't be found, or is unable to receive mail.
+
+Learn more here: https://support.google.com/mail/?p=NoSuchUser
+
+The response was:
+
+550 5.1.1 The email account that you tried to reach does not exist. Please try double-checking the recipient's email address for typos or unnecessary spaces. For more information, go to https://support.google.com/mail/?p=NoSuchUser 5b1f17b1804b1-47b2c3d4e5fsi123456f8f.123 - gsmtp
+
+--000000000000c5c2a5062f3e9b16
+Content-Type: text/html; charset="UTF-8"
+
+
+<html>
+<head>
+<style>
+* {
+font-family:Roboto, "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+</style>
+</head>
+<body>
+<table cellpadding="0" cellspacing="0" class="email-wrapper" style="padding-top:32px;background-color:#ffffff;"><tbody>
+<tr><td>
+<p>Your message wasn't delivered to <a style='color:#212121;text-decoration:none'><b>missing.person@gmail.com</b></a> because the address couldn't be found, or is unable to receive mail.</p>
+</td></tr>
+</tbody></table>
+</body>
+</html>
+
+--000000000000c5c2a5062f3e9b16--
+--000000000000c5c2a4062f3e9b15
+Content-Type: image/png; name="icon.png"
+Content-Disposition: attachment; filename="icon.png"
+Content-Transfer-Encoding: base64
+Content-ID: <icon.png>
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2O
+UAAAAABJRU5ErkJggg==
+--000000000000c5c2a4062f3e9b15--
+--000000000000c5b8a1062f3e9b11
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; googlemail.com
+Received-From-MTA: dns; w1.openmailwire.test
+Arrival-Date: Tue, 17 Nov 2026 01:20:30 -0800 (PST)
+X-Original-Message-ID: <7a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9@acme.test>
+
+Final-Recipient: rfc822; missing.person@gmail.com
+Action: failed
+Status: 5.1.1
+Remote-MTA: dns; gmail-smtp-in.l.google.com. (142.250.27.26, the server for
+ the domain gmail.com.)
+Diagnostic-Code: smtp; 550-5.1.1 The email account that you tried to reach does
+ not exist. Please try 550-5.1.1 double-checking the recipient's email address
+ for typos or 550-5.1.1 unnecessary spaces. For more information, go to 550
+ 5.1.1  https://support.google.com/mail/?p=NoSuchUser
+ 5b1f17b1804b1-47b2c3d4e5fsi123456f8f.123 - gsmtp
+Last-Attempt-Date: Tue, 17 Nov 2026 01:20:31 -0800 (PST)
+
+--000000000000c5b8a1062f3e9b11
+Content-Type: message/rfc822
+
+Return-Path: <b-7a1b2c3d4e5f40718293a4b5c6d7e8f9-a1b2c3d4e5@bounce.acme.test>
+Received: from w1.openmailwire.test ([203.0.113.7])
+        by mx.google.com with ESMTPS id 5b1f17b1804b1-47b2c3d4e5fsi123456f8f.123
+        for <missing.person@gmail.com>
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Tue, 17 Nov 2026 01:20:30 -0800 (PST)
+From: Acme Support <support@acme.test>
+To: missing.person@gmail.com
+Subject: Your order has shipped
+Date: Tue, 17 Nov 2026 09:20:29 +0000
+Message-ID: <7a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9@acme.test>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+Your order has shipped.
+
+--000000000000c5b8a1062f3e9b11--

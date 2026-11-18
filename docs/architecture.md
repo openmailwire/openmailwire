@@ -1,11 +1,12 @@
 # Architecture
 
-OpenMailWire has two roles, built into one binary.
+OpenMailWire's roles are built into one binary.
 
 | Role | Command | Holds |
 |---|---|---|
-| Control plane | `openmailwire serve` | The API, PostgreSQL, DKIM private keys, scheduling, suppression, events |
+| Control plane | `openmailwire serve` | The API, PostgreSQL, DKIM private keys, scheduling, suppression, events, inboxes |
 | Worker | `openmailwire worker` | Nothing durable except a small outbox of unsent reports |
+| Inbound node (optional) | `openmailwire inbound` | Nothing: it checks each recipient with the control plane and hands each message over before answering `250` |
 
 ## Life of a message
 
@@ -17,7 +18,17 @@ OpenMailWire has two roles, built into one binary.
    - returns the signed message and a VERP envelope sender.
 3. **Deliver.** The worker resolves MX records (preference order, implicit MX, null MX) and connects on port 25. It offers STARTTLS when the server supports it and records `none`, `opportunistic` or `verified`. When the domain publishes an MTA-STS policy in `enforce` mode, or the MX host has DNSSEC-signed TLSA records (DANE), TLS is required and must check out (`verified+mta-sts`, `dane`); otherwise the attempt is deferred with `4.7.5`. Then it runs MAIL, RCPT and DATA. The final reply text, which usually contains the receiver's queue ID, is kept.
 4. **Report.** The worker writes the outcome to its outbox, posts it, and deletes it once the control plane has accepted it. The control plane records the attempt, applies the policy (below), and appends an event.
-5. **Sweep.** Every 15 seconds the control plane reclaims expired leases, expires overdue deliveries, and purges message bodies past retention.
+5. **Sweep.** Every 15 seconds the control plane reclaims expired leases, expires overdue deliveries, and purges message bodies past retention (`OMW_RETENTION` for sent mail, `OMW_INBOUND_RETENTION` for inbox messages).
+
+## Inbound mail
+
+1. **RCPT.** For each `RCPT TO` the inbound node calls `POST /internal/inbound/check`. The control plane answers what the address is: a bounce address (`b-<delivery>-<hmac>@<return path>`, with a valid HMAC and an existing delivery on that return path), the feedback-loop address, or an inbox. Anything else gets `550 5.1.1`, so no bounce is ever generated afterwards.
+2. **DATA.** The node adds a `Received` header and posts the message to `POST /internal/inbound`. It answers `250` only when the control plane has stored it; otherwise `451`, and the sender retries.
+3. **Per recipient**, the control plane:
+   - **bounce address**: parses the report. A DSN with `Action: failed` sets the delivery to `bounced` (from any state but `bounced` and `suppressed`, so a late DSN after `delivered` counts), records a `bounced` event with `source: dsn`, and suppresses the address on 5.1.x. An ARF report there is a complaint about that delivery.
+   - **feedback-loop address**: an ARF report is matched to a delivery through the VERP sender it quotes, or else the original Message-ID and recipient. It records `complained` and suppresses the address with reason `complaint`.
+   - **inbox**: seals the raw message, links it to a thread, stores it and records a `received` event (events now point at an email or at an inbound message).
+4. **Threading.** `In-Reply-To`, then `References` from newest to oldest, are matched against the project's sent emails' Message-IDs and earlier inbound messages. The first match gives `thread_id`; the first sent email matched gives `in_reply_to_email_id`. A reply sent with `POST /messages/{id}/reply` is recorded in `email_threads`, so the answer to it lands in the same thread. That table keeps the send path unchanged: an email with no row starts its own thread.
 
 ## Delivery states
 
@@ -71,7 +82,7 @@ A unique index handles two requests that race.
 - **Workers get only what they need:** signed messages, one lease at a time. They never see DKIM keys or other projects' data beyond the jobs they carry.
 - **Project isolation.** A project's API key can read only that project's messages and domains.
 - **Key permissions and policies.** A `sending_access` key can only send and read its own emails. A key's policy (allowed senders and recipients, hourly and daily caps) is enforced in one place, `authorizeSend`, by every path that queues mail. The caps are re-checked under a per-key advisory lock in the insert transaction, so concurrent requests cannot overshoot them.
-- **Signed bounce addresses.** VERP addresses carry an HMAC (a key derived from the secret key), so a future bounce processor can reject forged bounces.
+- **Signed bounce addresses.** VERP addresses carry an HMAC (a key derived from the secret key). The inbound node refuses bounces to addresses whose HMAC does not check out, so nobody can mark your deliveries bounced or suppress your recipients with forged DSNs.
 
 ## Database
 

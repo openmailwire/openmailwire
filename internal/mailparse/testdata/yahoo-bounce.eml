@@ -1,0 +1,26 @@
+Return-Path: <>
+Received: from mta6024.mail.gq1.yahoo.com by sonic312-21.consmr.mail.gq1.yahoo.com with HTTP; Tue, 17 Nov 2026 09:40:12 +0000
+Date: Tue, 17 Nov 2026 09:40:12 +0000
+From: MAILER-DAEMON@yahoo.com
+To: b-2b3c4d5e6f7a48b9c0d1e2f3a4b5c6d7-5e4d3c2b1a@bounce.acme.test
+Subject: Failure Notice
+MIME-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+
+Sorry, we were unable to deliver your message to the following address.
+
+<gone.user@yahoo.com>:
+554: delivery error: dd This user doesn't have a yahoo.com account (gone.user@yahoo.com) [0] - mta6024.mail.gq1.yahoo.com
+
+--- Below this line is a copy of the message.
+
+Return-Path: <b-2b3c4d5e6f7a48b9c0d1e2f3a4b5c6d7-5e4d3c2b1a@bounce.acme.test>
+Received: from 203.0.113.7 (EHLO w1.openmailwire.test)
+ by mta6024.mail.gq1.yahoo.com with SMTP; Tue, 17 Nov 2026 09:40:11 +0000
+From: Acme <hello@acme.test>
+To: gone.user@yahoo.com
+Subject: Welcome to Acme
+Message-ID: <2b3c4d5e-6f7a-48b9-c0d1-e2f3a4b5c6d7@acme.test>
+Date: Tue, 17 Nov 2026 09:40:10 +0000
+
+Welcome!

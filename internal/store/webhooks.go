@@ -91,7 +91,9 @@ func (s *Store) RecentWebhookDeliveries(ctx context.Context, webhookID string, n
 	return out, rows.Err()
 }
 
-// EventRow is one timeline event with the message it belongs to.
+// EventRow is one timeline event with the message it belongs to: a sent
+// email or, when InboundMessageID is set, an inbound message (EmailID then
+// holds the inbound message's id too).
 type EventRow struct {
 	ID             int64
 	Type           string
@@ -105,6 +107,15 @@ type EventRow struct {
 	Tags           map[string]string
 	EmailCreatedAt time.Time
 	Recipient      string
+
+	// Inbound messages only.
+	InboundMessageID string
+	Cc               []string
+	MessageID        string
+	InboxID          string
+	InboxAddress     string
+	ThreadID         string
+	InReplyToEmailID string
 }
 
 type NewWebhookDelivery struct {
@@ -128,12 +139,19 @@ func (s *Store) FanoutWebhooks(ctx context.Context, limit int, build func(EventR
 	if err := tx.QueryRow(ctx, `SELECT last_event_id FROM webhook_cursor WHERE id = 1 FOR UPDATE`).Scan(&cursor); err != nil {
 		return 0, err
 	}
-	rows, err := tx.Query(ctx, `SELECT e.id, e.type, e.created_at, e.data, m.id::text, m.project_id::text,
-			m.from_addr, m.to_addrs, m.subject, m.tags, m.created_at, COALESCE(d.rcpt, '')
+	rows, err := tx.Query(ctx, `SELECT e.id, e.type, e.created_at, e.data,
+			COALESCE(m.id, im.id)::text, COALESCE(m.project_id, im.project_id)::text,
+			COALESCE(m.from_addr, im.from_addr), COALESCE(m.to_addrs, im.to_addrs), COALESCE(m.subject, im.subject),
+			COALESCE(m.tags, '{}'), COALESCE(m.created_at, im.received_at), COALESCE(d.rcpt, ''),
+			COALESCE(im.id::text, ''), COALESCE(im.cc_addrs, '{}'), COALESCE(im.message_id, ''),
+			COALESCE(im.inbox_id::text, ''), COALESCE(ib.address, ''), COALESCE(im.thread_id::text, ''),
+			COALESCE(im.in_reply_to_email_id::text, '')
 		FROM events e
-		JOIN emails m ON m.id = e.email_id
+		LEFT JOIN emails m ON m.id = e.email_id
 		LEFT JOIN deliveries d ON d.id = e.delivery_id
-		WHERE e.id > $1 ORDER BY e.id LIMIT $2`, cursor, limit)
+		LEFT JOIN inbound_messages im ON im.id = e.inbound_message_id
+		LEFT JOIN inboxes ib ON ib.id = im.inbox_id
+		WHERE e.id > $1 AND (m.id IS NOT NULL OR im.id IS NOT NULL) ORDER BY e.id LIMIT $2`, cursor, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -142,7 +160,9 @@ func (s *Store) FanoutWebhooks(ctx context.Context, limit int, build func(EventR
 	for rows.Next() {
 		var ev EventRow
 		if err := rows.Scan(&ev.ID, &ev.Type, &ev.CreatedAt, &ev.Data, &ev.EmailID, &ev.ProjectID,
-			&ev.From, &ev.To, &ev.Subject, &ev.Tags, &ev.EmailCreatedAt, &ev.Recipient); err != nil {
+			&ev.From, &ev.To, &ev.Subject, &ev.Tags, &ev.EmailCreatedAt, &ev.Recipient,
+			&ev.InboundMessageID, &ev.Cc, &ev.MessageID, &ev.InboxID, &ev.InboxAddress, &ev.ThreadID,
+			&ev.InReplyToEmailID); err != nil {
 			rows.Close()
 			return 0, err
 		}

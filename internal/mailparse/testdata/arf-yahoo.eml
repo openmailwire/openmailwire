@@ -1,0 +1,51 @@
+Return-Path: <feedbackloop@yahoo.com>
+Received: from mta4001.mail.bf1.yahoo.com (mta4001.mail.bf1.yahoo.com [98.139.212.80])
+	by inbound.openmailwire.test (OpenMailWire) with ESMTPS; Tue, 17 Nov 2026 10:02:13 +0000
+Date: Tue, 17 Nov 2026 10:02:12 +0000
+From: Yahoo! Mail AntiSpam Feedback <feedbackloop@yahoo.com>
+To: fbl@feedback.openmailwire.test
+Subject: FW: Spring sale starts today
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=feedback-report;
+	boundary="----=_Part_4271_1828367891.1763373732961"
+Message-ID: <1763373732961.4271.yahoo.feedback@mta4001.mail.bf1.yahoo.com>
+
+------=_Part_4271_1828367891.1763373732961
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+This is an email abuse report for an email message received from IP 203.0.113.7 on Tue, 17 Nov 2026 09:58:40 +0000.
+For more information about this format please see http://tools.ietf.org/html/rfc5965.
+
+------=_Part_4271_1828367891.1763373732961
+Content-Type: message/feedback-report
+Content-Transfer-Encoding: 7bit
+
+Feedback-Type: abuse
+User-Agent: Yahoo!-Mail-Feedback/2.0
+Version: 0.1
+Original-Mail-From: <b-3c4d5e6f7a8b49c0d1e2f3a4b5c6d7e8-9f8e7d6c5b@bounce.acme.test>
+Original-Rcpt-To: <complainer@yahoo.com>
+Received-Date: Tue, 17 Nov 2026 09:58:40 +0000
+Source-IP: 203.0.113.7
+Reported-Domain: acme.test
+Authentication-Results: mta4001.mail.bf1.yahoo.com  from=acme.test; domainkeys=neutral (no sig);  from=acme.test; dkim=pass (ok)
+
+------=_Part_4271_1828367891.1763373732961
+Content-Type: message/rfc822
+Content-Disposition: inline
+
+Return-Path: <b-3c4d5e6f7a8b49c0d1e2f3a4b5c6d7e8-9f8e7d6c5b@bounce.acme.test>
+Received: from 203.0.113.7 (EHLO w1.openmailwire.test)
+ by mta4001.mail.bf1.yahoo.com with SMTP; Tue, 17 Nov 2026 09:58:40 +0000
+From: Acme <news@acme.test>
+To: complainer@yahoo.com
+Subject: Spring sale starts today
+Date: Tue, 17 Nov 2026 09:58:38 +0000
+Message-ID: <3c4d5e6f-7a8b-49c0-d1e2-f3a4b5c6d7e8@acme.test>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Everything is 20% off.
+
+------=_Part_4271_1828367891.1763373732961--

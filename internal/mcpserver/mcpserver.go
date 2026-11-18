@@ -104,8 +104,9 @@ func pretty(v any) string {
 // New returns an MCP server whose tools act through c.
 func New(c *APIClient, version string) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "openmailwire", Title: "OpenMailWire", Version: version},
-		&mcp.ServerOptions{Instructions: instructions})
+		&mcp.ServerOptions{Instructions: instructions + inboxInstructions})
 	t := &tools{c: c}
+	addInboxTools(s, t)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:  "send_email",
