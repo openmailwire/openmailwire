@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
 ### SMTP submission and raw messages (v0.5)
 
