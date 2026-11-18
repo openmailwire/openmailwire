@@ -80,5 +80,37 @@ Run `openmailwire submission` only if some of your apps cannot call the HTTP API
 
 - **Start small.** New IPs and domains have no reputation. Begin with your most-wanted mail (sign-in codes, receipts) at low volume and grow week by week.
 - **Watch the attempt timeline.** Sudden 421/4.7.x deferrals from one receiver mean slow down. Bounces with 5.7.x mean authentication or reputation, which recipient suppression cannot fix.
+- **Adaptive throttling slows down for you.** A "slow down" deferral (421, `4.7.28`, `4.7.650`, "too many", "rate") halves that domain's concurrency, from `OMW_DOMAIN_CONCURRENCY` down to 1, and pauses direct workers for 1, 2, 4… up to 30 minutes. Each later delivery raises the limit by one. The timeline shows `throttled` and `throttle_relaxed` events, and `SELECT * FROM receiver_state` shows every domain's current limit and pause. If one receiver keeps throttling you, lower your volume to it; the pauses only space out the retries.
 - **Bulk-sender rules.** Gmail and Yahoo require SPF, DKIM, DMARC, a one-click unsubscribe (`List-Unsubscribe` and `List-Unsubscribe-Post` headers) on marketing mail, and a spam-complaint rate under 0.3%.
 - **Drain before maintenance.** `openmailwire workers drain <name>` stops new jobs to a worker. In-flight deliveries finish, then you can stop it.
+
+## 6. TLS policies: MTA-STS and DANE
+
+Receivers can require encrypted, authenticated delivery. Workers honour both standards; nothing breaks for domains that publish neither.
+
+**MTA-STS (RFC 8461)** needs no configuration.
+- Workers look up `_mta-sts.<domain>` (TXT), fetch `https://mta-sts.<domain>/.well-known/mta-sts.txt` and cache the policy by its `id` until `max_age` passes. Redirects are not followed, and bodies over 64 KB are refused.
+- **`enforce`:** only the MX hosts the policy lists are used, and only with STARTTLS and a certificate valid for the host. Otherwise the attempt is deferred with `4.7.5` and a response that names the policy. Retries follow the usual schedule, so a receiver that fixes its certificate gets its mail.
+- **`testing`:** mail goes out as usual; the attempt's event notes in `data.tls_policy` what enforce mode would have refused.
+- Workers need outbound HTTPS (port 443) to fetch policies. If a fetch fails, the cached policy (or none) applies, as the RFC requires.
+- The attempt's `tls` is `verified+mta-sts` when the policy was enforced.
+
+**DANE (RFC 7672)** needs a resolver you trust.
+- Run a DNSSEC-validating resolver next to each worker, e.g. Unbound on `127.0.0.1:53`, and set `OMW_DNSSEC_RESOLVER=127.0.0.1:53`. The worker trusts the resolver's AD bit, so never point it at a resolver across a network you do not control. Public resolvers reached over the internet are not good enough.
+- For each MX host whose address is DNSSEC-signed, the worker asks for `_25._tcp.<mx>` TLSA records. When the answer is authenticated and has usable records (DANE-EE `3` or DANE-TA `2`, selectors `0`/`1`, matching types `0`/`1`/`2`), TLS is required and the certificate must match. Otherwise the attempt is deferred with `4.7.5`.
+- If the resolver is down, or answers SERVFAIL (DNSSEC validation failed) for a signed host's records, that host is not used and the attempt is deferred. A broken resolver delays mail rather than sending it unprotected, so monitor it like any other dependency.
+- DANE takes precedence over MTA-STS for a host that has TLSA records. The attempt's `tls` is `dane`.
+
+## 7. A fallback relay
+
+When your IPs are throttled or blocked by one receiver, a relay worker can hand those messages to another provider (any smarthost that speaks SMTP submission: a transactional email service, your ISP's relay, a second OpenMailWire installation).
+
+1. Register it like any worker: `openmailwire workers add relay-1`.
+2. Run `openmailwire worker` with `OMW_RELAY_HOST`, `OMW_RELAY_PORT` (587), `OMW_RELAY_TLS` (`starttls` or `implicit`) and, usually, `OMW_RELAY_USERNAME` and `OMW_RELAY_PASSWORD`. It can run on the control-plane machine; it does not need port 25.
+3. The relay gets deliveries that already had `OMW_RELAY_AFTER_ATTEMPTS` attempts (default 2, set on the control plane), and deliveries to domains paused by adaptive throttling. While it is live, direct workers leave those to it. Stop it and everything goes back to direct delivery within 2 minutes.
+
+Before you rely on it:
+- **The smarthost must accept your envelope senders.** Mail leaves with the VERP return path `b-…@bounce.<your domain>`. Many providers only accept senders on domains you verified with them; verify the return-path domains (or the whole domain) there, or the smarthost will refuse every message.
+- **SPF.** The smarthost's IPs send for your return-path domains, so add its SPF include to your `_spf` record. DKIM is unaffected: the message is passed on byte for byte, so your signature still verifies and DMARC still aligns.
+- **TLS is mandatory** and the certificate must be valid for `OMW_RELAY_HOST`, because the session carries your credentials.
+- **Outcomes.** A refused login or TLS failure is deferred, never bounced: it is about the relay, not the recipient. Replies to `MAIL`, `RCPT` and `DATA` count as they do for direct delivery, so a smarthost that refuses a recipient with 5xx bounces it. The relay's acceptance is recorded as `delivered`; a later bounce from the provider arrives at the return path like any other bounce.

@@ -155,13 +155,14 @@ type Worker struct {
 	Version    string     `json:"version"`
 	Draining   bool       `json:"draining"`
 	LastSeenAt *time.Time `json:"last_seen_at"`
+	Kind       string     `json:"kind"` // "direct" or "relay", as last announced by the worker
 }
 
-const workerCols = `id::text, name, ip, ehlo, capacity, version, draining, last_seen_at`
+const workerCols = `id::text, name, ip, ehlo, capacity, version, draining, last_seen_at, kind`
 
 func scanWorker(row pgx.Row) (Worker, error) {
 	var w Worker
-	err := row.Scan(&w.ID, &w.Name, &w.IP, &w.EHLO, &w.Capacity, &w.Version, &w.Draining, &w.LastSeenAt)
+	err := row.Scan(&w.ID, &w.Name, &w.IP, &w.EHLO, &w.Capacity, &w.Version, &w.Draining, &w.LastSeenAt, &w.Kind)
 	return w, err
 }
 
@@ -205,8 +206,13 @@ func (s *Store) SetDraining(ctx context.Context, name string, draining bool) err
 }
 
 func (s *Store) Heartbeat(ctx context.Context, workerID string, hb protocol.HeartbeatRequest) (draining bool, err error) {
-	err = s.Pool.QueryRow(ctx, `UPDATE workers SET ip = $2, ehlo = $3, capacity = $4, version = $5, last_seen_at = now()
-		WHERE id = $1 RETURNING draining`, workerID, hb.PublicIP, hb.EHLO, hb.Capacity, hb.Version).Scan(&draining)
+	kind := hb.Kind
+	if kind == "" {
+		kind = protocol.KindDirect
+	}
+	err = s.Pool.QueryRow(ctx, `UPDATE workers SET ip = $2, ehlo = $3, capacity = $4, version = $5, kind = $6,
+			last_seen_at = now()
+		WHERE id = $1 RETURNING draining`, workerID, hb.PublicIP, hb.EHLO, hb.Capacity, hb.Version, kind).Scan(&draining)
 	return draining, noRows(err)
 }
 
@@ -670,49 +676,16 @@ type LeasedJob struct {
 	ReturnPath string
 }
 
-// Lease hands up to max due deliveries to a worker. Each gets a fresh attempt
-// ID and an expiring lease. perDomain caps in-flight deliveries per
-// recipient domain across all workers, so adding a worker never multiplies
-// the rate a receiver sees.
+// Lease hands up to max due deliveries to a direct worker. Each gets a
+// fresh attempt ID and an expiring lease. perDomain caps in-flight
+// deliveries per recipient domain across all direct workers, so adding a
+// worker never multiplies the rate a receiver sees. LeaseJobs has every
+// option.
 func (s *Store) Lease(ctx context.Context, workerID string, max int, lease time.Duration, perDomain int) ([]LeasedJob, error) {
-	rows, err := s.Pool.Query(ctx, `
-		WITH picked AS (
-			SELECT d.id
-			FROM deliveries d JOIN emails e ON e.id = d.email_id
-			WHERE d.status IN ('queued', 'deferred')
-			  AND d.next_attempt_at <= now()
-			  AND e.expires_at > now()
-			  AND e.raw IS NOT NULL
-			  AND (SELECT count(*) FROM deliveries x WHERE x.status = 'sending' AND x.rcpt_domain = d.rcpt_domain) < $3
-			ORDER BY d.next_attempt_at
-			LIMIT $1
-			FOR UPDATE OF d SKIP LOCKED
-		), leased AS (
-			UPDATE deliveries d SET status = 'sending', attempts = d.attempts + 1, lease_worker = $2,
-				lease_attempt = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $4),
-				updated_at = now()
-			FROM picked p WHERE d.id = p.id
-			RETURNING d.id, d.email_id, d.rcpt, d.rcpt_domain, d.lease_attempt, d.lease_expires_at
-		), started AS (
-			INSERT INTO attempts (id, delivery_id, worker_id)
-			SELECT lease_attempt, id, $2 FROM leased
-		)
-		SELECT l.id::text, l.rcpt, l.rcpt_domain, l.lease_attempt::text, l.lease_expires_at, e.raw, e.return_path
-		FROM leased l JOIN emails e ON e.id = l.email_id`,
-		max, workerID, perDomain, lease.Seconds())
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var jobs []LeasedJob
-	for rows.Next() {
-		var j LeasedJob
-		if err := rows.Scan(&j.DeliveryID, &j.Rcpt, &j.RcptDomain, &j.AttemptID, &j.LeaseExpiresAt, &j.SealedRaw, &j.ReturnPath); err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, j)
-	}
-	return jobs, rows.Err()
+	return s.LeaseJobs(ctx, LeaseOptions{
+		WorkerID: workerID, Kind: protocol.KindDirect, Max: max, Lease: lease,
+		DomainConcurrency: perDomain, RelayAfterAttempts: DefaultRelayAfterAttempts,
+	})
 }
 
 // Report records a worker's result for one attempt and moves the delivery
@@ -720,16 +693,32 @@ func (s *Store) Lease(ctx context.Context, workerID string, max int, lease time.
 // the sweeper already reclaimed is recorded; if it says delivered, the
 // delivery is marked delivered, because the receiver did accept it.
 func (s *Store) Report(ctx context.Context, workerID string, r protocol.Report) (string, error) {
+	return s.ReportAttempt(ctx, workerID, r, ReportOptions{DomainConcurrency: DefaultDomainConcurrency})
+}
+
+// ReportOptions carries the control plane settings a report needs.
+type ReportOptions struct {
+	DomainConcurrency int // OMW_DOMAIN_CONCURRENCY: the most a domain's limit can grow back to
+}
+
+// ReportAttempt is Report with explicit options. Besides moving the
+// delivery on, a report from a direct worker teaches the control plane about
+// the receiver: a throttling deferral halves the domain's limit and starts a
+// backoff; a delivery raises the limit again (see throttle and relax in delivery.go).
+func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.Report, o ReportOptions) (string, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var deliveryID, attemptWorker string
+	var deliveryID, attemptWorker, workerKind string
 	var reportedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT delivery_id::text, COALESCE(worker_id::text, ''), reported_at
-		FROM attempts WHERE id = $1 FOR UPDATE`, r.AttemptID).Scan(&deliveryID, &attemptWorker, &reportedAt)
+	var startedAt time.Time
+	err = tx.QueryRow(ctx, `SELECT a.delivery_id::text, COALESCE(a.worker_id::text, ''), a.reported_at, a.started_at,
+			COALESCE(w.kind, 'direct')
+		FROM attempts a LEFT JOIN workers w ON w.id = a.worker_id WHERE a.id = $1 FOR UPDATE OF a`, r.AttemptID).
+		Scan(&deliveryID, &attemptWorker, &reportedAt, &startedAt, &workerKind)
 	if err != nil {
 		return "", noRows(err)
 	}
@@ -737,15 +726,15 @@ func (s *Store) Report(ctx context.Context, workerID string, r protocol.Report) 
 		return "", ErrForbidden
 	}
 
-	var status, emailID, rcpt, projectID string
+	var status, emailID, rcpt, rcptDomain, projectID string
 	var leaseAttempt *string
 	var attempts int
 	var expiresAt time.Time
 	var retryUncertain bool
-	err = tx.QueryRow(ctx, `SELECT d.status, d.email_id::text, d.rcpt, e.project_id::text, d.lease_attempt::text,
-			d.attempts, e.expires_at, e.retry_uncertain
+	err = tx.QueryRow(ctx, `SELECT d.status, d.email_id::text, d.rcpt, d.rcpt_domain, e.project_id::text,
+			d.lease_attempt::text, d.attempts, e.expires_at, e.retry_uncertain
 		FROM deliveries d JOIN emails e ON e.id = d.email_id WHERE d.id = $1 FOR UPDATE OF d`, deliveryID).
-		Scan(&status, &emailID, &rcpt, &projectID, &leaseAttempt, &attempts, &expiresAt, &retryUncertain)
+		Scan(&status, &emailID, &rcpt, &rcptDomain, &projectID, &leaseAttempt, &attempts, &expiresAt, &retryUncertain)
 	if err != nil {
 		return "", err
 	}
@@ -760,10 +749,14 @@ func (s *Store) Report(ctx context.Context, workerID string, r protocol.Report) 
 		return "", err
 	}
 
-	eventData, _ := json.Marshal(map[string]any{
+	ev := map[string]any{
 		"attempt_id": r.AttemptID, "smtp_code": r.SMTPCode, "enhanced_code": r.EnhancedCode,
 		"response": truncate(r.Response, 300), "mx_host": r.MXHost,
-	})
+	}
+	if r.TLSPolicy != "" {
+		ev["tls_policy"] = truncate(r.TLSPolicy, 300)
+	}
+	eventData, _ := json.Marshal(ev)
 
 	if leaseAttempt == nil || *leaseAttempt != r.AttemptID {
 		if r.Outcome == protocol.OutcomeDelivered && status != "delivered" {
@@ -795,6 +788,20 @@ func (s *Store) Report(ctx context.Context, workerID string, r protocol.Report) 
 			VALUES ($1, $2, 'hard_bounce', $3) ON CONFLICT DO NOTHING`,
 			projectID, rcpt, truncate(r.Response, 300)); err != nil {
 			return "", err
+		}
+	}
+	// What the attempt teaches about the receiver is recorded just before
+	// the attempt's own event, so the timeline still ends with the outcome.
+	if workerKind == protocol.KindDirect {
+		at := attemptRef{emailID: emailID, deliveryID: deliveryID, domain: rcptDomain, startedAt: startedAt}
+		switch {
+		case policy.IsThrottle(r.Outcome, r.SMTPCode, r.EnhancedCode, r.Response):
+			err = throttle(ctx, tx, at, o.DomainConcurrency)
+		case r.Outcome == protocol.OutcomeDelivered:
+			err = relax(ctx, tx, at, o.DomainConcurrency)
+		}
+		if err != nil {
+			return "", fmt.Errorf("receiver state: %w", err)
 		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO events (email_id, delivery_id, type, data) VALUES ($1, $2, $3, $4)`,

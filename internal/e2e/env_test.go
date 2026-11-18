@@ -68,7 +68,7 @@ func newEnv(t *testing.T, tweak func(*config.Control)) *env {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Pool.Exec(ctx, `TRUNCATE projects, workers CASCADE`); err != nil {
+	if _, err := st.Pool.Exec(ctx, `TRUNCATE projects, workers, receiver_state CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	pid, err := st.CreateProject(ctx, "e2e")

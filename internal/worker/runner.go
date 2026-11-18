@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,32 +24,55 @@ import (
 	"github.com/openmailwire/openmailwire/internal/protocol"
 )
 
+// deliverer sends one job: a Deliverer (direct to the recipient's MX) or a
+// Relay (through a smarthost).
+type deliverer interface {
+	Deliver(ctx context.Context, j protocol.Job) Result
+}
+
 type Runner struct {
 	cfg     config.Worker
 	client  *Client
-	d       *Deliverer
+	d       deliverer
+	kind    string // "" for a direct worker (the wire default), protocol.KindRelay for a relay
 	log     *slog.Logger
 	version string
 	outbox  string
 }
 
 func NewRunner(cfg config.Worker, log *slog.Logger, version string) *Runner {
+	r := &Runner{
+		cfg:     cfg,
+		client:  &Client{Base: cfg.ControlURL, Token: cfg.Token, UserAgent: "openmailwire-worker/" + version, HTTP: &http.Client{Timeout: 60 * time.Second}},
+		log:     log,
+		version: version,
+		outbox:  filepath.Join(cfg.StateDir, "outbox"),
+	}
+	if cfg.Relay() {
+		r.kind = protocol.KindRelay
+		relay := &Relay{
+			Host: cfg.RelayHost, Port: cfg.RelayPort, Username: cfg.RelayUsername, Password: cfg.RelayPassword,
+			ImplicitTLS: cfg.RelayTLS == "implicit", EHLO: cfg.EHLO, SourceIP: cfg.SourceIP, RootCAs: cfg.TLSRoots,
+		}
+		relay.setDefaults() // before any concurrent Deliver
+		r.d = relay
+		return r
+	}
 	d := &Deliverer{
 		EHLO:     cfg.EHLO,
 		SourceIP: cfg.SourceIP,
 		Override: cfg.SMTPOverride,
 		IPv4Only: cfg.IPv4Only,
 		Resolver: net.DefaultResolver,
+		RootCAs:  cfg.TLSRoots,
+		STS:      &STSFetcher{Resolver: net.DefaultResolver, RootCAs: cfg.TLSRoots},
+	}
+	if cfg.DNSSECResolver != "" {
+		d.DANE = &DANEResolver{Server: cfg.DNSSECResolver}
 	}
 	d.setDefaults()
-	return &Runner{
-		cfg:     cfg,
-		client:  &Client{Base: cfg.ControlURL, Token: cfg.Token, UserAgent: "openmailwire-worker/" + version, HTTP: &http.Client{Timeout: 60 * time.Second}},
-		d:       d,
-		log:     log,
-		version: version,
-		outbox:  filepath.Join(cfg.StateDir, "outbox"),
-	}
+	r.d = d
+	return r
 }
 
 // Run leases and delivers until ctx is cancelled, then finishes the
@@ -60,7 +84,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.cfg.SMTPOverride != "" {
 		r.log.Warn("every message goes to the SMTP override, not to real recipients", "override", r.cfg.SMTPOverride)
 	}
+	if r.cfg.Relay() {
+		r.log.Info("relay worker: deliveries routed to relays go through the smarthost",
+			"relay", net.JoinHostPort(r.cfg.RelayHost, strconv.Itoa(r.cfg.RelayPort)), "tls", r.cfg.RelayTLS)
+	}
 	r.flushOutbox(ctx)
+	// The first heartbeat goes out before any lease, so the control plane
+	// knows this worker's kind when it hands out jobs.
+	r.beat(ctx)
 	go r.heartbeats(ctx)
 	go r.outboxLoop(ctx)
 
@@ -78,7 +109,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			continue
 		}
 		var resp protocol.LeaseResponse
-		if err := r.client.Post(ctx, "/internal/worker/lease", protocol.LeaseRequest{Max: free}, &resp); err != nil {
+		if err := r.client.Post(ctx, "/internal/worker/lease", protocol.LeaseRequest{Max: free, Kind: r.kind}, &resp); err != nil {
 			if ctx.Err() == nil {
 				r.log.Warn("lease failed", "err", err)
 			}
@@ -107,12 +138,16 @@ func (r *Runner) handle(ctx context.Context, j protocol.Job) {
 	defer cancel()
 	start := time.Now()
 	res := r.d.Deliver(jctx, j)
-	r.log.Info("attempt", "attempt", j.AttemptID, "rcpt_domain", j.RcptDomain, "outcome", res.Outcome,
+	attrs := []any{"attempt", j.AttemptID, "rcpt_domain", j.RcptDomain, "outcome", res.Outcome,
 		"code", res.Code, "enhanced", res.Enhanced, "mx", res.MXHost, "tls", res.TLS,
-		"ms", time.Since(start).Milliseconds())
+		"ms", time.Since(start).Milliseconds()}
+	if res.TLSPolicy != "" {
+		attrs = append(attrs, "tls_policy", res.TLSPolicy)
+	}
+	r.log.Info("attempt", attrs...)
 	r.submit(context.WithoutCancel(ctx), protocol.Report{
 		AttemptID: j.AttemptID, Outcome: res.Outcome, SMTPCode: res.Code, EnhancedCode: res.Enhanced,
-		Response: res.Response, MXHost: res.MXHost, SourceIP: r.cfg.PublicIP, TLS: res.TLS,
+		Response: res.Response, MXHost: res.MXHost, SourceIP: r.cfg.PublicIP, TLS: res.TLS, TLSPolicy: res.TLSPolicy,
 	})
 }
 
@@ -186,17 +221,19 @@ func (r *Runner) outboxLoop(ctx context.Context) {
 	}
 }
 
-func (r *Runner) heartbeats(ctx context.Context) {
-	beat := func() {
-		var resp protocol.HeartbeatResponse
-		err := r.client.Post(ctx, "/internal/worker/heartbeat", protocol.HeartbeatRequest{
-			PublicIP: r.cfg.PublicIP, EHLO: r.cfg.EHLO, Capacity: r.cfg.Concurrency, Version: r.version,
-		}, &resp)
-		if err != nil && ctx.Err() == nil {
-			r.log.Warn("heartbeat failed", "err", err)
-		}
+func (r *Runner) beat(ctx context.Context) {
+	bctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	var resp protocol.HeartbeatResponse
+	err := r.client.Post(bctx, "/internal/worker/heartbeat", protocol.HeartbeatRequest{
+		PublicIP: r.cfg.PublicIP, EHLO: r.cfg.EHLO, Capacity: r.cfg.Concurrency, Version: r.version, Kind: r.kind,
+	}, &resp)
+	if err != nil && ctx.Err() == nil {
+		r.log.Warn("heartbeat failed", "err", err)
 	}
-	beat()
+}
+
+func (r *Runner) heartbeats(ctx context.Context) {
 	t := time.NewTicker(20 * time.Second)
 	defer t.Stop()
 	for {
@@ -204,7 +241,7 @@ func (r *Runner) heartbeats(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			beat()
+			r.beat(ctx)
 		}
 	}
 }

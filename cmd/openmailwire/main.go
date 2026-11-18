@@ -179,8 +179,12 @@ func runWorker(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	log.Info("worker starting", "control", cfg.ControlURL, "ehlo", cfg.EHLO, "public_ip", cfg.PublicIP,
-		"concurrency", cfg.Concurrency, "version", version)
+	kind := "direct"
+	if cfg.Relay() {
+		kind = "relay"
+	}
+	log.Info("worker starting", "control", cfg.ControlURL, "kind", kind, "ehlo", cfg.EHLO, "public_ip", cfg.PublicIP,
+		"concurrency", cfg.Concurrency, "dane", cfg.DNSSECResolver != "", "version", version)
 	return worker.NewRunner(cfg, log, version).Run(ctx)
 }
 
@@ -372,13 +376,13 @@ func workersCmd(ctx context.Context, args []string) error {
 				return err
 			}
 			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tIP\tEHLO\tCAPACITY\tDRAINING\tLAST SEEN\tVERSION")
+			fmt.Fprintln(tw, "NAME\tKIND\tIP\tEHLO\tCAPACITY\tDRAINING\tLAST SEEN\tVERSION")
 			for _, w := range ws {
 				seen := "never"
 				if w.LastSeenAt != nil {
 					seen = time.Since(*w.LastSeenAt).Round(time.Second).String() + " ago"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%v\t%s\t%s\n", w.Name, w.IP, w.EHLO, w.Capacity, w.Draining, seen, w.Version)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%v\t%s\t%s\n", w.Name, w.Kind, w.IP, w.EHLO, w.Capacity, w.Draining, seen, w.Version)
 			}
 			return tw.Flush()
 		case (args[0] == "drain" || args[0] == "resume") && len(args) == 2:
