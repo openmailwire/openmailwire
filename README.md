@@ -31,7 +31,7 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 | **Facts, not guesses.** "Did it arrive?" needs a real answer. | a per-recipient timeline with the receiver's exact SMTP reply, and `unknown` when the truth is unknown | available |
 | **Errors it can act on.** | errors name the cause and the next step, e.g. which DNS record is missing | available |
 | **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer | v0.4 |
-| **Docs written for models.** | `llms.txt` and an OpenAPI spec served by every control plane | v0.4 |
+| **Docs written for models.** | [`/llms.txt`](docs/llms.txt) and an [OpenAPI 3.1 spec](docs/openapi.json) at `/openapi.json`, served by every control plane | available |
 
 ### Connect an agent (MCP)
 
@@ -85,6 +85,13 @@ openmailwire apikey create <project-id> support-agent --sending-only \
 
 A sending-only key can send, read and cancel its own emails, and read domains; it cannot add domains, webhooks or keys. The limits are enforced by the server, on every path that sends, MCP included. See [API keys](#api-keys).
 
+### Docs for models and tools
+
+Every control plane serves two documents that need no API key:
+
+- **`GET /llms.txt`**: a short guide for language models. It covers the safe send flow, every endpoint in one line, what each delivery status means, how to recover from each error, webhook verification and MCP setup. Point an agent at it before it uses the API. Copy: [docs/llms.txt](docs/llms.txt).
+- **`GET /openapi.json`**: the OpenAPI 3.1 reference for every endpoint, error and webhook payload, with examples. Use it to generate a client or load it into an API tool. Copy: [docs/openapi.json](docs/openapi.json).
+
 ## Why run it yourself
 
 - **You own the whole path.** No per-message fees, no shared IP pool with strangers, no third party that can pause your account.
@@ -137,6 +144,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Bounce addresses (VERP) carry an HMAC, ready for bounce processing.
 - Signed webhooks, verifiable by handlers written for Resend. They are retried for about a day and blocked from internal networks.
 - Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
+- `GET /openapi.json` (OpenAPI 3.1) and `GET /llms.txt` (a guide for models), served without a key.
 - One static binary, `openmailwire`, plays every role: `serve`, `worker` or `submission`.
 
 ## Quick start (local, no email leaves your machine)
@@ -290,6 +298,8 @@ The submission server keeps no state and holds no DKIM keys. Run it wherever app
 ## API
 
 Authenticate with `Authorization: Bearer <api key>`. Errors use Resend's shape: `{"statusCode": 422, "name": "validation_error", "message": "…"}`.
+
+The complete reference is the OpenAPI 3.1 document at `/openapi.json` (copy: [docs/openapi.json](docs/openapi.json)).
 
 ### `POST /emails`
 
@@ -529,7 +539,7 @@ openmailwire apikey list <project-id>
 **Agent-first**
 - [x] **MCP server**: stdio (`openmailwire mcp`) and remote (`/mcp`). Tools to send, track, and add and verify domains (v0.3).
 - [x] **Agent keys**: sending-only keys, per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key: every email records its key, and `GET /emails?api_key_id=` lists them (v0.4).
-- [ ] **`llms.txt` and OpenAPI**, served by the control plane (v0.4).
+- [x] **`llms.txt` and OpenAPI**, served by the control plane at `/llms.txt` and `/openapi.json` (v0.5).
 - [ ] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, and an inbound webhook and MCP tool (v0.5).
 
 **Delivery**

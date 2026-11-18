@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/openmailwire/openmailwire/internal/apidocs"
 	"github.com/openmailwire/openmailwire/internal/config"
 	"github.com/openmailwire/openmailwire/internal/domains"
 	"github.com/openmailwire/openmailwire/internal/secret"
@@ -30,6 +31,8 @@ type Server struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
+	mux.Handle("GET /openapi.json", apidocs.Handler())
+	mux.Handle("GET /llms.txt", apidocs.Handler())
 
 	// withProject admits every key, sending_access included; withFullAccess
 	// only full_access keys.

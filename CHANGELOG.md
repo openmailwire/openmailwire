@@ -64,6 +64,16 @@ Give each agent its own key, with limits the server enforces on every path that 
 
 Existing keys keep full access with no limits.
 
+**Docs for people and models**
+- `GET /openapi.json`: an OpenAPI 3.1 description of every public endpoint:
+  - emails (send with attachments, `scheduled_at`, `expires_at`, `retry_uncertain` and `Idempotency-Key`; get, list, cancel, batch and raw);
+  - domains, webhooks, API keys, inboxes and messages (with reply and attachments).
+  - It also documents the bearer scheme, which operations need a `full_access` key, every error name with its status, and examples for the main operations.
+  - Its `webhooks` section gives each event's payload and the Svix and Standard Webhooks signature headers.
+- `GET /llms.txt`: a short guide for language models. It covers auth, the safe send flow, every endpoint in one line, the delivery statuses, how to recover from each error, webhook verification and MCP setup.
+- Both are embedded in the binary, need no API key, and are cached for 5 minutes (with an ETag).
+- Copies live in `docs/openapi.json` and `docs/llms.txt`. A test keeps them identical to the embedded files. Another test fails when the server registers a public route that the spec does not document.
+
 ## v0.3.0: MCP server for AI agents
 
 OpenMailWire is now built for AI agents first.
