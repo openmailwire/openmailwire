@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### SMTP submission and raw messages (v0.6)
+
+**`POST /emails/raw`** sends a complete message you built yourself: `{"raw": base64, "rcpts"?, "mail_from"?}`.
+- The `From` domain must be added to the project and verified.
+- Recipients are `rcpts`, or else every address in `To`, `Cc` and `Bcc`.
+- OpenMailWire removes `Bcc`, adds `Message-ID` and `Date` when missing, turns line endings into CRLF and adds its DKIM signature on top. Nothing else changes.
+- Lines over 998 bytes are refused with a `422` that says how to fix them.
+- `Idempotency-Key` works as on `POST /emails`. The request may be up to 20 MB.
+
+**New role `openmailwire submission`:** an SMTP submission server for apps that only speak SMTP (WordPress, Postfix relays, monitoring tools, older code).
+- Port 587 with STARTTLS, which is required before `AUTH`. Optionally port 465 with implicit TLS (`OMW_SUBMISSION_TLS_LISTEN`).
+- `AUTH PLAIN` and `LOGIN`: any username, and an API key as the password. The key is checked at login.
+- Each message goes to `POST /emails/raw` with the client's key, so it gets the same checks, key limits and signing. API answers become SMTP replies: `250 2.0.0 queued as <id>`, `535 5.7.8`, `550 5.7.1`, `554 5.6.0`, `451 4.7.1` or `451 4.3.0`, with the API's message where there is one.
+- Messages up to 14 MB (`OMW_SUBMISSION_MAX_SIZE`), 50 recipients each, command and data timeouts, and three failed logins per connection.
+- A byte-identical resubmission of a message with its own `Message-ID` and `Date` returns the first copy instead of sending twice.
+- The TLS certificate (`OMW_TLS_CERT`, `OMW_TLS_KEY`) is reloaded when its files change.
+- Logs never contain message content or full addresses.
+
+**New dependencies:** `github.com/emersion/go-smtp` v0.26.0 and `github.com/emersion/go-sasl`.
+
 ## v0.3.0: MCP server for AI agents
 
 OpenMailWire is now built for AI agents first.

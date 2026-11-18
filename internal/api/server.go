@@ -54,6 +54,7 @@ func (s *Server) Handler() http.Handler {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
 	})
 	root = http.MaxBytesHandler(mux, 4<<20)
+	root = s.withRawRoute(root) // POST /emails/raw (raw.go), with its own 20 MB body limit
 	return root
 }
 

@@ -36,6 +36,7 @@ HTTP API, an MCP server, DKIM, and workers that deliver from your own IPs.
 Usage:
   openmailwire serve                          run the control plane (API, queue, scheduler)
   openmailwire worker                         run a delivery worker
+  openmailwire submission                     SMTP submission on 587/465 for apps that only speak SMTP
   openmailwire migrate                        apply database migrations
   openmailwire keygen                         print a new OMW_SECRET_KEY
   openmailwire project create <name>          create a project and its first API key
@@ -68,6 +69,8 @@ func main() {
 		err = serve(ctx, log)
 	case "worker":
 		err = runWorker(ctx, log)
+	case "submission":
+		err = runSubmission(ctx, log)
 	case "migrate":
 		err = withStore(ctx, func(st *store.Store) error { return nil })
 		if err == nil {
