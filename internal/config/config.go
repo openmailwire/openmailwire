@@ -29,6 +29,12 @@ type Control struct {
 	// are set (development only).
 	WebhookAllowHTTP    bool
 	WebhookAllowPrivate bool
+
+	// Inbound mail.
+	InboundMX        string        // host that receives mail for inboxes; shown as an optional MX record
+	FBLAddress       string        // where feedback loops (ARF complaints) are sent
+	InboundRetention time.Duration // inbound message bodies are purged this long after arrival
+	InboundMaxSize   int64         // largest inbound message, in bytes
 }
 
 // DatabaseURL returns DATABASE_URL or an error when it is unset.
@@ -47,6 +53,8 @@ func LoadControl() (Control, error) {
 		SPFInclude:      os.Getenv("OMW_SPF_INCLUDE"),
 		BounceMX:        os.Getenv("OMW_BOUNCE_MX"),
 		DNSServer:       os.Getenv("OMW_DNS_SERVER"),
+		InboundMX:       strings.TrimSuffix(os.Getenv("OMW_INBOUND_MX"), "."),
+		FBLAddress:      strings.ToLower(strings.TrimSpace(os.Getenv("OMW_FBL_ADDRESS"))),
 	}
 	var err error
 	if c.DatabaseURL, err = DatabaseURL(); err != nil {
@@ -80,7 +88,53 @@ func LoadControl() (Control, error) {
 	if c.WebhookAllowPrivate, err = envBool("OMW_WEBHOOK_ALLOW_PRIVATE", false); err != nil {
 		return c, err
 	}
+	if c.InboundRetention, err = envDuration("OMW_INBOUND_RETENTION", 720*time.Hour); err != nil {
+		return c, err
+	}
+	if c.InboundMaxSize, err = envSize("OMW_INBOUND_MAX_SIZE", DefaultInboundMaxSize); err != nil {
+		return c, err
+	}
 	return c, nil
+}
+
+// DefaultInboundMaxSize is the largest inbound message accepted by default.
+const DefaultInboundMaxSize = 25 << 20
+
+// Inbound configures an inbound SMTP node (openmailwire inbound).
+type Inbound struct {
+	Listen     string
+	Hostname   string // announced in the greeting and in Received headers
+	TLSCert    string // with TLSKey, enables STARTTLS
+	TLSKey     string
+	ControlURL string
+	Token      string // a worker token (omwk_…)
+	MaxSize    int64
+}
+
+func LoadInbound() (Inbound, error) {
+	host, _ := os.Hostname()
+	in := Inbound{
+		Listen:     env("OMW_INBOUND_LISTEN", ":25"),
+		Hostname:   env("OMW_INBOUND_HOSTNAME", host),
+		TLSCert:    os.Getenv("OMW_TLS_CERT"),
+		TLSKey:     os.Getenv("OMW_TLS_KEY"),
+		ControlURL: strings.TrimRight(os.Getenv("OMW_CONTROL_URL"), "/"),
+		Token:      os.Getenv("OMW_WORKER_TOKEN"),
+	}
+	if in.ControlURL == "" {
+		return in, errors.New("OMW_CONTROL_URL is not set")
+	}
+	if !strings.HasPrefix(in.Token, "omwk_") {
+		return in, errors.New("OMW_WORKER_TOKEN is not set; inbound nodes use a worker token: `openmailwire workers add <name>`")
+	}
+	if (in.TLSCert == "") != (in.TLSKey == "") {
+		return in, errors.New("set both OMW_TLS_CERT and OMW_TLS_KEY to enable STARTTLS, or neither")
+	}
+	var err error
+	if in.MaxSize, err = envSize("OMW_INBOUND_MAX_SIZE", DefaultInboundMaxSize); err != nil {
+		return in, err
+	}
+	return in, nil
 }
 
 // Worker configures a delivery worker (openmailwire worker).
@@ -163,6 +217,30 @@ func envInt(key string, def int) (int, error) {
 		return def, fmt.Errorf("%s must be a positive integer", key)
 	}
 	return n, nil
+}
+
+// envSize reads a size such as 25MB, 512KB or 1048576 (bytes). KB, MB and
+// GB are powers of 1024.
+func envSize(key string, def int64) (int64, error) {
+	v := strings.ToUpper(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return def, nil
+	}
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"KIB", 1 << 10}, {"MIB", 1 << 20}, {"GIB", 1 << 30}, {"KB", 1 << 10}, {"MB", 1 << 20}, {"GB", 1 << 30}, {"K", 1 << 10}, {"M", 1 << 20}, {"G", 1 << 30}, {"B", 1}} {
+		if n, ok := strings.CutSuffix(v, u.suffix); ok {
+			v, mult = strings.TrimSpace(n), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 1 || n > (1<<40)/mult {
+		return def, fmt.Errorf("%s must be a size like 25MB", key)
+	}
+	return n * mult, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {

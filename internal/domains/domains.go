@@ -62,7 +62,7 @@ const (
 )
 
 type Record struct {
-	Record   string `json:"record"` // DKIM, SPF, MX or DMARC
+	Record   string `json:"record"` // DKIM, SPF, MX, DMARC or INBOUND
 	Type     string `json:"type"`
 	Name     string `json:"name"`
 	Value    string `json:"value"`
@@ -78,6 +78,7 @@ type Spec struct {
 	DKIMPublic    string
 	ReturnPath    string   // envelope sender domain, e.g. bounce.example.com
 	BounceMX      string   // host that receives bounces; empty = not configured
+	InboundMX     string   // host that receives mail for inboxes; empty = not configured
 	SPFMechanisms []string // e.g. include:_spf.openmailwire.example or ip4:203.0.113.7
 }
 
@@ -98,6 +99,10 @@ func Records(s Spec) []Record {
 		recs = append(recs, Record{Record: "MX", Type: "MX", Name: s.ReturnPath, Value: s.BounceMX, Priority: 10, Required: true, Status: StatusPending})
 	}
 	recs = append(recs, Record{Record: "DMARC", Type: "TXT", Name: "_dmarc." + s.Domain, Value: "v=DMARC1; p=none;", Required: false, Status: StatusPending})
+	if s.InboundMX != "" {
+		// Only for inboxes: sending never depends on it.
+		recs = append(recs, Record{Record: "INBOUND", Type: "MX", Name: s.Domain, Value: s.InboundMX, Priority: 10, Required: false, Status: StatusPending})
+	}
 	return recs
 }
 
@@ -117,6 +122,11 @@ func Check(ctx context.Context, r Resolver, s Spec) (recs []Record, verified boo
 			rec.Status, rec.Detail = checkMX(ctx, r, rec.Name, s.BounceMX)
 		case "DMARC":
 			rec.Status, rec.Detail = checkDMARC(ctx, r, rec.Name)
+		case "INBOUND":
+			rec.Status, rec.Detail = checkMX(ctx, r, rec.Name, s.InboundMX)
+			if rec.Status != StatusVerified {
+				rec.Detail += " (needed only to receive mail in inboxes on this domain)"
+			}
 		}
 		if rec.Required && rec.Status != StatusVerified {
 			verified = false

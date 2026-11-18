@@ -49,12 +49,27 @@ func (s *Server) Handler() http.Handler {
 
 	var root http.Handler
 	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))
+	s.inboxRoutes(mux, func() http.Handler { return root })
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
 	})
-	root = http.MaxBytesHandler(mux, 4<<20)
+	root = s.limitBody(mux)
 	return root
+}
+
+// limitBody caps request bodies: 4 MB, or more on routes that carry whole
+// messages.
+func (s *Server) limitBody(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int64(4 << 20)
+		if r.URL.Path == "/internal/inbound" {
+			n = s.inboundBodyLimit()
+		}
+		r2 := *r
+		r2.Body = http.MaxBytesReader(w, r.Body, n)
+		h.ServeHTTP(w, &r2)
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

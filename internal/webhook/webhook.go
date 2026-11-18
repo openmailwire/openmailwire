@@ -39,9 +39,12 @@ const (
 	EmailFailed          = "email.failed"
 	EmailSuppressed      = "email.suppressed"
 	EmailDeliveryUnknown = "email.delivery_unknown"
+	EmailComplained      = "email.complained" // the recipient reported the email as spam (ARF)
+	EmailReceived        = "email.received"   // an inbox received a message
 )
 
-var Types = []string{EmailSent, EmailDelivered, EmailDeliveryDelayed, EmailBounced, EmailFailed, EmailSuppressed, EmailDeliveryUnknown}
+var Types = []string{EmailSent, EmailDelivered, EmailDeliveryDelayed, EmailBounced, EmailFailed, EmailSuppressed,
+	EmailDeliveryUnknown, EmailComplained, EmailReceived}
 
 func ValidType(t string) bool {
 	for _, v := range Types {
@@ -70,6 +73,10 @@ func ExternalType(internal string) string {
 		return EmailSuppressed
 	case "unknown":
 		return EmailDeliveryUnknown
+	case "complained":
+		return EmailComplained
+	case "received":
+		return EmailReceived
 	}
 	return ""
 }
@@ -113,6 +120,21 @@ type data struct {
 	Tags      map[string]string `json:"tags,omitempty"`
 	Bounce    *bounce           `json:"bounce,omitempty"`
 	Delivery  *delivery         `json:"delivery,omitempty"`
+	Complaint *complaint        `json:"complaint,omitempty"`
+
+	// email.received only. email_id is then the inbound message's id
+	// (GET /messages/{id}).
+	Cc               []string `json:"cc,omitempty"`
+	MessageID        string   `json:"message_id,omitempty"`
+	InboxID          string   `json:"inbox_id,omitempty"`
+	Inbox            string   `json:"inbox,omitempty"`
+	ThreadID         string   `json:"thread_id,omitempty"`
+	InReplyToEmailID string   `json:"in_reply_to_email_id,omitempty"`
+}
+
+type complaint struct {
+	FeedbackType string `json:"feedback_type,omitempty"`
+	UserAgent    string `json:"user_agent,omitempty"`
 }
 
 type bounce struct {
@@ -156,6 +178,23 @@ func Payload(ev store.EventRow, typ string) ([]byte, error) {
 			sub = "NoEmail"
 		}
 		p.Data.Bounce = &bounce{Type: "Permanent", SubType: sub, Message: d.Response}
+	}
+	if typ == EmailComplained {
+		var c complaint
+		json.Unmarshal(ev.Data, &c)
+		p.Data.Complaint = &c
+	}
+	if typ == EmailReceived {
+		p.Data.Delivery = nil
+		if len(to) == 0 && ev.InboxAddress != "" {
+			p.Data.To = []string{ev.InboxAddress}
+		}
+		p.Data.Cc = ev.Cc
+		if ev.MessageID != "" {
+			p.Data.MessageID = "<" + ev.MessageID + ">"
+		}
+		p.Data.InboxID, p.Data.Inbox = ev.InboxID, ev.InboxAddress
+		p.Data.ThreadID, p.Data.InReplyToEmailID = ev.ThreadID, ev.InReplyToEmailID
 	}
 	return json.Marshal(p)
 }

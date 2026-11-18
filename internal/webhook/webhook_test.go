@@ -111,3 +111,45 @@ func TestEndpointRules(t *testing.T) {
 		t.Fatalf("allowPrivate should permit loopback: %v", err)
 	}
 }
+
+func TestInboundPayloads(t *testing.T) {
+	ev := store.EventRow{
+		ID: 9, Type: "received", CreatedAt: time.Now(), EmailID: "m1", InboundMessageID: "m1",
+		From: "María <maria@example.test>", Subject: "Re: hi", Cc: []string{"ops@example.test"},
+		MessageID: "r1@example.test", InboxID: "i1", InboxAddress: "support@acme.test", ThreadID: "e1", InReplyToEmailID: "e1",
+	}
+	if ExternalType(ev.Type) != EmailReceived || !ValidType(EmailReceived) || !ValidType(EmailComplained) {
+		t.Fatal("received must map to email.received")
+	}
+	b, err := Payload(ev, EmailReceived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p map[string]any
+	json.Unmarshal(b, &p)
+	data := p["data"].(map[string]any)
+	// With no To header (the inbox was a Bcc), "to" is the inbox address.
+	if data["email_id"] != "m1" || data["to"].([]any)[0] != "support@acme.test" || data["inbox"] != "support@acme.test" ||
+		data["thread_id"] != "e1" || data["in_reply_to_email_id"] != "e1" || data["message_id"] != "<r1@example.test>" ||
+		data["delivery"] != nil || data["bounce"] != nil {
+		t.Fatalf("received payload: %s", b)
+	}
+
+	ev = store.EventRow{
+		ID: 10, Type: "complained", CreatedAt: time.Now(), EmailID: "e2", From: "a@acme.test",
+		To: []string{"x@example.test", "y@example.test"}, Recipient: "y@example.test",
+		Data: []byte(`{"source":"arf","feedback_type":"abuse","user_agent":"Yahoo!-Mail-Feedback/2.0"}`),
+	}
+	if ExternalType(ev.Type) != EmailComplained {
+		t.Fatal("complained must map to email.complained")
+	}
+	b, _ = Payload(ev, EmailComplained)
+	p = nil
+	json.Unmarshal(b, &p)
+	data = p["data"].(map[string]any)
+	c := data["complaint"].(map[string]any)
+	if len(data["to"].([]any)) != 1 || data["to"].([]any)[0] != "y@example.test" || c["feedback_type"] != "abuse" ||
+		c["user_agent"] != "Yahoo!-Mail-Feedback/2.0" || data["inbox"] != nil {
+		t.Fatalf("complained payload: %s", b)
+	}
+}

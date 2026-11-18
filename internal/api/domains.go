@@ -45,7 +45,7 @@ func (s *Server) spec(ctx context.Context, d store.Domain) domains.Spec {
 	}
 	return domains.Spec{
 		Domain: d.Name, Selector: d.Selector, DKIMPublic: d.DKIMPublic,
-		ReturnPath: d.ReturnPath, BounceMX: s.Cfg.BounceMX, SPFMechanisms: mechanisms,
+		ReturnPath: d.ReturnPath, BounceMX: s.Cfg.BounceMX, InboundMX: s.Cfg.InboundMX, SPFMechanisms: mechanisms,
 	}
 }
 

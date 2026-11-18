@@ -30,12 +30,12 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 | **Limits it cannot talk its way past.** A looping agent must not spam. | API keys per agent, with send caps and recipient allowlists, enforced by the server | v0.4 |
 | **Facts, not guesses.** "Did it arrive?" needs a real answer. | a per-recipient timeline with the receiver's exact SMTP reply, and `unknown` when the truth is unknown | available |
 | **Errors it can act on.** | errors name the cause and the next step, e.g. which DNS record is missing | available |
-| **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer | v0.4 |
+| **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer, and MCP tools to wait for and answer them | available (v0.5) |
 | **Docs written for models.** | `llms.txt` and an OpenAPI spec served by every control plane | v0.4 |
 
 ### Connect an agent (MCP)
 
-Five tools:
+The tools:
 
 | Tool | What it does |
 |---|---|
@@ -44,6 +44,11 @@ Five tools:
 | `list_domains` | The domains this key can send from, and whether each is verified. |
 | `add_domain` | Add a domain and get the DNS records to publish. |
 | `verify_domain` | Check those records now, by domain name or id. |
+| `list_inboxes` | The inbox addresses this key can read. |
+| `list_messages` | An inbox's messages, newest first. It can wait up to 60 s for a new one. |
+| `read_message` | A message's headers, text and attachment list. The sender's text is marked as information, not instructions. |
+| `reply_to_message` | Answer a message from the inbox, in the same thread. Marked destructive. |
+| `wait_for_reply` | Wait up to 120 s for the replies to an email you sent. |
 
 Every tool calls the HTTP API with the agent's own API key, so the agent has exactly that key's permissions. API errors reach the agent word for word, for example `domain_not_verified … publish its DNS records and call verify_domain`.
 
@@ -105,6 +110,7 @@ Give each agent its own key (`openmailwire apikey create <project-id> <agent-nam
 - The **control plane** owns the API, the PostgreSQL queue, DKIM keys and every scheduling decision. A message is committed to the database before the API answers.
 - **Workers** are stateless senders. They run anywhere with outbound port 25 and a clean IP. They pull jobs, look up MX records, speak SMTP with opportunistic TLS, and report the outcome. They never hold DKIM keys.
 - Each recipient gets an expiring **lease** and a unique **attempt ID**. If a worker disappears, its lease expires and the attempt is recorded as `unknown`. Workers write each report to a local outbox before sending it, so an outcome survives a crash or a control-plane outage.
+- **Inbound nodes** (optional) receive mail from the internet on port 25: replies to agents' inboxes, bounces and spam complaints. Like workers they hold nothing: each recipient is checked with the control plane, and each message is stored there before the sender gets `250`.
 
 More detail: [docs/architecture.md](docs/architecture.md).
 
@@ -121,10 +127,13 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Retries: a backoff schedule (1 min → 4 h), with expiry instead of endless retries.
 - Recipient failures (5.1.x) are suppressed automatically. Policy blocks (5.7.x) never suppress recipients.
 - Each project has its own API keys, domains, messages and suppression list.
-- Bounce addresses (VERP) carry an HMAC, ready for bounce processing.
+- Inbound mail (`openmailwire inbound`), see [Inbound mail](#inbound-mail):
+  - inboxes on your domains, with messages threaded to the emails they answer, attachments, and replies that go through the normal send path;
+  - bounce processing: delivery status notifications (RFC 3464) to the signed VERP address mark a delivery `bounced`, even after `delivered`;
+  - complaint processing: feedback-loop reports (ARF, RFC 5965) become `email.complained` and suppress the address.
 - Signed webhooks, verifiable by handlers written for Resend. They are retried for about a day and blocked from internal networks.
 - Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
-- One static binary, `openmailwire`, plays both roles: `serve` or `worker`.
+- One static binary, `openmailwire`, plays every role: `serve`, `worker` or `inbound`.
 
 ## Quick start (local, no email leaves your machine)
 
@@ -216,6 +225,7 @@ The records you publish:
 | SPF (TXT) | `bounce.example.com` | `v=spf1 include:<your SPF include> -all`, or the workers' IPs |
 | MX | `bounce.example.com` | your bounce host, when `OMW_BOUNCE_MX` is set |
 | DMARC (TXT, recommended) | `_dmarc.example.com` | start with `v=DMARC1; p=none; rua=mailto:…` |
+| INBOUND (MX, optional) | `example.com` | your inbound host, when `OMW_INBOUND_MX` is set. Needed only to receive mail in inboxes; sending never depends on it. |
 
 Mail is sent with the envelope sender `b-<delivery>-<mac>@bounce.example.com`. DMARC passes through the DKIM signature, which is aligned with your `From` domain.
 
@@ -239,12 +249,75 @@ Event types:
 | `email.failed` | the message expired before it could be delivered |
 | `email.suppressed` | the recipient is on the suppression list, so nothing was sent |
 | `email.delivery_unknown` | the outcome is unknown and `retry_uncertain` is `false` |
+| `email.complained` | the recipient reported the email as spam through a feedback loop; `data.complaint` holds the feedback type |
+| `email.received` | an inbox received a message (see below) |
 
-Every event is about **one recipient**, and `data.to` holds only that recipient. The body uses Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
+Every event about a sent email is about **one recipient**, and `data.to` holds only that recipient. A bounce reported later by a delivery status notification is an `email.bounced` too, with the DSN's status and diagnostic in `data.delivery`.
+
+`email.received` describes an inbound message without its content: `data.email_id` is the message id (read it with `GET /messages/{id}`), plus `data.inbox`, `data.inbox_id`, `data.thread_id`, `data.in_reply_to_email_id` and `data.message_id`. The body uses Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
 
 Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's Svix headers (`svix-id`, `svix-timestamp`, `svix-signature`) and once in the [Standard Webhooks](https://www.standardwebhooks.com) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`). A handler written for Resend webhooks verifies them unchanged.
 
 Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed. Endpoints must use `https` and resolve to public addresses (checked when connecting). That way a webhook cannot be used to reach the control plane's internal network.
+
+### Inboxes and received messages
+
+Mail to an inbox is received by an inbound node (see [Inbound mail](#inbound-mail)).
+
+| Method | Path | |
+|---|---|---|
+| `POST` | `/inboxes` | `{"address": "support@example.com"}`. The domain must be added to the project and verified. Full-access keys only. |
+| `GET` | `/inboxes` | Lists inboxes. |
+| `GET` | `/inboxes/{id}` | One inbox. |
+| `DELETE` | `/inboxes/{id}` | Deletes the inbox **and its messages**. Full-access keys only. |
+| `GET` | `/inboxes/{id}/messages` | `?limit=20&before=<message id>&thread_id=<id>`. Newest first: `{data:[{id, from, to, subject, received_at, thread_id, in_reply_to_email_id, snippet}], has_more, next_before}`. |
+| `GET` | `/messages/{id}` | `from`, `to`, `cc`, `reply_to`, `subject`, `text`, `html`, `headers` (`message-id`, `in-reply-to`, `references`, `date`), `attachments[]` (`index`, `filename`, `content_type`, `size`), `thread_id`, `in_reply_to_email_id`, `received_at`, `body_purged`. |
+| `GET` | `/messages/{id}/attachments/{index}` | The attachment's bytes, as a download. Indexes start at 0. |
+| `POST` | `/messages/{id}/reply` | `{"text": "…", "html": "…"}`. Sends from the inbox address to the message's `Reply-To` (or `From`), with `Re: …`, `In-Reply-To` and `References`. Returns `{"id", "thread_id"}`. |
+| `GET` | `/emails/{id}/replies` | The received messages that answer a sent email, and its `thread_id`. |
+
+**Threading.** A received message whose `In-Reply-To` or `References` names one of the project's sent emails gets `in_reply_to_email_id`. `thread_id` is the id of the first email or message of the conversation: a reply sent with `POST /messages/{id}/reply` joins the thread of the message it answers, and the answer to that reply joins it too. For replies to reach an inbox, send from the inbox address.
+
+**Replies are ordinary emails.** `POST /messages/{id}/reply` calls `POST /emails` with your own API key, so the domain must be verified and every send rule (key policies, suppression list) applies. An `Idempotency-Key` header is passed on. Refusals come back unchanged.
+
+**Retention.** Message content (body and attachments) is deleted `OMW_INBOUND_RETENTION` after arrival (default 30 days). The message stays listed with its sender, subject and thread, and `body_purged` becomes `true`.
+
+## Inbound mail
+
+`openmailwire inbound` is an SMTP server for mail from the internet. It is stateless: for every `RCPT TO` it asks the control plane whether the address exists, and it acknowledges a message only after the control plane has stored it. Unknown addresses are refused with `550 5.1.1` during the SMTP conversation, so OpenMailWire never sends bounces of its own (no backscatter). Inbound nodes authenticate with a worker token.
+
+It receives three kinds of mail:
+
+| Sent to | What happens |
+|---|---|
+| a bounce address `b-<delivery>-<hmac>@bounce.example.com` | The HMAC is checked first; forged addresses are refused. A delivery status notification (RFC 3464, and the plain-text "failure notice" some providers still send) with `Action: failed` marks that delivery `bounced`, even if it was `delivered`, records the status and the remote server's diagnostic, suppresses the address on 5.1.x, and sends `email.bounced`. Delays, auto-replies and anything else are ignored. |
+| `OMW_FBL_ADDRESS` (or a bounce address) | A feedback-loop complaint (ARF, RFC 5965; Yahoo, Microsoft and others). The email is found through the VERP envelope sender in the report, or else its Message-ID and `Original-Rcpt-To`. The address is suppressed with reason `complaint` and `email.complained` is sent. DMARC failure reports and `not-spam` feedback are ignored. |
+| an inbox address | The message is sealed (AES-256-GCM), threaded, stored, and announced with `email.received`. A copy with a Message-ID the inbox already holds is stored once. |
+
+Run it next to the control plane or anywhere that can reach it:
+
+```sh
+OMW_CONTROL_URL=https://mail.example.com \
+OMW_WORKER_TOKEN=omwk_… \
+OMW_INBOUND_HOSTNAME=mx.mail.example.net \
+OMW_TLS_CERT=/etc/ssl/mx.crt OMW_TLS_KEY=/etc/ssl/mx.key \
+  openmailwire inbound
+```
+
+Then point the MX records at it: the return-path domains through `OMW_BOUNCE_MX` and inbox domains through `OMW_INBOUND_MX` (see [docs/production.md](docs/production.md#6-inbound-mail-mx-bounces-and-complaints)).
+
+To try it locally with the [quick start](#quick-start-local-no-email-leaves-your-machine) setup:
+
+```sh
+bin/openmailwire workers add inbound-1                      # inbound nodes use a worker token
+OMW_CONTROL_URL=http://127.0.0.1:8080 OMW_WORKER_TOKEN=omwk_… \
+OMW_INBOUND_LISTEN=127.0.0.1:2526 bin/openmailwire inbound &
+
+curl -X POST localhost:8080/inboxes -H "Authorization: Bearer omw_…" \
+  -H 'Content-Type: application/json' -d '{"address": "agent@example.com"}'
+swaks --server 127.0.0.1:2526 --from you@example.org --to agent@example.com   # any SMTP client works
+curl localhost:8080/inboxes/<inbox id>/messages -H "Authorization: Bearer omw_…"
+```
 
 ## Running in production
 
@@ -266,7 +339,11 @@ Control plane (`openmailwire serve`):
 | `OMW_SECRET_KEY` | none | 32 bytes, base64 (`openmailwire keygen`). Encrypts DKIM keys and queued messages. |
 | `OMW_LISTEN` | `:8080` | |
 | `OMW_SPF_INCLUDE` | none | e.g. `_spf.mail.example.net`. If unset, SPF records list the workers' IPs. |
-| `OMW_BOUNCE_MX` | none | Host that receives bounces for the return-path domains. |
+| `OMW_BOUNCE_MX` | none | Host that receives bounces for the return-path domains: your inbound node. |
+| `OMW_INBOUND_MX` | none | Host that receives mail for inboxes. When set, every domain shows an optional `INBOUND` MX record. |
+| `OMW_FBL_ADDRESS` | none | Address you registered with feedback loops, e.g. `fbl@mail.example.net`. Its domain's MX must point to an inbound node. |
+| `OMW_INBOUND_RETENTION` | `720h` | Inbound message content is deleted this long after arrival. |
+| `OMW_INBOUND_MAX_SIZE` | `25MB` | Largest inbound message the control plane accepts (MB = 1024 × 1024 bytes). |
 | `OMW_RETURN_PATH_LABEL` | `bounce` | Gives `bounce.<domain>`. |
 | `OMW_DEFAULT_EXPIRY` | `48h` | |
 | `OMW_RETENTION` | `72h` | Message bodies are deleted this long after their last delivery. |
@@ -292,6 +369,17 @@ Worker (`openmailwire worker`):
 | `OMW_STATE_DIR` | `./openmailwire-worker-state` | Holds the report outbox. |
 | `OMW_SMTP_OVERRIDE` | none | Development only: send everything to this `host:port`. |
 
+Inbound node (`openmailwire inbound`):
+
+| Variable | Default | |
+|---|---|---|
+| `OMW_CONTROL_URL` | none | |
+| `OMW_WORKER_TOKEN` | none | Inbound nodes authenticate as workers: `openmailwire workers add <name>`. |
+| `OMW_INBOUND_LISTEN` | `:25` | |
+| `OMW_INBOUND_HOSTNAME` | hostname | Announced in the greeting and in `Received` headers. Use the name your MX records point to. |
+| `OMW_TLS_CERT`, `OMW_TLS_KEY` | none | PEM files. When set, STARTTLS is offered. |
+| `OMW_INBOUND_MAX_SIZE` | `25MB` | Larger messages are refused with `552 5.3.4`. |
+
 Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
 
 ## Roadmap
@@ -300,12 +388,12 @@ Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (
 - [x] **MCP server**: stdio (`openmailwire mcp`) and remote (`/mcp`). Tools to send, track, and add and verify domains (v0.3).
 - [ ] **Agent keys**: per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key (v0.4).
 - [ ] **`llms.txt` and OpenAPI**, served by the control plane (v0.4).
-- [ ] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, and an inbound webhook and MCP tool (v0.5).
+- [x] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, an `email.received` webhook and MCP tools to wait for and answer replies (v0.5).
 
 **Delivery**
-- [ ] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC.
+- [x] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC (v0.5).
 - [x] **Signed webhooks**, Resend-compatible (v0.2).
-- [ ] **Complaint feedback loops**: `email.complained` from Yahoo, Microsoft and other feedback loops.
+- [x] **Complaint feedback loops**: `email.complained` from Yahoo, Microsoft and other feedback loops (v0.5).
 - [ ] **MTA-STS and DANE**: enforce TLS where receivers require it.
 - [ ] **Adaptive throttling**: learn per-receiver limits from 421 deferrals.
 - [ ] **Fallback relay worker**: hand mail to another provider when your IPs are throttled.

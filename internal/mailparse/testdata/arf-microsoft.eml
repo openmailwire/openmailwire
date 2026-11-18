@@ -1,0 +1,43 @@
+Return-Path: <staff@hotmail.com>
+Date: Tue, 17 Nov 2026 10:15:44 -0800
+From: staff@hotmail.com
+To: fbl@feedback.openmailwire.test
+Subject: complaint about message from 203.0.113.7
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=feedback-report; boundary="--boundary-LibPST-iamunique-1832463412_-_-"
+Message-ID: <JMRP.0b7c2e1f-3a4d-4e5f-9a8b-7c6d5e4f3a2b@hotmail.com>
+
+----boundary-LibPST-iamunique-1832463412_-_-
+Content-Type: text/plain; charset="us-ascii"
+
+This is an email abuse report for an email message received from IP 203.0.113.7 on Tue, 17 Nov 2026 10:11:05 -0800
+
+----boundary-LibPST-iamunique-1832463412_-_-
+Content-Type: message/feedback-report
+
+Feedback-Type: abuse
+User-Agent: Hotmail FBL
+Version: 1
+Original-Mail-From: <b-4d5e6f7a8b9c40d1e2f3a4b5c6d7e8f9-1a2b3c4d5e@bounce.acme.test>
+Arrival-Date: Tue, 17 Nov 2026 10:11:05 -0800
+Source-IP: 203.0.113.7
+Reported-Domain: acme.test
+
+----boundary-LibPST-iamunique-1832463412_-_-
+Content-Type: message/rfc822
+Content-Disposition: inline
+
+X-HmXmrOriginalRecipient: <redacted@outlook.com>
+Received: from w1.openmailwire.test ([203.0.113.7]) by BAY004-MC1F9.hotmail.com with Microsoft SMTPSVC(7.5.7601.23143);
+	 Tue, 17 Nov 2026 10:11:05 -0800
+Return-Path: b-4d5e6f7a8b9c40d1e2f3a4b5c6d7e8f9-1a2b3c4d5e@bounce.acme.test
+From: Acme <news@acme.test>
+To: redacted@outlook.com
+Subject: Weekly digest
+Date: Tue, 17 Nov 2026 18:11:03 +0000
+Message-ID: <4d5e6f7a-8b9c-40d1-e2f3-a4b5c6d7e8f9@acme.test>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+This week at Acme.
+----boundary-LibPST-iamunique-1832463412_-_---

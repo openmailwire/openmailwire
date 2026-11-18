@@ -1,0 +1,56 @@
+Return-Path: <maria@example.net>
+Received: from mail-ed1-f44.example.net (mail-ed1-f44.example.net [192.0.2.44])
+	by inbound.openmailwire.test (OpenMailWire) with ESMTPS; Tue, 17 Nov 2026 11:04:09 +0000
+From: =?iso-8859-1?q?Mar=EDa_L=F3pez?= <Maria@Example.NET>
+Reply-To: "Lopez, Maria" <maria.replies@example.net>
+To: Acme Support <support@acme.test>
+Cc: ops@example.net, "Second Person" <second@example.net>
+Subject: =?iso-8859-1?q?Re=3A_Your_order_has_shipped_=96_d=E9j=E0_vu?=
+Date: Tue, 17 Nov 2026 12:04:07 +0100
+Message-ID: <CAFx9q1=reply-1@mail.example.net>
+In-Reply-To: <7a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9@acme.test>
+References: <first-thread-message@acme.test>
+ <7a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9@acme.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="0000000000004a1b2c062f40ffee"
+
+--0000000000004a1b2c062f40ffee
+Content-Type: multipart/alternative; boundary="0000000000004a1b2b062f40ffec"
+
+--0000000000004a1b2b062f40ffec
+Content-Type: text/plain; charset="windows-1252"
+Content-Transfer-Encoding: quoted-printable
+
+Thanks =96 the parcel arrived, but the receipt is missing. Could you send it a=
+gain?
+
+Mar=EDa
+
+On Tue, 17 Nov 2026 at 10:20, Acme Support <support@acme.test> wrote:
+> Your order has shipped.
+
+--0000000000004a1b2b062f40ffec
+Content-Type: text/html; charset="UTF-8"
+Content-Transfer-Encoding: quoted-printable
+
+<div dir=3D"ltr">Thanks =E2=80=93 the parcel arrived, but the receipt is mis=
+sing. Could you send it again?<br><br>Mar=C3=ADa</div><blockquote>Your order=
+ has shipped.</blockquote>
+
+--0000000000004a1b2b062f40ffec--
+--0000000000004a1b2c062f40ffee
+Content-Type: application/pdf; name="=?UTF-8?B?ZmFjdHVyYS3DsS5wZGY=?="
+Content-Disposition: attachment; filename="=?UTF-8?B?ZmFjdHVyYS3DsS5wZGY=?="
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJcOkw7zDtsOfCjEgMCBvYmoKPDwvVHlwZS9DYXRhbG9nPj4KZW5kb2JqCnRyYWls
+ZXIKPDwvUm9vdCAxIDAgUj4+CiUlRU9GCg==
+--0000000000004a1b2c062f40ffee
+Content-Type: image/png
+Content-Disposition: inline
+Content-ID: <ii_photo1>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2O
+UAAAAABJRU5ErkJggg==
+--0000000000004a1b2c062f40ffee--

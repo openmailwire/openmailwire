@@ -74,3 +74,39 @@ func TestNormalize(t *testing.T) {
 		}
 	}
 }
+
+func TestInboundMX(t *testing.T) {
+	spec := Spec{
+		Domain: "acme.test", Selector: "pk1", DKIMPublic: "MIIBkey",
+		ReturnPath: "bounce.acme.test", SPFMechanisms: []string{"ip4:203.0.113.7"},
+	}
+	for _, r := range Records(spec) {
+		if r.Record == "INBOUND" {
+			t.Fatal("INBOUND is shown only when OMW_INBOUND_MX is set")
+		}
+	}
+	spec.InboundMX = "mx.openmailwire.test"
+	dns := fakeDNS{txt: map[string][]string{
+		"pk1._domainkey.acme.test": {"v=DKIM1; k=rsa; p=MIIBkey"},
+		"bounce.acme.test":         {"v=spf1 ip4:203.0.113.7 -all"},
+	}}
+	// Without the MX the domain still verifies: inboxes are optional.
+	recs, ok := Check(context.Background(), dns, spec)
+	var inbound *Record
+	for i := range recs {
+		if recs[i].Record == "INBOUND" {
+			inbound = &recs[i]
+		}
+	}
+	if !ok || inbound == nil || inbound.Required || inbound.Type != "MX" || inbound.Name != "acme.test" ||
+		inbound.Value != "mx.openmailwire.test" || inbound.Status != StatusMissing {
+		t.Fatalf("verified=%v inbound=%+v", ok, inbound)
+	}
+	dns.mx = map[string][]*net.MX{"acme.test": {{Host: "mx.openmailwire.test.", Pref: 10}}}
+	recs, _ = Check(context.Background(), dns, spec)
+	for _, r := range recs {
+		if r.Record == "INBOUND" && r.Status != StatusVerified {
+			t.Fatalf("inbound MX published but %+v", r)
+		}
+	}
+}
