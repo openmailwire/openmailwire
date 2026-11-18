@@ -124,6 +124,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Bounce addresses (VERP) carry an HMAC, ready for bounce processing.
 - Signed webhooks, verifiable by handlers written for Resend. They are retried for about a day and blocked from internal networks.
 - Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
+- A web dashboard at `/dashboard/`: emails with per-recipient timelines, domains and their DNS records, webhooks, API keys and inboxes. No build step and no third-party requests.
 - One static binary, `openmailwire`, plays both roles: `serve` or `worker`.
 
 ## Quick start (local, no email leaves your machine)
@@ -245,6 +246,34 @@ Every event is about **one recipient**, and `data.to` holds only that recipient.
 Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's Svix headers (`svix-id`, `svix-timestamp`, `svix-signature`) and once in the [Standard Webhooks](https://www.standardwebhooks.com) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`). A handler written for Resend webhooks verifies them unchanged.
 
 Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed. Endpoints must use `https` and resolve to public addresses (checked when connecting). That way a webhook cannot be used to reach the control plane's internal network.
+
+## Dashboard
+
+Every control plane serves a web dashboard at **`/dashboard/`** (for example `http://localhost:8080/dashboard/`). Sign in by pasting an API key.
+
+| Page | What you can do |
+|---|---|
+| Emails | List sent emails (newest first, "Load more"), open one by ID, and send a test email. An email shows each recipient's status and a timeline of every attempt (worker, source IP, MX host, TLS, the receiver's SMTP reply) and event. It refreshes itself every 5 s until every recipient has a final status. |
+| Domains | Add a domain, copy each DNS record, and verify it against live DNS. |
+| Webhooks | Create one (its signing secret is shown once, with a copy button), delete it, and see its 20 most recent deliveries. |
+| API keys | Create keys with full or sending-only access, hourly and daily caps, and recipient and sender allowlists. The token is shown once. Revoke keys. Needs a full-access key. |
+| Inboxes | Add inboxes, read messages, follow a thread, download attachments, and reply. |
+
+When the server is older than a page (for example API keys before v0.4), the page says "Not available on this server version". When the key lacks the permission, it says "This key can't manage …".
+
+**How it keeps the key safe.** The browser holds an API key, so the dashboard is built to be boring to attack:
+- The key is kept in `sessionStorage` only: it is gone when the tab closes, and never sent anywhere but the same-origin API, as `Authorization: Bearer`. No cookies, so no CSRF.
+- Every dashboard response carries `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`, plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. The page itself is `Cache-Control: no-store`.
+- There is no inline script or style, no framework, no CDN and no third-party request. The files are embedded in the binary (`internal/dashboard/static`).
+- Subjects, addresses, SMTP replies, webhook URLs and inbound mail are attacker-controlled. They are only ever inserted as text, never as HTML. Inbound HTML mail is shown as source, never rendered, and attachments always download. A test (`internal/dashboard/tests`) fails if `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` appears in the scripts.
+
+Serve the control plane over HTTPS when the dashboard is used from another machine: the key travels with every request.
+
+To work on the dashboard, edit the files in `internal/dashboard/static` and rebuild; there is no build step for them. Its JavaScript tests need Node 22:
+
+```sh
+node --test internal/dashboard/tests/*.test.mjs
+```
 
 ## Running in production
 

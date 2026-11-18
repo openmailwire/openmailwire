@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/openmailwire/openmailwire/internal/config"
+	"github.com/openmailwire/openmailwire/internal/dashboard"
 	"github.com/openmailwire/openmailwire/internal/domains"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/store"
@@ -49,6 +50,8 @@ func (s *Server) Handler() http.Handler {
 
 	var root http.Handler
 	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))
+	mux.Handle("GET "+dashboard.Prefix, dashboard.Handler())
+	mux.Handle("GET "+dashboard.Prefix+"/", dashboard.Handler())
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
