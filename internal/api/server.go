@@ -87,7 +87,7 @@ func (s *Server) withProject(next http.HandlerFunc) http.Handler {
 			writeError(w, http.StatusUnauthorized, "missing_api_key", "send an API key as Authorization: Bearer omw_…")
 			return
 		}
-		pid, err := s.Store.ProjectForKey(r.Context(), secret.Hash(token))
+		key, err := s.Store.KeyForToken(r.Context(), secret.Hash(token))
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusUnauthorized, "invalid_api_key", "API key is invalid or revoked")
 			return
@@ -96,7 +96,7 @@ func (s *Server) withProject(next http.HandlerFunc) http.Handler {
 			s.internal(w, "api key lookup", err)
 			return
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), projectKey, pid)))
+		next(w, r.WithContext(context.WithValue(r.Context(), projectKey, key)))
 	})
 }
 
@@ -120,7 +120,10 @@ func (s *Server) withWorker(next http.HandlerFunc) http.Handler {
 	})
 }
 
-func projectID(r *http.Request) string { return r.Context().Value(projectKey).(string) }
+// apiKeyOf returns the API key that authenticated r.
+func apiKeyOf(r *http.Request) store.APIKey { return r.Context().Value(projectKey).(store.APIKey) }
+
+func projectID(r *http.Request) string { return apiKeyOf(r).ProjectID }
 
 func workerOf(r *http.Request) store.Worker { return r.Context().Value(workerKey).(store.Worker) }
 

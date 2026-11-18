@@ -108,6 +108,10 @@ func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
 		return
 	}
+	if pe := s.authorizeSend(r, strings.ToLower(from.Address), recipients); pe != nil {
+		pe.write(w)
+		return
+	}
 	for _, a := range req.ReplyTo {
 		if _, err := mail.ParseAddress(a); err != nil {
 			writeError(w, http.StatusUnprocessableEntity, "validation_error", fmt.Sprintf("reply_to %q: %v", a, err))

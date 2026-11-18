@@ -150,11 +150,19 @@ func (s *Store) CreateAPIKey(ctx context.Context, projectID, name, prefix string
 	return err
 }
 
-// ProjectForKey returns the project an API key belongs to.
-func (s *Store) ProjectForKey(ctx context.Context, hash []byte) (string, error) {
-	var id string
-	err := s.Pool.QueryRow(ctx, `SELECT project_id::text FROM api_keys WHERE token_hash = $1 AND revoked_at IS NULL`, hash).Scan(&id)
-	return id, noRows(err)
+// APIKey is the authenticated caller of the public API. Fields that key
+// policies need (permission, limits, allowlists) are added here.
+type APIKey struct {
+	ID        string
+	ProjectID string
+}
+
+// KeyForToken returns the live API key with this token hash.
+func (s *Store) KeyForToken(ctx context.Context, hash []byte) (APIKey, error) {
+	var k APIKey
+	err := s.Pool.QueryRow(ctx, `SELECT id::text, project_id::text FROM api_keys
+		WHERE token_hash = $1 AND revoked_at IS NULL`, hash).Scan(&k.ID, &k.ProjectID)
+	return k, noRows(err)
 }
 
 // ---- workers ----
