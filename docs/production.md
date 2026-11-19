@@ -36,7 +36,9 @@ The return-path domain needs an MX (or an A record) even if you do not process b
 
 - Publish what `POST /domains` returns, then call `POST /domains/{id}/verify`.
 - DKIM keys are 2048-bit. Their TXT value is longer than 255 characters. Most DNS dashboards split it automatically; with raw zone files, split it into quoted strings yourself.
-- **DMARC.** Start with `p=none` and an aggregate report address (`rua=`). Read the reports, then move to `quarantine` or `reject`.
+- **DMARC.** Start with `p=none` and an aggregate report address (`rua=`). Use the domain's own: `GET /domains/{id}` shows `report_addresses`, e.g. `rua=mailto:dmarc@bounce.example.com`. Read the reports with `GET /domains/{id}/reports`: once every source you recognize passes and `unknown_senders` holds only spoofers, move to `quarantine` or `reject`.
+- **TLS reporting.** Publish `_smtp._tls.example.com TXT "v=TLSRPTv1; rua=mailto:tls-rpt@bounce.example.com"` (the `tls_rpt_record` in `report_addresses`). Receivers that send you mail over TLS (Google, Microsoft) report failures there; they show in the same summary. It matters most once the domain publishes MTA-STS.
+- Both addresses are on the return-path domain, whose MX points to your inbound nodes (`OMW_BOUNCE_MX`, section 8); without an inbound node the reports have nowhere to go. The return-path domain shares the domain's organizational domain, so no `_report._dmarc` authorization record is needed.
 - **Register the domain** with [Google Postmaster Tools](https://postmaster.google.com). For Outlook, enroll your IPs in Microsoft SNDS and JMRP.
 
 ## 4. The control plane
@@ -72,7 +74,9 @@ Run `openmailwire submission` only if some of your apps cannot call the HTTP API
 - Home and office networks often block outbound port 25, but rarely 587 or 465.
 
 **Abuse**
-- A connection is closed after three failed logins. Each failure is logged as `submission: authentication failed` with the client's IP, so fail2ban or a firewall rule can block repeat offenders.
+- A connection is closed after three failed logins. After 10 failed logins from one address (an IPv6 /64) in 15 minutes, its logins are refused until the window passes, whatever the password. Each failure is logged as `submission: authentication failed` with the client's IP, so fail2ban or a firewall rule can block repeat offenders.
+- At most `OMW_SUBMISSION_MAX_CONNS` (200) connections in total and `OMW_SUBMISSION_MAX_CONNS_PER_IP` (20) per address, shared by 587 and 465. A connection lasts at most 30 minutes and gets a minute per command until it logs in.
+- An SMTP password is a `sending_access` key: it reads no inbox unless its policy lists one (`inboxes`), so a password left in a printer or plugin does not expose your agents' mail.
 - Logs carry the key prefix, recipient domains and size, never addresses or content.
 - Each app's key has the limits you give it (send caps, allowed senders and recipients). A leaked SMTP password is an API key: revoke it like one.
 
@@ -136,12 +140,32 @@ Then set on the control plane:
 - **Microsoft** (JMRP, through SNDS): register the workers' IPs.
 - Others (Comcast, Fastmail, Zoho, …) where you have volume.
 
-Give them one address, e.g. `fbl@mail.example.net`, set `OMW_FBL_ADDRESS` to it, and point that domain's MX at an inbound node. Reports name the email through the VERP envelope sender or the Message-ID, so they work even when the provider hides the recipient. Gmail runs no per-message feedback loop; watch the spam rate in Postmaster Tools.
+Give them one address, e.g. `fbl@mail.example.net`, set `OMW_FBL_ADDRESS` to it, and point that domain's MX at an inbound node. Gmail runs no per-message feedback loop; watch the spam rate in Postmaster Tools.
+
+Anyone can send a report to that address, so OpenMailWire trusts what it can check:
+- A report that carries a VERP address (the original's `Return-Path`, which Yahoo and most loops quote, or `Original-Mail-From`) names exactly one delivery through its HMAC. That recipient is suppressed with reason `complaint`.
+- A report that names the email only by its Message-ID (Microsoft hides the recipient and sometimes the envelope) counts only when a feedback loop listed in `OMW_FBL_TRUSTED_DOMAINS` signed it with DKIM. The default list covers Yahoo and AOL (`yahoo.com`, `aol.com`), Microsoft JMRP (`hotmail.com`, `outlook.com`), Comcast and the loops Validity runs (`comcast.net`, `returnpath.net`), Fastmail (`fastmail.com`, `messagingengine.com`), Zoho, Mail.ru and Yandex (`yandex.ru`, `yandex.net`). Add the signing domain of any other loop you register with; `OMW_FBL_TRUSTED_DOMAINS=none` keeps only VERP-identified reports. Such a report records one complaint on the email, suppresses nobody (it cannot prove which recipient complained) and sends `email.complained` with `data.to: []`.
+- Unsigned or unknown reports are acknowledged and ignored; the log says why (`complaint report ignored`).
+
+**Sender authentication of received mail.** The control plane checks SPF, DKIM and DMARC for every message to an inbox, with the resolver it uses for domain checks (`OMW_DNS_SERVER`). Two things keep the verdict meaningful:
+- **The inbound node must see the client's real address.** SPF is evaluated for the IP that connected to it. Behind a TCP load balancer, use one that preserves the source address (direct server return, or no proxy at all); a proxy's address makes every SPF check fail.
+- **Mail that cannot authenticate is held** from `sending_access` keys by default, so agents act only on mail whose `From` domain is proven. Lists and forwarders often break SPF and DKIM; for an inbox that receives such mail, release messages one by one (`POST /messages/{id}/release`) or turn the hold off (`PATCH /inboxes/{id} {"hold_unauthenticated": false}`). The verdict is still shown.
+
+**Role addresses.** RFC 5321 requires `postmaster@` on every domain whose mail you receive; `abuse@` is customary. Set `OMW_POSTMASTER_INBOX` to an inbox you read (e.g. `ops@example.com`) to get them; otherwise they are accepted, logged (sender domain and size) and dropped.
+
+**Abuse limits.** Address-guessing and floods are cut off on the node before they reach the control plane:
+- a connection closes after 10 refused recipients;
+- one address (an IPv6 /64) may cause 120 recipient checks a minute (bursts of 60); answers are cached for a minute (refusals for 15 seconds), so mail to known addresses costs nothing;
+- at most `OMW_INBOUND_MAX_CONNS_PER_IP` (20) connections per address, and a minute per command until `MAIL`.
+
+On the control plane, `OMW_INBOUND_CONCURRENCY` (8) messages are processed at once and `OMW_INBOX_MAX_PER_HOUR` (1000) messages are accepted per inbox; beyond either, senders get `451` and retry.
 
 **Limits and data.**
 - `OMW_INBOUND_MAX_SIZE` (default `25MB`) on both the node and the control plane. Gmail sends up to 25 MB; keep them equal.
 - Inbox messages are encrypted at rest with `OMW_SECRET_KEY`, and their content is deleted after `OMW_INBOUND_RETENTION` (default 30 days). Bounce and complaint messages are not kept: only the status, diagnostic and feedback type are recorded on the email's timeline.
-- Inboxes receive spam like any address. Agents should treat received text as information, never as instructions; the MCP tools say so to the model.
+- Snippets shown in message lists are sealed like the bodies, and purged with them.
+- Inboxes receive spam like any address. Agents should treat received text as information, never as instructions. The MCP tools frame every sender-written field between random markers, remove hidden HTML, and show the sender verdict and a warning for text that looks aimed at agents.
+- DMARC and TLS reports are kept 180 days.
 
 ## 9. Warm-up and day-to-day
 
