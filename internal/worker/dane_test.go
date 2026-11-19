@@ -142,6 +142,7 @@ type dnssecServer struct {
 
 	mu       sync.Mutex
 	a        map[string]string // name -> IPv4
+	mx       map[string]string // name -> MX host
 	tlsa     map[string][]TLSARecord
 	secure   map[string]bool
 	servfail map[string]bool
@@ -180,6 +181,9 @@ func (s *dnssecServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	case s.servfail[name]:
 		m.Rcode = dns.RcodeServerFailure
 		m.AuthenticatedData = false
+	case q.Qtype == dns.TypeMX && s.mx[name] != "":
+		m.Answer = append(m.Answer, &dns.MX{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: 60},
+			Preference: 10, Mx: s.mx[name]})
 	case q.Qtype == dns.TypeA && s.a[name] != "":
 		m.Answer = append(m.Answer, &dns.A{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP(s.a[name])})
 	case q.Qtype == dns.TypeTLSA && len(s.tlsa[name]) > 0:
@@ -228,10 +232,17 @@ func TestDANEResolver(t *testing.T) {
 	r := &DANEResolver{Server: s.addr}
 	ctx := context.Background()
 	recs, err := r.TLSA(ctx, "MX.Signed.Test")
-	if err != nil || len(recs) != 1 || recs[0].Usage != 3 {
-		t.Fatalf("signed host: %v %v (only the DANE-EE record is usable)", recs, err)
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("signed host: %v %v", recs, err)
 	}
-	for _, h := range []string{"mx.insecure-tlsa.test", "mx.no-tlsa.test", "mx.pkix-only.test", "mx.unsigned.test"} {
+	if u := usableTLSA(recs); len(u) != 1 || u[0].Usage != 3 {
+		t.Fatalf("signed host: usable %v (only the DANE-EE record is usable)", u)
+	}
+	// Unusable records are still returned: they make TLS mandatory.
+	if recs, err := r.TLSA(ctx, "mx.pkix-only.test"); err != nil || len(recs) != 1 || len(usableTLSA(recs)) != 0 {
+		t.Errorf("pkix-only: %v %v", recs, err)
+	}
+	for _, h := range []string{"mx.insecure-tlsa.test", "mx.no-tlsa.test", "mx.unsigned.test"} {
 		if recs, err := r.TLSA(ctx, h); err != nil || recs != nil {
 			t.Errorf("%s: want no DANE, got %v %v", h, recs, err)
 		}

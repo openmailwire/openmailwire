@@ -120,7 +120,7 @@ func (s *Server) signMessage(dom store.Domain, raw []byte) ([]byte, *policyError
 	if err != nil {
 		return nil, s.internalErr("dkim sign", err)
 	}
-	return signed, nil
+	return s.signEd25519(dom, signed) // lane C: an Ed25519 signature too, when enabled (dkim.go)
 }
 
 // queue stores signed emails for the request's API key, all of them or

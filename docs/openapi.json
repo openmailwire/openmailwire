@@ -2378,6 +2378,191 @@
           }
         }
       }
+    },
+    "/domains/{id}/dkim": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DomainId"
+        }
+      ],
+      "get": {
+        "operationId": "getDomainDkim",
+        "tags": [
+          "Domains"
+        ],
+        "summary": "List a domain's DKIM keys",
+        "description": "Every DKIM key of the domain with the TXT record it needs: the current RSA key, a new key during a rotation, the previous key during its overlap, and the Ed25519 key when enabled. Also lists authentication problems receivers reported for the domain.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The domain's DKIM keys.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DkimState"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/domains/{id}/dkim/rotate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DomainId"
+        }
+      ],
+      "post": {
+        "operationId": "rotateDomainDkim",
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Rotate the domain's DKIM key",
+        "description": "Rotation uses two selectors and an overlap. The first call creates a new RSA key under a new selector and answers `202` with the TXT record to publish; mail is still signed with the current key. Call again once the record is published: signing switches to the new key (`200`, `status: rotated`), and the previous key stays listed until its `retire_at` (8 days), because mail queued before the switch carries its signature.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signing switched to the new key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DkimState"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A new key was created; publish its record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DkimState"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "The new key's TXT record is not published yet (`dkim_record_not_found`); the message names the record. Publish it, wait for DNS, and call again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains/{id}/dkim/ed25519": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DomainId"
+        }
+      ],
+      "post": {
+        "operationId": "setDomainDkimEd25519",
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Turn the Ed25519 DKIM signature on or off",
+        "description": "With `{\"enabled\": true}` the first call creates an Ed25519 key (RFC 8463) and answers `202` with its TXT record; call again once it is published, and new mail carries an Ed25519 signature next to the RSA one. `{\"enabled\": false}` removes it.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ed25519 signing is active, or disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DkimState"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A key was created; publish its record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DkimState"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "The new key's TXT record is not published yet (`dkim_record_not_found`); the message names the record. Publish it, wait for DNS, and call again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
     }
   },
   "webhooks": {
@@ -4927,6 +5112,93 @@
             }
           }
         }
+      },
+      "DkimKey": {
+        "type": "object",
+        "properties": {
+          "selector": {
+            "type": "string"
+          },
+          "algorithm": {
+            "type": "string",
+            "enum": [
+              "rsa",
+              "ed25519"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "pending",
+              "retiring"
+            ],
+            "description": "`active` keys sign new mail; a `pending` key waits for its DNS record; a `retiring` key is the previous one after a rotation, kept published until `retire_at`."
+          },
+          "signs": {
+            "type": "boolean",
+            "description": "New mail is signed with this key."
+          },
+          "record": {
+            "$ref": "#/components/schemas/DnsRecord"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "retire_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "selector",
+          "algorithm",
+          "state",
+          "signs",
+          "record"
+        ]
+      },
+      "DkimState": {
+        "type": "object",
+        "properties": {
+          "object": {
+            "type": "string",
+            "enum": [
+              "dkim",
+              "dkim_rotation",
+              "dkim_ed25519"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "For rotation: `pending` or `rotated`. For Ed25519: `pending`, `active` or `disabled`."
+          },
+          "message": {
+            "type": "string",
+            "description": "What happened and the next step."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DkimKey"
+            }
+          },
+          "auth_issues": {
+            "type": "array",
+            "description": "Authentication problems receivers reported for this sending domain (Gmail's 4.7.26 to 4.7.32 and 5.7.x equivalents): SPF, DKIM or DMARC did not pass.",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "object",
+          "keys"
+        ]
       }
     },
     "parameters": {

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -136,9 +137,10 @@ func VerifyDANE(chain []*x509.Certificate, recs []TLSARecord, names []string) er
 	return errors.New("the certificate matches none of the TLSA records")
 }
 
-// TLSASource looks up the usable TLSA records of an MX host. No records
-// (nil, nil) means DANE does not apply to the host. An error means the
-// answer could not be trusted either way, so the host must not be used.
+// TLSASource looks up the TLSA records of an MX host, usable or not. No
+// records (nil, nil) means DANE does not apply to the host. Records of which
+// none is usable still require TLS (RFC 7672 section 2.2). An error means
+// the answer could not be trusted either way, so the host must not be used.
 type TLSASource interface {
 	TLSA(ctx context.Context, host string) ([]TLSARecord, error)
 }
@@ -152,7 +154,9 @@ type DANEResolver struct {
 	Timeout time.Duration
 }
 
-// TLSA returns host's usable TLSA records for SMTP (_25._tcp.<host>).
+// TLSA returns host's TLSA records for SMTP (_25._tcp.<host>), when the
+// resolver vouches for them. Unusable records are returned too: they still
+// make TLS mandatory (TLSARecord.Usable tells them apart).
 //
 // RFC 7672 section 2.2 applies DANE only to MX hosts whose address records
 // are DNSSEC-secure, so the address lookup is checked first: an unsigned
@@ -185,12 +189,72 @@ func (r *DANEResolver) TLSA(ctx context.Context, host string) ([]TLSARecord, err
 		if err != nil {
 			continue
 		}
-		rec := TLSARecord{Usage: t.Usage, Selector: t.Selector, MatchingType: t.MatchingType, Data: data}
-		if rec.Usable() {
-			out = append(out, rec)
-		}
+		out = append(out, TLSARecord{Usage: t.Usage, Selector: t.Selector, MatchingType: t.MatchingType, Data: data})
 	}
 	return out, nil
+}
+
+// DNSSECResolver looks up MX and address records through the validating
+// resolver DANE trusts (OMW_DNSSEC_RESOLVER), so that the MX answer is
+// known to be DNSSEC-secure or not: DANE applies to MX hosts only when it
+// is (RFC 7672 section 2.2.1).
+type DNSSECResolver struct {
+	DANEResolver
+}
+
+// LookupMX returns name's MX records.
+func (r *DNSSECResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	mxs, _, err := r.LookupMXSecure(ctx, name)
+	return mxs, err
+}
+
+// LookupMXSecure returns name's MX records and whether the answer was
+// authenticated (the AD bit). No records is a *net.DNSError with
+// IsNotFound, as from net.Resolver.
+func (r *DNSSECResolver) LookupMXSecure(ctx context.Context, name string) ([]*net.MX, bool, error) {
+	m, err := r.query(ctx, dns.Fqdn(strings.ToLower(name)), dns.TypeMX)
+	if err != nil {
+		return nil, false, &net.DNSError{Err: err.Error(), Name: name, IsTemporary: true}
+	}
+	var out []*net.MX
+	for _, rr := range m.Answer {
+		if mx, ok := rr.(*dns.MX); ok {
+			out = append(out, &net.MX{Host: mx.Mx, Pref: mx.Preference})
+		}
+	}
+	if len(out) == 0 {
+		return nil, m.AuthenticatedData, &net.DNSError{Err: "no MX records", Name: name, IsNotFound: true}
+	}
+	return out, m.AuthenticatedData, nil
+}
+
+// LookupIPAddr returns host's A and AAAA addresses.
+func (r *DNSSECResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	name := dns.Fqdn(strings.ToLower(host))
+	var out []net.IPAddr
+	var lastErr error
+	for _, t := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		m, err := r.query(ctx, name, t)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		for _, rr := range m.Answer {
+			switch a := rr.(type) {
+			case *dns.A:
+				out = append(out, net.IPAddr{IP: a.A})
+			case *dns.AAAA:
+				out = append(out, net.IPAddr{IP: a.AAAA})
+			}
+		}
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+	if lastErr != nil {
+		return nil, &net.DNSError{Err: lastErr.Error(), Name: host, IsTemporary: true}
+	}
+	return nil, &net.DNSError{Err: "no address records", Name: host, IsNotFound: true}
 }
 
 // query asks the resolver with the DO bit set (and AD, to say the answer's

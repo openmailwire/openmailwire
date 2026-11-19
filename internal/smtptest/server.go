@@ -8,7 +8,11 @@
 //     (RequireTLS);
 //   - AUTH PLAIN with one user (RequireAuth);
 //   - scripted replies per recipient (ReplyToRcpt) or per recipient domain
-//     (ReplyToDomain), e.g. a 421 that tells the sender to slow down.
+//     (ReplyToDomain), e.g. a 421 that tells the sender to slow down;
+//   - the extensions it announces besides STARTTLS and AUTH (Extensions;
+//     8BITMIME by default).
+//
+// Connections and RSETs are counted, to test connection reuse.
 package smtptest
 
 import (
@@ -22,11 +26,12 @@ import (
 )
 
 type Message struct {
-	MailFrom string
-	Rcpts    []string
-	Data     []byte // CRLF line endings, dot-unstuffed
-	TLS      bool   // the message arrived over TLS (STARTTLS or implicit)
-	AuthUser string // the user that authenticated with AUTH PLAIN, if any
+	MailFrom   string
+	MailParams string // what followed the address on MAIL FROM, e.g. "BODY=8BITMIME"
+	Rcpts      []string
+	Data       []byte // CRLF line endings, dot-unstuffed
+	TLS        bool   // the message arrived over TLS (STARTTLS or implicit)
+	AuthUser   string // the user that authenticated with AUTH PLAIN, if any
 }
 
 type Server struct {
@@ -44,6 +49,9 @@ type Server struct {
 	requireTLS    bool
 	authUser      string
 	authPass      string
+	extensions    []string
+	connections   int
+	resets        int
 }
 
 // Start listens on a random localhost port.
@@ -72,7 +80,7 @@ func start(ln net.Listener, implicitTLS bool) *Server {
 	s := &Server{
 		Addr: ln.Addr().String(), ln: ln, implicitTLS: implicitTLS,
 		rcptReply: map[string]string{}, domainReply: map[string]string{},
-		dropAfterData: map[string]bool{}, rcptCount: map[string]int{},
+		dropAfterData: map[string]bool{}, rcptCount: map[string]int{}, extensions: []string{"8BITMIME"},
 	}
 	go s.serve()
 	return s
@@ -136,6 +144,28 @@ func (s *Server) RequireAuth(user, pass string) {
 	s.authUser, s.authPass = user, pass
 }
 
+// Extensions sets the EHLO keywords announced besides STARTTLS and AUTH,
+// e.g. Extensions("8BITMIME", "SMTPUTF8", "SIZE 1000000"), or none.
+func (s *Server) Extensions(ext ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.extensions = append([]string(nil), ext...)
+}
+
+// Connections returns how many connections the server accepted.
+func (s *Server) Connections() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connections
+}
+
+// Resets returns how many RSET commands the server got.
+func (s *Server) Resets() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resets
+}
+
 // RcptCount returns how many RCPT TO commands named an address at domain.
 func (s *Server) RcptCount(domain string) int {
 	s.mu.Lock()
@@ -179,16 +209,21 @@ type settings struct {
 	tlsConfig          *tls.Config
 	requireTLS         bool
 	authUser, authPass string
+	extensions         []string
 }
 
 func (s *Server) settings() settings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return settings{tlsConfig: s.tlsConfig, requireTLS: s.requireTLS, authUser: s.authUser, authPass: s.authPass}
+	return settings{tlsConfig: s.tlsConfig, requireTLS: s.requireTLS, authUser: s.authUser, authPass: s.authPass,
+		extensions: s.extensions}
 }
 
 func (s *Server) handle(c net.Conn) {
 	defer func() { c.Close() }()
+	s.mu.Lock()
+	s.connections++
+	s.mu.Unlock()
 	tp := textproto.NewConn(c)
 	tp.PrintfLine("220 smtptest ESMTP")
 	inTLS := s.implicitTLS
@@ -203,7 +238,7 @@ func (s *Server) handle(c net.Conn) {
 		cfg := s.settings()
 		switch {
 		case strings.HasPrefix(verb, "EHLO"), strings.HasPrefix(verb, "HELO"):
-			ext := []string{"smtptest", "8BITMIME"}
+			ext := append([]string{"smtptest"}, cfg.extensions...)
 			if cfg.tlsConfig != nil && !inTLS {
 				ext = append(ext, "STARTTLS")
 			}
@@ -262,6 +297,9 @@ func (s *Server) handle(c net.Conn) {
 				continue
 			}
 			cur = Message{MailFrom: addrArg(line), TLS: inTLS, AuthUser: authed}
+			if j := strings.IndexByte(line, '>'); j >= 0 {
+				cur.MailParams = strings.TrimSpace(line[j+1:])
+			}
 			tp.PrintfLine("250 2.1.0 ok")
 		case strings.HasPrefix(verb, "RCPT TO:"):
 			rcpt := addrArg(line)
@@ -298,7 +336,13 @@ func (s *Server) handle(c net.Conn) {
 				return
 			}
 			tp.PrintfLine("250 2.0.0 ok queued as smtptest-%d", len(cur.Data))
-		case verb == "RSET", verb == "NOOP":
+		case verb == "RSET":
+			s.mu.Lock()
+			s.resets++
+			s.mu.Unlock()
+			cur = Message{}
+			tp.PrintfLine("250 ok")
+		case verb == "NOOP":
 			tp.PrintfLine("250 ok")
 		case verb == "QUIT":
 			tp.PrintfLine("221 bye")

@@ -63,6 +63,7 @@ func (s *Server) view(ctx context.Context, d store.Domain) domainResponse {
 			}
 		}
 	}
+	recs = append(recs, s.dkimRecords(ctx, d)...) // lane C: DKIM rotation and Ed25519 records (dkim.go)
 	return domainResponse{
 		Object: "domain", ID: d.ID, Name: d.Name, Status: d.Status, CreatedAt: d.CreatedAt,
 		VerifiedAt: d.VerifiedAt, CheckedAt: d.CheckedAt, Records: recs,

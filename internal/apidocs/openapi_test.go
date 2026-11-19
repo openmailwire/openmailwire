@@ -46,6 +46,9 @@ var publicRoutes = []route{
 	{"GET", "/domains/{id}", sending},
 	{"POST", "/domains/{id}/verify", full},
 	{"DELETE", "/domains/{id}", full},
+	{"GET", "/domains/{id}/dkim", sending},
+	{"POST", "/domains/{id}/dkim/rotate", full},
+	{"POST", "/domains/{id}/dkim/ed25519", full},
 
 	{"POST", "/webhooks", full},
 	{"GET", "/webhooks", full},
