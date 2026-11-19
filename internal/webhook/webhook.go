@@ -133,6 +133,14 @@ type data struct {
 	Inbox            string   `json:"inbox,omitempty"`
 	ThreadID         string   `json:"thread_id,omitempty"`
 	InReplyToEmailID string   `json:"in_reply_to_email_id,omitempty"`
+	// Lane D (v0.6): "to" is the inbox that received the message; the
+	// message's own To header is header_to. Sender authentication comes
+	// from the "received" event's data.
+	HeaderTo               []string          `json:"header_to,omitempty"`
+	Trust                  string            `json:"trust,omitempty"`
+	Authentication         map[string]string `json:"authentication,omitempty"`
+	Held                   *bool             `json:"held,omitempty"`
+	SuspiciousInstructions *bool             `json:"suspicious_instructions,omitempty"`
 }
 
 type complaint struct {
@@ -186,12 +194,26 @@ func Payload(ev store.EventRow, typ string) ([]byte, error) {
 		var c complaint
 		json.Unmarshal(ev.Data, &c)
 		p.Data.Complaint = &c
+		// Lane D: a report that does not say which recipient complained is
+		// about the email, not about every recipient of it.
+		if ev.Recipient == "" {
+			p.Data.To = []string{}
+		}
 	}
 	if typ == EmailReceived {
 		p.Data.Delivery = nil
-		if len(to) == 0 && ev.InboxAddress != "" {
-			p.Data.To = []string{ev.InboxAddress}
+		// Lane D: "to" is the inbox, whatever the sender wrote in To.
+		p.Data.HeaderTo = ev.To
+		p.Data.To = []string{ev.InboxAddress}
+		var auth struct {
+			Trust                  string            `json:"trust"`
+			Authentication         map[string]string `json:"authentication"`
+			Held                   *bool             `json:"held"`
+			SuspiciousInstructions *bool             `json:"suspicious_instructions"`
 		}
+		json.Unmarshal(ev.Data, &auth)
+		p.Data.Trust, p.Data.Authentication, p.Data.Held, p.Data.SuspiciousInstructions =
+			auth.Trust, auth.Authentication, auth.Held, auth.SuspiciousInstructions
 		p.Data.Cc = ev.Cc
 		if ev.MessageID != "" {
 			p.Data.MessageID = "<" + ev.MessageID + ">"

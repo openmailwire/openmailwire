@@ -22,6 +22,10 @@ type Submission struct {
 	TLSKey    string
 	APIURL    string // the control plane
 	MaxSize   int64
+	// MaxConns caps concurrent connections over both ports, and
+	// MaxConnsPerIP those from one address.
+	MaxConns      int
+	MaxConnsPerIP int
 }
 
 func LoadSubmission() (Submission, error) {
@@ -44,6 +48,13 @@ func LoadSubmission() (Submission, error) {
 			return c, fmt.Errorf("OMW_SUBMISSION_MAX_SIZE must be a size like 10MB, between 1KB and 14MB")
 		}
 		c.MaxSize = n
+	}
+	var err error
+	if c.MaxConns, err = envInt("OMW_SUBMISSION_MAX_CONNS", 200); err != nil {
+		return c, err
+	}
+	if c.MaxConnsPerIP, err = envInt("OMW_SUBMISSION_MAX_CONNS_PER_IP", 20); err != nil {
+		return c, err
 	}
 	return c, nil
 }

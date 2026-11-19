@@ -49,7 +49,7 @@ Usage:
   openmailwire keygen                         print a new OMW_SECRET_KEY
   openmailwire project create <name>          create a project and its first API key
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
-                       [--allow-to PATTERN]... [--allow-from PATTERN]...
+                       [--allow-to PATTERN]... [--allow-from PATTERN]... [--inbox PATTERN]...
                                               create an API key, e.g. one per agent, with its limits
   openmailwire apikey list <project-id>       list a project's live API keys
   openmailwire workers add <name>             register a worker and print its token
@@ -218,7 +218,7 @@ func runInbound(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	srv := inbound.New(inbound.Config{Hostname: cfg.Hostname, TLS: tlsConfig, MaxSize: cfg.MaxSize},
+	srv := inbound.New(inbound.Config{Hostname: cfg.Hostname, TLS: tlsConfig, MaxSize: cfg.MaxSize, MaxConnsPerIP: cfg.MaxConnsPerIP},
 		&inbound.Client{URL: cfg.ControlURL, Token: cfg.Token, HTTP: &http.Client{Timeout: 3 * time.Minute}}, log)
 	go func() {
 		<-ctx.Done()
@@ -269,11 +269,12 @@ func projectCmd(ctx context.Context, args []string) error {
 
 const apikeyUsage = `usage:
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
-                             [--allow-to PATTERN]... [--allow-from PATTERN]...
+                             [--allow-to PATTERN]... [--allow-from PATTERN]... [--inbox PATTERN]...
   openmailwire apikey list <project-id>
 
 Patterns match addresses; "*" matches any characters within the local part
-or the domain part: --allow-to '*@acme.com' --allow-from agent@acme.com`
+or the domain part: --allow-to '*@acme.com' --allow-from agent@acme.com
+A --sending-only key reads only the inboxes --inbox names: --inbox support@acme.com`
 
 // patterns collects a repeatable flag.
 type patterns []string
@@ -320,9 +321,10 @@ func apikeyCreate(ctx context.Context, args []string) error {
 	sendingOnly := fs.Bool("sending-only", false, "")
 	perHour := fs.Int("max-per-hour", 0, "")
 	perDay := fs.Int("max-per-day", 0, "")
-	var allowTo, allowFrom patterns
+	var allowTo, allowFrom, inboxes patterns
 	fs.Var(&allowTo, "allow-to", "")
 	fs.Var(&allowFrom, "allow-from", "")
+	fs.Var(&inboxes, "inbox", "") // lane D: policy.inboxes
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return fmt.Errorf("%v\n\n%s", err, apikeyUsage)
@@ -345,6 +347,9 @@ func apikeyCreate(ctx context.Context, args []string) error {
 	}
 	if len(allowFrom) > 0 {
 		policy.AllowedFrom = allowFrom
+	}
+	if len(inboxes) > 0 {
+		policy.Inboxes = inboxes
 	}
 	if err := policy.Normalize(); err != nil {
 		return err

@@ -161,6 +161,30 @@ func Evaluate(ctx context.Context, r Resolver, in Input, timeout time.Duration, 
 	return res
 }
 
+// VerifyDKIM checks only the DKIM signatures of a message, within
+// timeout. Feedback-loop reports are trusted by their signature.
+func VerifyDKIM(ctx context.Context, r Resolver, raw []byte, timeout time.Duration) []DKIMResult {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return checkDKIM(ctx, r, raw)
+}
+
+// SignedBy returns the first domain in trusted that signed the message
+// (a valid signature by it or a subdomain of it), or "".
+func SignedBy(results []DKIMResult, trusted []string) string {
+	for _, d := range results {
+		if d.Result != Pass {
+			continue
+		}
+		for _, t := range trusted {
+			if d.Domain == t || strings.HasSuffix(d.Domain, "."+t) {
+				return d.Domain
+			}
+		}
+	}
+	return ""
+}
+
 func checkDKIM(ctx context.Context, r Resolver, raw []byte) []DKIMResult {
 	vs, err := dkim.VerifyWithOptions(bytes.NewReader(raw), &dkim.VerifyOptions{
 		LookupTXT: func(domain string) ([]string, error) {

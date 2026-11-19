@@ -11,6 +11,7 @@ import (
 type Message struct {
 	From       string // "Name <addr>", decoded
 	FromAddr   string // lowercase address
+	FromCount  int    // addresses in From; DMARC needs exactly one
 	To         []string
 	Cc         []string
 	ReplyTo    []string
@@ -44,9 +45,10 @@ func Parse(raw []byte) *Message {
 		Date:    collapseSpace(h.get("Date")),
 		Headers: map[string]string{},
 	}
-	if from := parseAddresses(h.get("From")); len(from) > 0 {
+	if from := parseAddresses(strings.Join(h.all("From"), ", ")); len(from) > 0 {
 		m.From = FormatAddress(from[0])
 		m.FromAddr = strings.ToLower(from[0].Address)
+		m.FromCount = len(from)
 	}
 	m.To = formatAddresses(parseAddresses(strings.Join(h.all("To"), ", ")))
 	m.Cc = formatAddresses(parseAddresses(strings.Join(h.all("Cc"), ", ")))

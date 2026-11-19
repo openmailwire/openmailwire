@@ -14,8 +14,9 @@ import (
 const (
 	// FullAccess can call every endpoint.
 	FullAccess = "full_access"
-	// SendingAccess can send, read and cancel its own emails, and read
-	// domains. It suits an agent that should not manage the project.
+	// SendingAccess can send, read and cancel its own emails, read
+	// domains, and use the inboxes its policy lists. It suits an agent that
+	// should not manage the project.
 	SendingAccess = "sending_access"
 )
 
@@ -41,6 +42,10 @@ type Policy struct {
 	// local part or within the domain part: "*@acme.com", "ops@*.acme.com".
 	AllowedRecipients []string `json:"allowed_recipients,omitempty"`
 	AllowedFrom       []string `json:"allowed_from,omitempty"`
+	// Inboxes are the inbox addresses (patterns, as above) a
+	// sending_access key may read and reply from. Without it such a key
+	// sees no inbox. Full-access keys see every inbox.
+	Inboxes []string `json:"inboxes,omitempty"`
 }
 
 // Parse decodes a policy, refusing unknown fields, and normalizes it.
@@ -75,12 +80,18 @@ func (p *Policy) Normalize() error {
 	if p.AllowedFrom, err = normalizePatterns("allowed_from", p.AllowedFrom); err != nil {
 		return err
 	}
+	if p.Inboxes, err = normalizePatterns("inboxes", p.Inboxes); err != nil {
+		return err
+	}
 	return nil
 }
 
 func normalizePatterns(field string, in []string) ([]string, error) {
 	if in == nil {
 		return nil, nil
+	}
+	if len(in) == 0 && field == "inboxes" {
+		return nil, fmt.Errorf("policy.inboxes is empty; list inbox addresses like support@acme.com or *@agents.acme.com, or leave it out so the key sees no inbox")
 	}
 	if len(in) == 0 {
 		return nil, fmt.Errorf("policy.%s is empty; leave it out to allow every address", field)
@@ -184,6 +195,12 @@ func (p Policy) FirstDisallowedRecipient(rcpts []string) (rcpt string, ok bool) 
 		}
 	}
 	return "", false
+}
+
+// AllowsInbox reports whether a sending_access key with this policy may
+// use the inbox at addr: only when its inboxes patterns match.
+func (p Policy) AllowsInbox(addr string) bool {
+	return p.Inboxes != nil && matchAny(p.Inboxes, addr)
 }
 
 // HasCaps reports whether the policy limits how much the key sends.

@@ -40,6 +40,51 @@ type Control struct {
 	FBLAddress       string        // where feedback loops (ARF complaints) are sent
 	InboundRetention time.Duration // inbound message bodies are purged this long after arrival
 	InboundMaxSize   int64         // largest inbound message, in bytes
+	// FBLTrustedDomains are the feedback-loop senders whose DKIM-signed
+	// complaint reports count even when they name the email only by its
+	// Message-ID (a report that carries the VERP address needs no
+	// signature). A signing domain matches an entry or a subdomain of it.
+	FBLTrustedDomains []string
+	// PostmasterInbox, when set, is an inbox address that receives mail
+	// for postmaster@ and abuse@ on every domain the inbound nodes serve.
+	// Otherwise such mail is accepted, logged and dropped.
+	PostmasterInbox string
+	// InboxMaxPerHour caps the messages one inbox accepts per hour; more
+	// are deferred (the sender retries later).
+	InboxMaxPerHour int
+	// InboundConcurrency caps the inbound messages the control plane
+	// processes at once; more wait, then are deferred.
+	InboundConcurrency int
+}
+
+// DefaultFBLTrustedDomains sign the feedback-loop reports of the large
+// mailbox providers: Yahoo and AOL, Microsoft (JMRP), Comcast and the ISPs
+// whose loops Validity (Return Path) runs, Fastmail, Zoho, Mail.ru and
+// Yandex.
+var DefaultFBLTrustedDomains = []string{
+	"yahoo.com", "aol.com", "hotmail.com", "outlook.com", "comcast.net", "returnpath.net",
+	"fastmail.com", "messagingengine.com", "zoho.com", "mail.ru", "yandex.ru", "yandex.net",
+}
+
+// domainList reads a comma- or space-separated list of domains. "none"
+// gives an empty list; an unset variable gives def.
+func domainList(key string, def []string) ([]string, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	if strings.EqualFold(v, "none") {
+		return []string{}, nil
+	}
+	var out []string
+	for _, d := range strings.FieldsFunc(strings.ToLower(v), func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		d = strings.TrimSuffix(strings.TrimPrefix(d, "."), ".")
+		if !strings.Contains(d, ".") || strings.ContainsAny(d, "@/:") {
+			return nil, fmt.Errorf("%s: %q is not a domain name; list domains like yahoo.com,hotmail.com, or set none", key, d)
+		}
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 // DatabaseURL returns DATABASE_URL or an error when it is unset.
@@ -102,6 +147,16 @@ func LoadControl() (Control, error) {
 	if c.InboundMaxSize, err = envSize("OMW_INBOUND_MAX_SIZE", DefaultInboundMaxSize); err != nil {
 		return c, err
 	}
+	if c.FBLTrustedDomains, err = domainList("OMW_FBL_TRUSTED_DOMAINS", DefaultFBLTrustedDomains); err != nil {
+		return c, err
+	}
+	c.PostmasterInbox = strings.ToLower(strings.TrimSpace(os.Getenv("OMW_POSTMASTER_INBOX")))
+	if c.InboxMaxPerHour, err = envInt("OMW_INBOX_MAX_PER_HOUR", 1000); err != nil {
+		return c, err
+	}
+	if c.InboundConcurrency, err = envInt("OMW_INBOUND_CONCURRENCY", 8); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -117,6 +172,8 @@ type Inbound struct {
 	ControlURL string
 	Token      string // a worker token (omwk_…)
 	MaxSize    int64
+	// MaxConnsPerIP caps concurrent connections from one address.
+	MaxConnsPerIP int
 }
 
 func LoadInbound() (Inbound, error) {
@@ -140,6 +197,9 @@ func LoadInbound() (Inbound, error) {
 	}
 	var err error
 	if in.MaxSize, err = envSize("OMW_INBOUND_MAX_SIZE", DefaultInboundMaxSize); err != nil {
+		return in, err
+	}
+	if in.MaxConnsPerIP, err = envInt("OMW_INBOUND_MAX_CONNS_PER_IP", 20); err != nil {
 		return in, err
 	}
 	return in, nil
