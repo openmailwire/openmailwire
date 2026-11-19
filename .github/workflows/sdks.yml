@@ -10,6 +10,7 @@ on:
       - "sdks/**"
       - ".github/workflows/sdks.yml"
 
+# Every action is pinned by commit SHA (the version is in the comment).
 permissions:
   contents: read
 
@@ -20,8 +21,10 @@ jobs:
       run:
         working-directory: sdks/node
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -35,8 +38,10 @@ jobs:
       run:
         working-directory: sdks/python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests -v
@@ -47,8 +52,10 @@ jobs:
       run:
         working-directory: sdks/go
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: sdks/go/go.mod
           cache: false
@@ -63,11 +70,13 @@ jobs:
       run:
         working-directory: sdks/php
     steps:
-      - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: "8.3"
-          extensions: curl
+          extensions: curl, sodium
           tools: composer
           coverage: none
       - run: composer validate --no-check-lock
