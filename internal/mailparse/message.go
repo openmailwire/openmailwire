@@ -79,7 +79,7 @@ func Parse(raw []byte) *Message {
 		default:
 			if strings.HasPrefix(p.mediaType, "message/") && name == "" {
 				name = "message.eml"
-				if sub := Parse(p.body).Subject; sub != "" {
+				if sub := embeddedSubject(p.body); sub != "" {
 					name = sub + ".eml"
 				}
 			}
@@ -93,6 +93,14 @@ func Parse(raw []byte) *Message {
 		}
 	})
 	return m
+}
+
+// embeddedSubject reads only the header of an embedded message/* part.
+// Parsing the whole embedded message would recurse once per nesting level,
+// with a fresh depth and part budget each time.
+func embeddedSubject(body []byte) string {
+	head, _ := splitMessage(body)
+	return collapseSpace(decodeHeader(parseHeader(head).get("Subject")))
 }
 
 func joinText(have, add string) string {

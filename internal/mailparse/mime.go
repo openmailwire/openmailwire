@@ -70,26 +70,49 @@ func splitMessage(raw []byte) (head, body []byte) {
 	return raw, nil
 }
 
+// Limits on one header block. Lines past them are ignored: the parser is
+// lenient, and a real header is far smaller.
+const (
+	maxHeaderBytes  = 1 << 20
+	maxHeaderFields = 1000
+)
+
 // parseHeader reads header fields leniently: lines that are neither a field
-// nor a continuation are skipped.
+// nor a continuation are skipped. Continuation lines are collected and
+// joined once per field, so unfolding stays linear in the header size.
 func parseHeader(head []byte) header {
-	var h header
+	if len(head) > maxHeaderBytes {
+		head = head[:maxHeaderBytes]
+	}
+	type pending struct {
+		name  string
+		parts []string
+	}
+	var fields []pending
 	for _, line := range strings.Split(string(head), "\n") {
 		line = strings.TrimSuffix(line, "\r")
 		if line == "" {
 			continue
 		}
 		if line[0] == ' ' || line[0] == '\t' {
-			if len(h) > 0 {
-				h[len(h)-1].value += line
+			if len(fields) > 0 {
+				f := &fields[len(fields)-1]
+				f.parts = append(f.parts, line)
 			}
 			continue
+		}
+		if len(fields) == maxHeaderFields {
+			break
 		}
 		name, value, ok := strings.Cut(line, ":")
 		if !ok || name == "" || strings.ContainsAny(name, " \t") {
 			continue
 		}
-		h = append(h, field{name: name, value: value})
+		fields = append(fields, pending{name: name, parts: []string{value}})
+	}
+	h := make(header, len(fields))
+	for i, f := range fields {
+		h[i] = field{name: f.name, value: strings.Join(f.parts, "")}
 	}
 	return h
 }

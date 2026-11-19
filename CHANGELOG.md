@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.1: parser hardening, current Go
+
+- The mail parser reads only the header of an embedded `message/*` part instead of parsing it again, and unfolds header lines in linear time with limits on header size and field count. Hostile inbound mail can no longer use excessive stack or CPU.
+- Release binaries, CI and the container image are built with the newest stable Go instead of `go.mod`'s minimum version, so they include current standard-library security fixes. The container image now uses current Alpine.
+
 ## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
 ### SMTP submission and raw messages (v0.5)

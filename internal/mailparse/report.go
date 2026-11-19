@@ -131,34 +131,54 @@ func ParseReport(raw []byte) Report {
 }
 
 // fieldGroups splits a report body into blocks of fields separated by
-// blank lines, unfolding continuation lines.
+// blank lines, unfolding continuation lines. Continuations are collected
+// and joined once per field, so the work stays linear in the input.
 func fieldGroups(b []byte) []header {
+	if len(b) > maxHeaderBytes {
+		b = b[:maxHeaderBytes]
+	}
+	type pending struct {
+		name  string
+		parts []string
+	}
 	var groups []header
-	var cur header
+	var cur []pending
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		h := make(header, len(cur))
+		for i, f := range cur {
+			h[i] = field{name: f.name, value: strings.Join(f.parts, " ")}
+		}
+		groups = append(groups, h)
+		cur = nil
+	}
+	fields := 0
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSuffix(line, "\r")
 		if strings.TrimSpace(line) == "" {
-			if len(cur) > 0 {
-				groups = append(groups, cur)
-				cur = nil
-			}
+			flush()
 			continue
 		}
 		if line[0] == ' ' || line[0] == '\t' {
 			if len(cur) > 0 {
-				cur[len(cur)-1].value += " " + strings.TrimSpace(line)
+				f := &cur[len(cur)-1]
+				f.parts = append(f.parts, strings.TrimSpace(line))
 			}
 			continue
+		}
+		if fields == maxHeaderFields {
+			break
 		}
 		name, value, ok := strings.Cut(line, ":")
 		if !ok || strings.ContainsAny(strings.TrimSpace(name), " \t") {
 			continue
 		}
-		cur = append(cur, field{name: strings.TrimSpace(name), value: strings.TrimSpace(value)})
+		fields++
+		cur = append(cur, pending{name: strings.TrimSpace(name), parts: []string{strings.TrimSpace(value)}})
 	}
-	if len(cur) > 0 {
-		groups = append(groups, cur)
-	}
+	flush()
 	return groups
 }
 

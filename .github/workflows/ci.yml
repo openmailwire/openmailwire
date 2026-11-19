@@ -25,7 +25,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # The newest stable Go, not go.mod's minimum: release binaries must
+          # carry current standard-library security fixes.
+          go-version: stable
+          check-latest: true
       - run: go vet ./...
       - uses: actions/setup-node@v4
         with:
