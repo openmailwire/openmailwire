@@ -35,6 +35,7 @@ type Server struct {
 
 	limiter *keyLimiter // per-key request rate; nil when off
 	large   slots       // requests with bodies over largeBody
+	safety  safetyState // lane B: in-memory state (unsubscribe rate limit)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -78,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	var root http.Handler
 	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))
 	s.inboxRoutes(mux, func() http.Handler { return root })
+	s.safetyRoutes(mux) // lane B: approvals, suppressions, unsubscribe, pauses, project, check (safety.go)
 	mux.Handle("GET "+dashboard.Prefix, dashboard.Handler())
 	mux.Handle("GET "+dashboard.Prefix+"/", dashboard.Handler())
 

@@ -54,15 +54,23 @@ func (s *Server) internalErr(what string, err error) *policyError {
 // stored. It returns nil to allow the send.
 //
 // It checks the key's allowed_from and allowed_recipients patterns, then
-// its max_per_hour and max_per_day caps. Storing through queue checks the
-// caps again under a per-key lock, so concurrent requests cannot overshoot
-// them together.
+// its max_per_hour and max_per_day caps, then whether a circuit breaker has
+// paused the key, the sending domain or the project. Storing through queue
+// checks the caps and pauses again (the caps under a per-key lock), and
+// claims the project's per-recipient cap (max_per_recipient_per_day) under
+// a project lock, so concurrent requests cannot overshoot them together.
+//
+// Holds are not refusals: planSafety and rawSafety apply the key's
+// require_approval rules.
 func (s *Server) authorizeSend(r *http.Request, from string, recipients []string) *policyError {
 	key := apiKeyOf(r)
 	if pe := allowedBy(key.Policy, from, recipients); pe != nil {
 		return pe
 	}
-	return s.checkCaps(r.Context(), key, recipients)
+	if pe := s.checkCaps(r.Context(), key, recipients); pe != nil {
+		return pe
+	}
+	return s.checkPause(r.Context(), key, nil, []string{domainOf(strings.ToLower(from))})
 }
 
 // allowedBy checks the sender and recipients against a key's allowlists.

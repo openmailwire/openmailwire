@@ -159,6 +159,9 @@ func serve(ctx context.Context, log *slog.Logger) error {
 				if err := st.SweepInbound(ctx, cfg.InboundRetention); err != nil && ctx.Err() == nil {
 					log.Error("sweep inbound", "err", err)
 				}
+				if err := st.SweepSafety(ctx); err != nil && ctx.Err() == nil { // lane B: held mail expiry, cap rows
+					log.Error("sweep safety", "err", err)
+				}
 			}
 		}
 	}()

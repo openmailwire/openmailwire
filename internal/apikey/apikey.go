@@ -42,6 +42,8 @@ type Policy struct {
 	// local part or within the domain part: "*@acme.com", "ops@*.acme.com".
 	AllowedRecipients []string `json:"allowed_recipients,omitempty"`
 	AllowedFrom       []string `json:"allowed_from,omitempty"`
+	// Safety (lane B, approval.go): require_approval and can_approve.
+	Safety
 }
 
 // Parse decodes a policy, refusing unknown fields, and normalizes it.
@@ -68,6 +70,9 @@ func (p *Policy) Normalize() error {
 		if c.v != nil && (*c.v < 1 || *c.v > maxCap) {
 			return fmt.Errorf("policy.%s must be between 1 and %d; leave it out for no limit, or revoke the key to stop it sending", c.name, maxCap)
 		}
+	}
+	if err := p.Safety.normalize(); err != nil { // lane B: approval rules
+		return err
 	}
 	var err error
 	if p.AllowedRecipients, err = normalizePatterns("allowed_recipients", p.AllowedRecipients); err != nil {

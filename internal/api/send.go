@@ -33,7 +33,7 @@ const (
 func bodyLimit(r *http.Request) int64 {
 	if r.Method == http.MethodPost {
 		switch r.URL.Path {
-		case "/emails", "/emails/batch", "/emails/raw":
+		case "/emails", "/emails/batch", "/emails/raw", "/emails/check":
 			return maxSendBody
 		}
 	}
@@ -160,7 +160,12 @@ func (s *Server) queue(r *http.Request, es []store.NewEmail) ([]store.Inserted, 
 		es[i].ProjectID = key.ProjectID
 		es[i].APIKeyID = key.ID
 	}
+	reserved, pe := s.reserveSafety(r, es) // lane B: pauses, per-recipient cap
+	if pe != nil {
+		return nil, pe
+	}
 	out, err := s.Store.InsertEmails(r.Context(), es, capsOf(key))
+	s.settleSafety(r, es, out, err, reserved) // lane B: contacts, breaker counts
 	var ce *store.CapError
 	switch {
 	case errors.As(err, &ce):

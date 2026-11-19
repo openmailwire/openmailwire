@@ -69,6 +69,22 @@ var publicRoutes = []route{
 	{"GET", "/messages/{id}", sending},
 	{"GET", "/messages/{id}/attachments/{index}", sending},
 	{"POST", "/messages/{id}/reply", sending},
+
+	// v0.6 lane B: agent safety and compliance.
+	{"POST", "/emails/check", sending},
+	{"GET", "/emails/held", sending},
+	{"POST", "/emails/{id}/approve", sending}, // full_access, or a key with can_approve
+	{"POST", "/emails/{id}/reject", sending},
+	{"GET", "/suppressions", sending},
+	{"POST", "/suppressions", full},
+	{"GET", "/suppressions/export", sending},
+	{"DELETE", "/suppressions/{address}", full},
+	{"GET", "/pauses", sending},
+	{"POST", "/pauses/{id}/resume", full},
+	{"GET", "/project", sending},
+	{"PATCH", "/project", full},
+	{"GET", "/u/{token}", public},
+	{"POST", "/u/{token}", public},
 }
 
 var httpMethods = []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"}
@@ -343,18 +359,23 @@ func TestOpenAPIWebhooks(t *testing.T) {
 
 // The error names an agent must be able to branch on, with their statuses.
 var requiredErrors = map[string]int{
-	"validation_error":        422,
-	"domain_not_found":        403,
-	"domain_not_verified":     403,
-	"idempotency_conflict":    409,
-	"insufficient_permission": 403,
-	"sender_not_allowed":      403,
-	"recipient_not_allowed":   403,
-	"rate_limit_exceeded":     429,
-	"cannot_cancel":           409,
-	"not_found":               404,
-	"missing_api_key":         401,
-	"invalid_api_key":         401,
+	"validation_error":         422,
+	"domain_not_found":         403,
+	"domain_not_verified":      403,
+	"idempotency_conflict":     409,
+	"insufficient_permission":  403,
+	"sender_not_allowed":       403,
+	"recipient_not_allowed":    403,
+	"rate_limit_exceeded":      429,
+	"sending_paused":           403,
+	"recipient_rate_limited":   429,
+	"not_held":                 409,
+	"cannot_approve_own_email": 403,
+	"unsubscribe_unavailable":  422,
+	"cannot_cancel":            409,
+	"not_found":                404,
+	"missing_api_key":          401,
+	"invalid_api_key":          401,
 }
 
 func TestOpenAPIErrors(t *testing.T) {

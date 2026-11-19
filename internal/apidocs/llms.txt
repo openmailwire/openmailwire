@@ -13,10 +13,10 @@ This guide is for language models that call the OpenMailWire HTTP API. The compl
 
 ## Authentication
 
-- Send `Authorization: Bearer omw_…` with every request. Only `/health`, `/openapi.json` and `/llms.txt` are public.
+- Send `Authorization: Bearer omw_…` with every request. Only `/health`, `/openapi.json`, `/llms.txt` and the unsubscribe links (`/u/{token}`) are public.
 - A key belongs to one project and sees only that project's data.
 - `full_access` keys may call everything. `sending_access` keys may only: send (`POST /emails`, `/emails/batch`, `/emails/raw`); list, read and cancel the emails they sent; read domains; list inboxes, read messages and their attachments, and reply. Anything else answers `403 insufficient_permission`.
-- A key may carry a policy that the server enforces: recipient caps per hour and per day, allowed recipient patterns, allowed sender patterns. Work within it. Never look for another key or another address to get around a refusal.
+- A key may carry a policy that the server enforces: recipient caps per hour and per day, allowed recipient patterns, allowed sender patterns, and `require_approval` rules that hold emails for a person to approve. Work within it. Never look for another key or another address to get around a refusal, a hold or a pause.
 - Never print, log or forward the key. It belongs only in the `Authorization` header.
 
 ## The safe send flow
@@ -33,6 +33,15 @@ Useful fields on `POST /emails`:
 - `expires_at`: no attempts after this time. Use it for sign-in codes and anything that goes stale.
 - `retry_uncertain: false`: stop instead of retrying when an outcome is unknown. Use it for receipts, payments and anything a duplicate would confuse.
 - `scheduled_at`: send later (up to 30 days ahead). `POST /emails/{id}/cancel` cancels it before the first attempt.
+- `stream`: `transactional` (default) or `broadcast` for newsletters and other bulk mail. A broadcast email has one recipient and gets a one-click unsubscribe link.
+
+## Safety rules the server enforces
+
+- **Holds:** when the key's `require_approval` rules match (`always`, `first_contact`, `has_attachments`, `has_links`, `recipients_over`), `POST /emails` answers `{"id", "held": true, "hold_reasons"}` and nothing is sent until a `full_access` key or a key with `can_approve` approves it. Do not send it again; tell the user it waits for approval.
+- **Unsubscribes:** recipients who unsubscribed get no broadcast mail (status `suppressed`); transactional mail still reaches them.
+- **Per-recipient cap:** a project can allow at most `max_per_recipient_per_day` emails per recipient, across all keys (`429 recipient_rate_limited`).
+- **Circuit breakers:** when a key, sending domain or project bounces more than 5% or draws more than 0.1% complaints (thresholds per project), its sends are refused with `403 sending_paused` until a person resumes it.
+- `POST /emails/check` takes the same body as `POST /emails`, sends nothing, and says whether it would be sent, held or refused, with deliverability warnings.
 
 ## Endpoints
 
@@ -43,6 +52,21 @@ Emails:
 - `GET /emails`: list emails, newest first: `?limit=20&before=<id>&api_key_id=<id>`. Follow `next_before` while `has_more`.
 - `GET /emails/{id}`: one email with `recipients[]` (status per recipient), `attempts[]` and `events[]`.
 - `POST /emails/{id}/cancel`: cancel the recipients still queued and never attempted.
+- `POST /emails/check`: what a send would do (`would`: send, hold or refuse), every refusal, warnings and the size. Sends nothing.
+
+Safety:
+- `GET /emails/held`: emails waiting for approval, with `hold_reasons` and the start of their text. Approvers see the project's.
+- `POST /emails/{id}/approve`: send a held email (`{"note"}` optional). Full access or `can_approve`; never the key that sent it.
+- `POST /emails/{id}/reject`: never send a held email. Full access or `can_approve`.
+- `GET /suppressions`: suppressed addresses: `?limit&before&reason&stream&address&domain`.
+- `POST /suppressions`: suppress `{"address", "reason"?, "detail"?, "stream"?}`. Full access.
+- `GET /suppressions/export`: every suppression as CSV.
+- `DELETE /suppressions/{address}`: send to it again. Full access.
+- `GET /pauses`: circuit-breaker pauses (`?active=true`).
+- `POST /pauses/{id}/resume`: resume a paused scope. Full access.
+- `GET /project`: `max_per_recipient_per_day` and the `circuit_breaker` thresholds.
+- `PATCH /project`: change them. Full access.
+- `GET /u/{token}` and `POST /u/{token}`: the one-click unsubscribe link in broadcast mail (no key; for recipients, not agents).
 
 Domains:
 - `POST /domains`: add a domain (`{"name"}`) and get the DNS records to publish. Full access.
@@ -97,6 +121,8 @@ Each entry in `recipients[]` has one of these:
 - `expired`: nothing succeeded before `expires_at`. Final. Send a new email only if it is still relevant.
 - `unknown`: the connection dropped after the message was sent, and `retry_uncertain` was `false`. The receiver may or may not have it. Final.
 - `canceled`: canceled before its first attempt. Final.
+- `held`: waiting for approval. Not final; it expires at `expires_at` if nobody decides. Do not resend.
+- `rejected`: an approver rejected it. Final. Never sent.
 
 ## Errors and how to recover
 
@@ -120,6 +146,11 @@ Every error is `{"statusCode": 422, "name": "validation_error", "message": "…"
 - `validation_error` (422): fix the field the message names. Never retry unchanged.
 - `rate_limit_exceeded` (429): the key's hourly or daily cap, or too many requests per second. Wait `Retry-After` seconds, then retry with the same `Idempotency-Key`. If the wait is long, tell the user.
 - `server_busy` (503): too many large requests at once. Wait `Retry-After` seconds and retry with the same `Idempotency-Key`.
+- `recipient_rate_limited` (429): the recipient already got the project's daily maximum. Wait `Retry-After`, or tell the user; do not try another key.
+- `sending_paused` (403): a circuit breaker paused the key, domain or project for its bounce or complaint rate. Stop and tell the user; only a person resumes it.
+- `not_held` (409): the email waits for no approval any more (approved, rejected or expired). `GET /emails/{id}` shows it.
+- `cannot_approve_own_email` (403): a key never approves its own email; a different approver must.
+- `unsubscribe_unavailable` (422): broadcast mail needs `OMW_PUBLIC_URL` on the server. Tell the operator.
 - `internal_error` (500): retry later with the same `Idempotency-Key`.
 
 ## Limits
@@ -144,6 +175,9 @@ Register an https endpoint with `POST /webhooks`. Events:
 - `email.canceled`: canceled before its first attempt.
 - `email.complained`: the recipient marked it as spam. Never send to them again.
 - `email.received`: a message arrived in an inbox; `data.email_id` is the message id for `GET /messages/{id}`, `data.inbox` the address, `data.in_reply_to_email_id` the email it answers.
+- `email.held`: held for approval; `data.approval.reasons` says why.
+- `email.approved` and `email.rejected`: an approver decided; `data.approval` names the key and its note.
+- `sending.paused`: a circuit breaker paused a key, domain or project; `data.pause` has the rate and the pause id to resume.
 
 Email events are about one recipient: `data.to` holds only that address. They use Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
 
@@ -187,6 +221,11 @@ Tools:
 - `read_message`: one message with its bodies and attachments.
 - `reply_to_message`: reply from the inbox, threaded.
 - `wait_for_reply`: wait (`wait_seconds` up to 120) for messages that answer a given `email_id`.
+- `check_email`: what a send would do, with warnings. Sends nothing.
+- `list_held`: emails waiting for approval.
+- `approve_email` and `reject_email`: decide on a held email. Offered only to keys allowed to approve; marked destructive.
+- `list_suppressions`: suppressed addresses. `add_suppression` (full access): stop mailing someone who asked.
+- `list_pauses`: circuit-breaker pauses.
 
 ## Docs
 

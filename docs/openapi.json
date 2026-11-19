@@ -60,6 +60,10 @@
       "description": "Received messages: read them, download attachments, reply."
     },
     {
+      "name": "Safety",
+      "description": "Approval holds, suppressions, one-click unsubscribe, circuit breakers, project settings and the pre-send check."
+    },
+    {
       "name": "Meta",
       "description": "Health and documentation. No authentication."
     },
@@ -174,7 +178,7 @@
           "Emails"
         ],
         "summary": "Send an email",
-        "description": "Validates the email, signs it with the domain's DKIM key and queues it, then answers with its id. Delivery happens in the background: call `GET /emails/{id}` (or use webhooks) to learn what happened to each recipient.\n\nAlways send an `Idempotency-Key` and reuse it, with the same body, if you retry. The sender's domain must be verified, and the key's policy must allow the sender and every recipient. Suppressed recipients (who bounced or complained before) are recorded as `suppressed` and not sent to.\n\nAllowed for `sending_access` keys.",
+        "description": "Validates the email, signs it with the domain's DKIM key and queues it, then answers with its id. Delivery happens in the background: call `GET /emails/{id}` (or use webhooks) to learn what happened to each recipient.\n\nAlways send an `Idempotency-Key` and reuse it, with the same body, if you retry. The sender's domain must be verified, and the key's policy must allow the sender and every recipient. Suppressed recipients (who bounced or complained before) are recorded as `suppressed` and not sent to.\n\nAllowed for `sending_access` keys.\n\nWhen the key's `require_approval` policy matches, the email is stored but held: the answer has `\"held\": true` and `hold_reasons`, and nothing is sent until it is approved. Sends from a paused key, domain or project are refused with `403 sending_paused`; a recipient over the project's `max_per_recipient_per_day` with `429 recipient_rate_limited`.",
         "security": [
           {
             "apiKey": []
@@ -272,6 +276,16 @@
                     "value": {
                       "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94"
                     }
+                  },
+                  "held": {
+                    "summary": "Held for approval",
+                    "value": {
+                      "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "held": true,
+                      "hold_reasons": [
+                        "first_contact"
+                      ]
+                    }
                   }
                 }
               }
@@ -290,7 +304,7 @@
             "$ref": "#/components/responses/PayloadTooLarge"
           },
           "422": {
-            "$ref": "#/components/responses/ValidationError"
+            "$ref": "#/components/responses/SendValidationError"
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
@@ -471,7 +485,7 @@
             "$ref": "#/components/responses/PayloadTooLarge"
           },
           "422": {
-            "$ref": "#/components/responses/ValidationError"
+            "$ref": "#/components/responses/SendValidationError"
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
@@ -552,7 +566,7 @@
             "$ref": "#/components/responses/PayloadTooLarge"
           },
           "422": {
-            "$ref": "#/components/responses/ValidationError"
+            "$ref": "#/components/responses/SendValidationError"
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
@@ -2479,6 +2493,1192 @@
           }
         }
       }
+    },
+    "/emails/held": {
+      "get": {
+        "operationId": "listHeldEmails",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "List emails waiting for approval",
+        "description": "Emails held by `require_approval`, newest first, with the rules that matched and the start of their text. Keys that may approve (`full_access`, or `can_approve`) see the project's; other keys see their own.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 20
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Before"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of held emails.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeldEmailList"
+                },
+                "examples": {
+                  "held": {
+                    "summary": "Held",
+                    "value": {
+                      "object": "list",
+                      "data": [
+                        {
+                          "object": "held_email",
+                          "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                          "api_key_id": "6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                          "from": "Acme <hello@acme.com>",
+                          "to": [
+                            "jane@example.org"
+                          ],
+                          "cc": [],
+                          "bcc": [],
+                          "subject": "Following up",
+                          "stream": "transactional",
+                          "hold_reasons": [
+                            "first_contact"
+                          ],
+                          "recipients": [
+                            "jane@example.org"
+                          ],
+                          "created_at": "2026-11-18T10:00:00Z",
+                          "expires_at": "2026-11-20T10:00:00Z",
+                          "scheduled_at": null,
+                          "text": "Hi Jane, following up on our call…",
+                          "text_truncated": false
+                        }
+                      ],
+                      "has_more": false,
+                      "next_before": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/emails/{id}/approve": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EmailId"
+        }
+      ],
+      "post": {
+        "operationId": "approveEmail",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Approve a held email",
+        "description": "Sends every held recipient of the email (they become `queued`; webhook `email.approved`). A recipient suppressed since the email was held is not sent to. Refused while the sending key, domain or project is paused, and for the key that sent the email.\n\nNeeds a `full_access` key or a key whose policy has `can_approve`. The decision and the approving key are recorded.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Decided.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Decision"
+                },
+                "examples": {
+                  "approved": {
+                    "summary": "Approved",
+                    "value": {
+                      "object": "email",
+                      "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "decision": "approved",
+                      "recipients": [
+                        "jane@example.org"
+                      ],
+                      "suppressed": []
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "This key may not decide on held emails, or tried to approve its own.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "insufficient_permission": {
+                    "summary": "insufficient_permission",
+                    "value": {
+                      "statusCode": 403,
+                      "name": "insufficient_permission",
+                      "message": "this API key cannot approve held emails: that needs a full_access key, or a key whose policy has can_approve: true (PATCH /api-keys/{id})"
+                    }
+                  },
+                  "cannot_approve_own_email": {
+                    "summary": "cannot_approve_own_email",
+                    "value": {
+                      "statusCode": 403,
+                      "name": "cannot_approve_own_email",
+                      "message": "an API key cannot approve the emails it sent itself; approve with a different key that has can_approve, or a full_access key"
+                    }
+                  },
+                  "sending_paused": {
+                    "summary": "sending_paused",
+                    "value": {
+                      "statusCode": 403,
+                      "name": "sending_paused",
+                      "message": "sending is paused for the API key \"newsletter-agent\" (6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d): its bounce rate over the last 24 hours is 7.5% (45 of 600 recipients), above the 5% limit. Nothing is sent from it until a full_access key resumes it with POST /pauses/4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a/resume, after finding out why recipients bounce (GET /emails, GET /suppressions) and remove bad addresses"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Nothing waits for approval: never held, or already approved, rejected or expired.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "not_held": {
+                    "summary": "not_held",
+                    "value": {
+                      "statusCode": 409,
+                      "name": "not_held",
+                      "message": "email ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94 has no recipient waiting for approval: it was never held, or it was already approved, rejected or expired; see GET /emails/ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94"
+                    }
+                  },
+                  "message_purged": {
+                    "summary": "message_purged",
+                    "value": {
+                      "statusCode": 409,
+                      "name": "message_purged",
+                      "message": "email ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94 can no longer be sent: its message was purged (OMW_RETENTION). Reject it, and send it again if it is still wanted"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/emails/{id}/reject": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EmailId"
+        }
+      ],
+      "post": {
+        "operationId": "rejectEmail",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Reject a held email",
+        "description": "Rejects every held recipient of the email: they become `rejected` (webhook `email.rejected`) and nothing is ever sent. They stop counting toward the key's caps and the per-recipient cap.\n\nNeeds a `full_access` key or a key whose policy has `can_approve`. The decision and the approving key are recorded.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Decided.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Decision"
+                },
+                "examples": {
+                  "rejected": {
+                    "summary": "Rejected",
+                    "value": {
+                      "object": "email",
+                      "id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "decision": "rejected",
+                      "recipients": [
+                        "jane@example.org"
+                      ],
+                      "suppressed": []
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "This key may not decide on held emails, or tried to approve its own.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "insufficient_permission": {
+                    "summary": "insufficient_permission",
+                    "value": {
+                      "statusCode": 403,
+                      "name": "insufficient_permission",
+                      "message": "this API key cannot approve held emails: that needs a full_access key, or a key whose policy has can_approve: true (PATCH /api-keys/{id})"
+                    }
+                  },
+                  "cannot_approve_own_email": {
+                    "summary": "cannot_approve_own_email",
+                    "value": {
+                      "statusCode": 403,
+                      "name": "cannot_approve_own_email",
+                      "message": "an API key cannot approve the emails it sent itself; approve with a different key that has can_approve, or a full_access key"
+                    }
+                  },
+                  "sending_paused": {
+                    "summary": "sending_paused",
+                    "value": {
+                      "statusCode": 403,
+                      "name": "sending_paused",
+                      "message": "sending is paused for the API key \"newsletter-agent\" (6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d): its bounce rate over the last 24 hours is 7.5% (45 of 600 recipients), above the 5% limit. Nothing is sent from it until a full_access key resumes it with POST /pauses/4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a/resume, after finding out why recipients bounce (GET /emails, GET /suppressions) and remove bad addresses"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Nothing waits for approval: never held, or already approved, rejected or expired.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "not_held": {
+                    "summary": "not_held",
+                    "value": {
+                      "statusCode": 409,
+                      "name": "not_held",
+                      "message": "email ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94 has no recipient waiting for approval: it was never held, or it was already approved, rejected or expired; see GET /emails/ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94"
+                    }
+                  },
+                  "message_purged": {
+                    "summary": "message_purged",
+                    "value": {
+                      "statusCode": 409,
+                      "name": "message_purged",
+                      "message": "email ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94 can no longer be sent: its message was purged (OMW_RETENTION). Reject it, and send it again if it is still wanted"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/emails/check": {
+      "post": {
+        "operationId": "checkEmail",
+        "tags": [
+          "Safety",
+          "Emails"
+        ],
+        "summary": "Check an email without sending it",
+        "description": "Takes the body of `POST /emails`, stores and sends nothing, and reports what a send would do (`send`, `hold` or `refuse`), every refusal that would apply, the size, and warnings: no plain-text part, HTML over Gmail's 102 KB clip, links to other domains than the sender's, a broadcast without an unsubscribe link, an unverified domain, a message over 10 MB.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendEmailRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The check. Refusals are reported here, not as error statuses.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResult"
+                },
+                "examples": {
+                  "warnings": {
+                    "summary": "Warnings",
+                    "value": {
+                      "object": "email_check",
+                      "ok": false,
+                      "would": "send",
+                      "stream": "broadcast",
+                      "size": 128731,
+                      "hold_reasons": [],
+                      "refusals": [],
+                      "warnings": [
+                        {
+                          "code": "html_too_large",
+                          "message": "the HTML is 118 KB; Gmail clips HTML over 102 KB and hides the rest (often the unsubscribe link) behind \"View entire message\". Shorten it or link to a web page"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/suppressions": {
+      "get": {
+        "operationId": "listSuppressions",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "List suppressed addresses",
+        "description": "Addresses the project does not send to, newest first. Bounces and complaints add them for every stream; one-click unsubscribes for broadcast mail only.\n\nAllowed for `sending_access` keys.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "The `next_before` of the previous page.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "description": "Only this reason, e.g. `hard_bounce`, `complaint`, `unsubscribe`, `manual`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "Only `all` or only `broadcast` suppressions.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "broadcast"
+              ]
+            }
+          },
+          {
+            "name": "address",
+            "in": "query",
+            "required": false,
+            "description": "Only this address.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "domain",
+            "in": "query",
+            "required": false,
+            "description": "Only addresses at this domain.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of suppressions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuppressionList"
+                },
+                "examples": {
+                  "list": {
+                    "summary": "List",
+                    "value": {
+                      "object": "list",
+                      "data": [
+                        {
+                          "address": "jane@example.org",
+                          "stream": "all",
+                          "reason": "hard_bounce",
+                          "detail": "550 5.1.1 no such user",
+                          "created_at": "2026-11-18T10:00:05Z"
+                        }
+                      ],
+                      "has_more": false,
+                      "next_before": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createSuppression",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Suppress an address",
+        "description": "Stops sending to an address: every stream, or only broadcast mail. Adding one that exists answers 200 with the existing row.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSuppressionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Suppressed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuppressionCreated"
+                },
+                "examples": {
+                  "created": {
+                    "summary": "Created",
+                    "value": {
+                      "object": "suppression",
+                      "address": "jane@example.org",
+                      "stream": "all",
+                      "reason": "customer_request",
+                      "detail": "asked by phone",
+                      "created_at": "2026-11-18T10:00:05Z",
+                      "created": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Already suppressed; the existing row.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuppressionCreated"
+                },
+                "examples": {
+                  "existing": {
+                    "summary": "Existing",
+                    "value": {
+                      "object": "suppression",
+                      "address": "jane@example.org",
+                      "stream": "all",
+                      "reason": "hard_bounce",
+                      "detail": "550 5.1.1 no such user",
+                      "created_at": "2026-11-18T10:00:05Z",
+                      "created": false
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/suppressions/export": {
+      "get": {
+        "operationId": "exportSuppressions",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Export suppressions as CSV",
+        "description": "Every matching suppression, oldest first, as CSV with the columns `address,stream,reason,detail,created_at`. Values that a spreadsheet would read as a formula start with `'`.\n\nAllowed for `sending_access` keys.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "description": "Only this reason, e.g. `hard_bounce`, `complaint`, `unsubscribe`, `manual`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "Only `all` or only `broadcast` suppressions.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "broadcast"
+              ]
+            }
+          },
+          {
+            "name": "address",
+            "in": "query",
+            "required": false,
+            "description": "Only this address.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "domain",
+            "in": "query",
+            "required": false,
+            "description": "Only addresses at this domain.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The CSV file.",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "address,stream,reason,detail,created_at\njane@example.org,all,hard_bounce,550 5.1.1 no such user,2026-11-18T10:00:05Z\n"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/suppressions/{address}": {
+      "parameters": [
+        {
+          "name": "address",
+          "in": "path",
+          "required": true,
+          "description": "The suppressed address.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "delete": {
+        "operationId": "deleteSuppression",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Send to an address again",
+        "description": "Removes the address's suppressions (only the one for `stream` when given). Only do this when the address is known to work and to want the mail.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "Remove only this stream's suppression.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "broadcast"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuppressionDeleted"
+                },
+                "examples": {
+                  "deleted": {
+                    "summary": "Deleted",
+                    "value": {
+                      "object": "suppression",
+                      "address": "jane@example.org",
+                      "deleted": true,
+                      "removed": [
+                        {
+                          "address": "jane@example.org",
+                          "stream": "all",
+                          "reason": "hard_bounce",
+                          "detail": "550 5.1.1 no such user",
+                          "created_at": "2026-11-18T10:00:05Z"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/pauses": {
+      "get": {
+        "operationId": "listPauses",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "List circuit-breaker pauses",
+        "description": "A circuit breaker pauses an API key, a sending domain or the project when its bounce or complaint rate over 24 hours goes over the project's thresholds (`GET /project`). Newest first.\n\nAllowed for `sending_access` keys.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "active",
+            "in": "query",
+            "required": false,
+            "description": "`true`: only pauses still in force.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The pauses.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PauseList"
+                },
+                "examples": {
+                  "list": {
+                    "summary": "List",
+                    "value": {
+                      "object": "list",
+                      "data": [
+                        {
+                          "object": "pause",
+                          "id": "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a",
+                          "scope": "api_key",
+                          "scope_id": "6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                          "scope_name": "newsletter-agent",
+                          "reason": "bounce_rate",
+                          "rate": 0.075,
+                          "threshold": 0.05,
+                          "recipients": 600,
+                          "bounces": 45,
+                          "complaints": 0,
+                          "created_at": "2026-11-18T10:20:00Z",
+                          "resumed_at": null,
+                          "resumed_by": null,
+                          "active": true
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/pauses/{id}/resume": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "A pause id (`GET /pauses`).",
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "resumePause",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Resume sending",
+        "description": "Ends a pause. The scope's counts start over, so the same bounces do not pause it again. Find out why recipients bounced or complained first. The resume is recorded with the acting key.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resumed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pause"
+                },
+                "examples": {
+                  "resumed": {
+                    "summary": "Resumed",
+                    "value": {
+                      "object": "pause",
+                      "id": "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a",
+                      "scope": "api_key",
+                      "scope_id": "6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                      "scope_name": "newsletter-agent",
+                      "reason": "bounce_rate",
+                      "rate": 0.075,
+                      "threshold": 0.05,
+                      "recipients": 600,
+                      "bounces": 45,
+                      "complaints": 0,
+                      "created_at": "2026-11-18T10:20:00Z",
+                      "resumed_at": "2026-11-18T12:00:00Z",
+                      "resumed_by": "9b8a7c6d-5e4f-4321-8a9b-0c1d2e3f4a5b",
+                      "active": false
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "The pause was already resumed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "not_paused": {
+                    "summary": "not_paused",
+                    "value": {
+                      "statusCode": 409,
+                      "name": "not_paused",
+                      "message": "this pause was already resumed; GET /pauses?active=true lists the active ones"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/project": {
+      "get": {
+        "operationId": "getProject",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Get the project's sending settings",
+        "description": "The per-recipient cap and the circuit-breaker thresholds.\n\nAllowed for `sending_access` keys.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The settings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                },
+                "examples": {
+                  "project": {
+                    "summary": "Project",
+                    "value": {
+                      "object": "project",
+                      "id": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+                      "name": "Acme",
+                      "max_per_recipient_per_day": 3,
+                      "circuit_breaker": {
+                        "enabled": true,
+                        "bounce_rate": 0.05,
+                        "complaint_rate": 0.001,
+                        "min_recipients": 50
+                      },
+                      "updated_at": "2026-11-18T09:00:00Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateProject",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Change the project's sending settings",
+        "description": "Fields left out keep their value. The change is recorded with the acting key.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectRequest"
+              },
+              "examples": {
+                "cap": {
+                  "summary": "Cap mail per recipient",
+                  "value": {
+                    "max_per_recipient_per_day": 3
+                  }
+                },
+                "breaker": {
+                  "summary": "Stricter bounce limit",
+                  "value": {
+                    "circuit_breaker": {
+                      "bounce_rate": 0.03
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new settings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                },
+                "examples": {
+                  "project": {
+                    "summary": "Project",
+                    "value": {
+                      "object": "project",
+                      "id": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+                      "name": "Acme",
+                      "max_per_recipient_per_day": 3,
+                      "circuit_breaker": {
+                        "enabled": true,
+                        "bounce_rate": 0.05,
+                        "complaint_rate": 0.001,
+                        "min_recipients": 50
+                      },
+                      "updated_at": "2026-11-18T09:00:00Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/u/{token}": {
+      "parameters": [
+        {
+          "name": "token",
+          "in": "path",
+          "required": true,
+          "description": "The signed token from the email's `List-Unsubscribe` header.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "unsubscribePage",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "Unsubscribe confirm page",
+        "description": "The page a person sees when following a broadcast email's unsubscribe link: a button that POSTs to the same address. A GET never unsubscribes, because link scanners and previews follow links. No authentication; rate-limited per client IP.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "A confirm page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The token is not valid.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests from this IP address; retry later.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "unsubscribe",
+        "tags": [
+          "Safety"
+        ],
+        "summary": "One-click unsubscribe (RFC 8058)",
+        "description": "Suppresses the token's address for broadcast mail of the token's project at once (reason `unsubscribe`, stream `broadcast`); transactional mail still goes out. Mailbox providers POST `List-Unsubscribe=One-Click` here; the confirm page does too. Repeating it changes nothing. No authentication; rate-limited per client IP.",
+        "security": [],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "List-Unsubscribe": {
+                    "const": "One-Click"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Unsubscribed.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The token is not valid.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests from this IP address; retry later.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "webhooks": {
@@ -3321,6 +4521,355 @@
           }
         }
       }
+    },
+    "email.held": {
+      "post": {
+        "operationId": "emailHeldWebhook",
+        "tags": [
+          "Webhook events"
+        ],
+        "summary": "The email is held for approval",
+        "description": "The sending key's `require_approval` policy matched. Nothing is sent until a `full_access` key, or a key with `can_approve`, calls `POST /emails/{id}/approve`. `data.approval.reasons` lists the rules that matched.\n\nVerify the signature headers before trusting the body. `data.to` holds only the recipient this event is about.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SvixIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixSignatureHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookSignatureHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EmailEvent"
+                  },
+                  {
+                    "properties": {
+                      "type": {
+                        "const": "email.held"
+                      }
+                    }
+                  }
+                ]
+              },
+              "examples": {
+                "event": {
+                  "summary": "email.held",
+                  "value": {
+                    "type": "email.held",
+                    "created_at": "2026-11-18T10:00:03Z",
+                    "data": {
+                      "email_id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "created_at": "2026-11-18T10:00:00Z",
+                      "from": "Acme <hello@acme.com>",
+                      "to": [
+                        "jane@example.org"
+                      ],
+                      "subject": "Your sign-in code",
+                      "tags": {
+                        "category": "signin"
+                      },
+                      "approval": {
+                        "reasons": [
+                          "first_contact"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged. Any 2xx status works."
+          },
+          "default": {
+            "description": "Anything else, or no answer within 15 s, is retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed."
+          }
+        }
+      }
+    },
+    "email.approved": {
+      "post": {
+        "operationId": "emailApprovedWebhook",
+        "tags": [
+          "Webhook events"
+        ],
+        "summary": "A held email was approved",
+        "description": "Delivery to this recipient starts now. `data.approval` names the approving key and its note.\n\nVerify the signature headers before trusting the body. `data.to` holds only the recipient this event is about.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SvixIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixSignatureHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookSignatureHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EmailEvent"
+                  },
+                  {
+                    "properties": {
+                      "type": {
+                        "const": "email.approved"
+                      }
+                    }
+                  }
+                ]
+              },
+              "examples": {
+                "event": {
+                  "summary": "email.approved",
+                  "value": {
+                    "type": "email.approved",
+                    "created_at": "2026-11-18T10:00:03Z",
+                    "data": {
+                      "email_id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "created_at": "2026-11-18T10:00:00Z",
+                      "from": "Acme <hello@acme.com>",
+                      "to": [
+                        "jane@example.org"
+                      ],
+                      "subject": "Your sign-in code",
+                      "tags": {
+                        "category": "signin"
+                      },
+                      "approval": {
+                        "approved_by": "9b8a7c6d-5e4f-4321-8a9b-0c1d2e3f4a5b",
+                        "note": "checked with the customer"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged. Any 2xx status works."
+          },
+          "default": {
+            "description": "Anything else, or no answer within 15 s, is retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed."
+          }
+        }
+      }
+    },
+    "email.rejected": {
+      "post": {
+        "operationId": "emailRejectedWebhook",
+        "tags": [
+          "Webhook events"
+        ],
+        "summary": "A held email was rejected",
+        "description": "It is never sent to this recipient. `data.approval` names the rejecting key and its note.\n\nVerify the signature headers before trusting the body. `data.to` holds only the recipient this event is about.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SvixIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixSignatureHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookSignatureHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EmailEvent"
+                  },
+                  {
+                    "properties": {
+                      "type": {
+                        "const": "email.rejected"
+                      }
+                    }
+                  }
+                ]
+              },
+              "examples": {
+                "event": {
+                  "summary": "email.rejected",
+                  "value": {
+                    "type": "email.rejected",
+                    "created_at": "2026-11-18T10:00:03Z",
+                    "data": {
+                      "email_id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "created_at": "2026-11-18T10:00:00Z",
+                      "from": "Acme <hello@acme.com>",
+                      "to": [
+                        "jane@example.org"
+                      ],
+                      "subject": "Your sign-in code",
+                      "tags": {
+                        "category": "signin"
+                      },
+                      "approval": {
+                        "rejected_by": "9b8a7c6d-5e4f-4321-8a9b-0c1d2e3f4a5b",
+                        "note": "wrong recipient"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged. Any 2xx status works."
+          },
+          "default": {
+            "description": "Anything else, or no answer within 15 s, is retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed."
+          }
+        }
+      }
+    },
+    "sending.paused": {
+      "post": {
+        "operationId": "sendingPausedWebhook",
+        "tags": [
+          "Webhook events"
+        ],
+        "summary": "A circuit breaker paused sending",
+        "description": "An API key, a sending domain or the project went over the project's bounce or complaint rate limit. Sends from that scope are refused with `403 sending_paused` until a `full_access` key calls `POST /pauses/{id}/resume`. `data` is the email whose bounce or complaint tripped it, and `data.pause` the pause.\n\nVerify the signature headers before trusting the body. `data.to` holds only the recipient this event is about.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SvixIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SvixSignatureHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookTimestampHeader"
+          },
+          {
+            "$ref": "#/components/parameters/WebhookSignatureHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EmailEvent"
+                  },
+                  {
+                    "properties": {
+                      "type": {
+                        "const": "sending.paused"
+                      }
+                    }
+                  }
+                ]
+              },
+              "examples": {
+                "event": {
+                  "summary": "sending.paused",
+                  "value": {
+                    "type": "sending.paused",
+                    "created_at": "2026-11-18T10:00:03Z",
+                    "data": {
+                      "email_id": "ed01a077-3c2f-4f7e-9a51-2b6f0c1d8e94",
+                      "created_at": "2026-11-18T10:00:00Z",
+                      "from": "Acme <hello@acme.com>",
+                      "to": [
+                        "jane@example.org"
+                      ],
+                      "subject": "Your sign-in code",
+                      "tags": {
+                        "category": "signin"
+                      },
+                      "pause": {
+                        "id": "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a",
+                        "scope": "api_key",
+                        "scope_id": "6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                        "scope_name": "newsletter-agent",
+                        "reason": "bounce_rate",
+                        "rate": 0.075,
+                        "threshold": 0.05,
+                        "recipients": 600,
+                        "bounces": 45,
+                        "complaints": 0
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged. Any 2xx status works."
+          },
+          "default": {
+            "description": "Anything else, or no answer within 15 s, is retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed."
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3477,7 +5026,7 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Extra headers, e.g. `List-Unsubscribe`. Structural headers (From, To, Date, Message-ID, MIME headers…) are refused."
+            "description": "Extra headers, e.g. `List-Unsubscribe` on transactional mail. Structural headers (From, To, Date, Message-ID, MIME headers…) are refused, and so is `Feedback-ID`, which OpenMailWire sets; on `broadcast` mail so are `List-Unsubscribe` and `List-Unsubscribe-Post`."
           },
           "tags": {
             "type": "array",
@@ -3508,6 +5057,15 @@
             "type": "boolean",
             "default": true,
             "description": "When an attempt's outcome is unknown (the connection dropped after the message was sent), `true` retries it, so the recipient may get two copies, and `false` stops with status `unknown`. Use `false` for receipts and other mail where a duplicate is harmful."
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "transactional",
+              "broadcast"
+            ],
+            "default": "transactional",
+            "description": "`transactional` (the default): mail the recipient expects, like receipts, codes and replies. `broadcast`: newsletters and other bulk mail. A broadcast email goes to exactly one recipient and gets `List-Unsubscribe` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058) pointing at `OMW_PUBLIC_URL/u/{token}`; without `OMW_PUBLIC_URL` it is refused with `422 unsubscribe_unavailable`. Every email gets `Feedback-ID: <stream>:<api key id>:<project id>:omw` for Gmail's feedback loop."
           }
         },
         "additionalProperties": false
@@ -3549,6 +5107,15 @@
               "type": "string"
             },
             "description": "Envelope recipients. Default: the addresses in the `To` and `Cc` headers."
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "transactional",
+              "broadcast"
+            ],
+            "default": "transactional",
+            "description": "As in `POST /emails`. A message sent over SMTP submission can say `X-OMW-Stream: broadcast` instead; that header is removed. On broadcast mail OpenMailWire replaces any `List-Unsubscribe` pair in the message, and it always replaces `Feedback-ID`."
           }
         },
         "additionalProperties": false
@@ -3563,6 +5130,14 @@
             "type": "string",
             "format": "uuid",
             "description": "The new email's id. Pass it to `GET /emails/{id}`."
+          },
+          "held": {
+            "type": "boolean",
+            "const": true,
+            "description": "Present when the email waits for approval (the key's `require_approval` policy). Nothing is sent until it is approved."
+          },
+          "hold_reasons": {
+            "$ref": "#/components/schemas/HoldReasons"
           }
         }
       },
@@ -3592,9 +5167,11 @@
           "expired",
           "suppressed",
           "unknown",
-          "canceled"
+          "canceled",
+          "held",
+          "rejected"
         ],
-        "description": "One recipient's state.\n\n- `queued`: waiting for its first attempt, or for `scheduled_at`. Not final.\n- `sending`: a worker is delivering it now. Not final.\n- `deferred`: a temporary failure; OpenMailWire retries by itself until `expires_at`. Not final. Do not resend.\n- `delivered`: the recipient's mail server accepted it. Final, except that a bounce report that arrives later turns it into `bounced`.\n- `bounced`: a permanent failure (a 5xx reply or a bounce report). Final. Never resend. 5.1.x bounces add the address to the suppression list.\n- `suppressed`: nothing was sent, because the address bounced or complained before. Final. Never resend.\n- `expired`: no successful attempt before `expires_at`. Final.\n- `unknown`: the connection dropped after the message was sent and `retry_uncertain` is `false`; the receiver may or may not have it. Final.\n- `canceled`: canceled before its first attempt. Final."
+        "description": "One recipient's state.\n\n- `queued`: waiting for its first attempt, or for `scheduled_at`. Not final.\n- `sending`: a worker is delivering it now. Not final.\n- `deferred`: a temporary failure; OpenMailWire retries by itself until `expires_at`. Not final. Do not resend.\n- `delivered`: the recipient's mail server accepted it. Final, except that a bounce report that arrives later turns it into `bounced`.\n- `bounced`: a permanent failure (a 5xx reply or a bounce report). Final. Never resend. 5.1.x bounces add the address to the suppression list.\n- `suppressed`: nothing was sent, because the address bounced or complained before. Final. Never resend.\n- `expired`: no successful attempt before `expires_at`. Final.\n- `unknown`: the connection dropped after the message was sent and `retry_uncertain` is `false`; the receiver may or may not have it. Final.\n- `canceled`: canceled before its first attempt. Final.\n- `held`: waiting for approval (`POST /emails/{id}/approve`), because of the sending key's `require_approval` policy. Not final; it expires at `expires_at`.\n- `rejected`: rejected by an approver (`POST /emails/{id}/reject`). Final. Never sent."
       },
       "Recipient": {
         "type": "object",
@@ -4158,7 +5735,11 @@
           "email.delivery_unknown",
           "email.canceled",
           "email.complained",
-          "email.received"
+          "email.received",
+          "email.held",
+          "email.approved",
+          "email.rejected",
+          "sending.paused"
         ],
         "description": "An event a webhook can subscribe to. The `webhooks` section describes each payload."
       },
@@ -4329,6 +5910,40 @@
               "type": "string"
             },
             "description": "Patterns the sender address must match, e.g. `agent@acme.com`, `*@support.acme.com`."
+          },
+          "require_approval": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "description": "Hold this key's emails for approval when any rule matches. A held email is stored with status `held` (webhook `email.held`) and sent only after a `full_access` key, or a key with `can_approve`, approves it.",
+            "properties": {
+              "always": {
+                "type": "boolean",
+                "description": "Every email."
+              },
+              "first_contact": {
+                "type": "boolean",
+                "description": "A recipient this project has never sent to."
+              },
+              "has_attachments": {
+                "type": "boolean",
+                "description": "Any attachment, inline ones included."
+              },
+              "has_links": {
+                "type": "boolean",
+                "description": "A web link in the text or HTML."
+              },
+              "recipients_over": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000,
+                "description": "More than this many recipients (to, cc and bcc together)."
+              }
+            }
+          },
+          "can_approve": {
+            "type": "boolean",
+            "description": "This key may approve and reject held emails of other keys. `full_access` keys always can. No key approves its own emails."
           }
         },
         "additionalProperties": false
@@ -4935,6 +6550,29 @@
                 "description": "The feedback loop that sent it."
               }
             }
+          },
+          "approval": {
+            "type": "object",
+            "description": "`email.held`: `{\"reasons\": [...]}`. `email.approved`: `{\"approved_by\": <key id>, \"note\"}`. `email.rejected`: `{\"rejected_by\": <key id>, \"note\"}`.",
+            "properties": {
+              "reasons": {
+                "$ref": "#/components/schemas/HoldReasons"
+              },
+              "approved_by": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "rejected_by": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          },
+          "pause": {
+            "$ref": "#/components/schemas/PauseDetail"
           }
         }
       },
@@ -5238,6 +6876,709 @@
           },
           "problem": {
             "type": "string"
+          }
+        }
+      },
+      "HoldReasons": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "always",
+            "first_contact",
+            "has_attachments",
+            "has_links",
+            "recipients_over"
+          ]
+        },
+        "description": "The `require_approval` rules that matched."
+      },
+      "HeldEmail": {
+        "type": "object",
+        "required": [
+          "object",
+          "id",
+          "from",
+          "to",
+          "subject",
+          "stream",
+          "hold_reasons",
+          "recipients",
+          "created_at",
+          "expires_at",
+          "text"
+        ],
+        "properties": {
+          "object": {
+            "const": "held_email"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "api_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The key that sent it."
+          },
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cc": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "bcc": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "subject": {
+            "type": "string"
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "transactional",
+              "broadcast"
+            ]
+          },
+          "hold_reasons": {
+            "$ref": "#/components/schemas/HoldReasons"
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The recipients waiting for approval."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Held mail nobody decides on expires then (webhook `email.failed`)."
+          },
+          "scheduled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "text": {
+            "type": "string",
+            "description": "The first 2000 characters of the text (or of the HTML as text), for the reviewer."
+          },
+          "text_truncated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "HeldEmailList": {
+        "type": "object",
+        "required": [
+          "object",
+          "data",
+          "has_more",
+          "next_before"
+        ],
+        "properties": {
+          "object": {
+            "const": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeldEmail"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Pass as `before` for the next page."
+          }
+        }
+      },
+      "DecisionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "note": {
+            "type": "string",
+            "maxLength": 1000,
+            "description": "Why; kept with the decision and sent in the webhook."
+          }
+        }
+      },
+      "Decision": {
+        "type": "object",
+        "required": [
+          "object",
+          "id",
+          "decision",
+          "recipients",
+          "suppressed"
+        ],
+        "properties": {
+          "object": {
+            "const": "email"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approved",
+              "rejected"
+            ]
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Approved (now `queued`) or rejected."
+          },
+          "suppressed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Approved, but suppressed since the email was held, so not sent."
+          }
+        }
+      },
+      "CheckResult": {
+        "type": "object",
+        "required": [
+          "object",
+          "ok",
+          "would",
+          "stream",
+          "size",
+          "hold_reasons",
+          "refusals",
+          "warnings"
+        ],
+        "properties": {
+          "object": {
+            "const": "email_check"
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "No refusal and no warning."
+          },
+          "would": {
+            "type": "string",
+            "enum": [
+              "send",
+              "hold",
+              "refuse"
+            ],
+            "description": "What `POST /emails` would do with this body now."
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "transactional",
+              "broadcast"
+            ]
+          },
+          "size": {
+            "type": "integer",
+            "description": "The message size in bytes as it would be sent, DKIM signature included (estimated)."
+          },
+          "hold_reasons": {
+            "$ref": "#/components/schemas/HoldReasons"
+          },
+          "refusals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "description": "Every refusal that would apply: validation, the key's policy and caps, the domain, a pause, the per-recipient cap."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "code",
+                "message"
+              ],
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "enum": [
+                    "no_text_part",
+                    "html_too_large",
+                    "link_domain_mismatch",
+                    "missing_unsubscribe",
+                    "domain_not_verified",
+                    "large_message"
+                  ]
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Suppression": {
+        "type": "object",
+        "required": [
+          "address",
+          "stream",
+          "reason",
+          "detail",
+          "created_at"
+        ],
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "all",
+              "broadcast"
+            ],
+            "description": "`all`: no mail is sent to the address. `broadcast`: only broadcast mail is suppressed (one-click unsubscribes)."
+          },
+          "reason": {
+            "type": "string",
+            "description": "`hard_bounce`, `complaint`, `unsubscribe`, `manual`, or a name given with `POST /suppressions`."
+          },
+          "detail": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SuppressionList": {
+        "type": "object",
+        "required": [
+          "object",
+          "data",
+          "has_more",
+          "next_before"
+        ],
+        "properties": {
+          "object": {
+            "const": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Suppression"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An opaque cursor: pass as `before` for the next page."
+          }
+        }
+      },
+      "CreateSuppressionRequest": {
+        "type": "object",
+        "required": [
+          "address"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "The address to stop sending to."
+          },
+          "reason": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{1,32}$",
+            "default": "manual",
+            "description": "A short reason name, e.g. `customer_request`."
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Free text kept with it."
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "all",
+              "broadcast"
+            ],
+            "default": "all"
+          }
+        }
+      },
+      "SuppressionCreated": {
+        "type": "object",
+        "required": [
+          "object",
+          "address",
+          "stream",
+          "reason",
+          "created"
+        ],
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "stream": {
+            "type": "string",
+            "enum": [
+              "all",
+              "broadcast"
+            ],
+            "description": "`all`: no mail is sent to the address. `broadcast`: only broadcast mail is suppressed (one-click unsubscribes)."
+          },
+          "reason": {
+            "type": "string",
+            "description": "`hard_bounce`, `complaint`, `unsubscribe`, `manual`, or a name given with `POST /suppressions`."
+          },
+          "detail": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "object": {
+            "const": "suppression"
+          },
+          "created": {
+            "type": "boolean",
+            "description": "`false` when the address was already suppressed for that stream (the existing row is returned, with status 200)."
+          }
+        }
+      },
+      "SuppressionDeleted": {
+        "type": "object",
+        "required": [
+          "object",
+          "address",
+          "deleted",
+          "removed"
+        ],
+        "properties": {
+          "object": {
+            "const": "suppression"
+          },
+          "address": {
+            "type": "string"
+          },
+          "deleted": {
+            "const": true
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Suppression"
+            }
+          }
+        }
+      },
+      "PauseDetail": {
+        "type": "object",
+        "description": "`sending.paused` only: the pause and the rates that tripped it.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "api_key",
+              "domain",
+              "project"
+            ],
+            "description": "What is paused."
+          },
+          "scope_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The API key's, domain's or project's id."
+          },
+          "scope_name": {
+            "type": "string",
+            "description": "The key's or project's name, or the domain."
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "bounce_rate",
+              "complaint_rate"
+            ]
+          },
+          "rate": {
+            "type": "number",
+            "description": "The rate when it tripped, as a fraction (0.07 is 7%), over the last 24 hours."
+          },
+          "threshold": {
+            "type": "number",
+            "description": "The project's limit it went over."
+          },
+          "recipients": {
+            "type": "integer"
+          },
+          "bounces": {
+            "type": "integer"
+          },
+          "complaints": {
+            "type": "integer"
+          }
+        }
+      },
+      "Pause": {
+        "type": "object",
+        "required": [
+          "object",
+          "id",
+          "scope",
+          "scope_id",
+          "reason",
+          "rate",
+          "threshold",
+          "created_at",
+          "active"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "api_key",
+              "domain",
+              "project"
+            ],
+            "description": "What is paused."
+          },
+          "scope_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The API key's, domain's or project's id."
+          },
+          "scope_name": {
+            "type": "string",
+            "description": "The key's or project's name, or the domain."
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "bounce_rate",
+              "complaint_rate"
+            ]
+          },
+          "rate": {
+            "type": "number",
+            "description": "The rate when it tripped, as a fraction (0.07 is 7%), over the last 24 hours."
+          },
+          "threshold": {
+            "type": "number",
+            "description": "The project's limit it went over."
+          },
+          "recipients": {
+            "type": "integer"
+          },
+          "bounces": {
+            "type": "integer"
+          },
+          "complaints": {
+            "type": "integer"
+          },
+          "object": {
+            "const": "pause"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "resumed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "resumed_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The key that resumed it."
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Still in force: sends from its scope are refused with `403 sending_paused`."
+          }
+        }
+      },
+      "PauseList": {
+        "type": "object",
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "object": {
+            "const": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Pause"
+            }
+          }
+        }
+      },
+      "Project": {
+        "type": "object",
+        "required": [
+          "object",
+          "id",
+          "name",
+          "max_per_recipient_per_day",
+          "circuit_breaker"
+        ],
+        "properties": {
+          "object": {
+            "const": "project"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "max_per_recipient_per_day": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "At most this many emails per recipient in any 24 hours, across every key of the project; `null` is no cap."
+          },
+          "circuit_breaker": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "bounce_rate": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "default": 0.05,
+                "description": "Pause when bounces over 24 hours are above this fraction of recipients."
+              },
+              "complaint_rate": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "default": 0.001,
+                "description": "Pause when complaints are above this fraction."
+              },
+              "min_recipients": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Rates count only once a scope has queued this many recipients in 24 hours."
+              }
+            }
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "UpdateProjectRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_per_recipient_per_day": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "`null` turns the cap off."
+          },
+          "circuit_breaker": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "bounce_rate": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "default": 0.05,
+                "description": "Pause when bounces over 24 hours are above this fraction of recipients."
+              },
+              "complaint_rate": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "default": 0.001,
+                "description": "Pause when complaints are above this fraction."
+              },
+              "min_recipients": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Rates count only once a scope has queued this many recipients in 24 hours."
+              }
+            },
+            "additionalProperties": false,
+            "description": "Fields left out keep their value."
           }
         }
       }
@@ -5545,7 +7886,7 @@
         }
       },
       "RateLimited": {
-        "description": "The key's hourly or daily recipient cap is reached.",
+        "description": "The key's hourly or daily recipient cap is reached (`rate_limit_exceeded`), or a recipient already got the project's `max_per_recipient_per_day` emails in the last 24 hours (`recipient_rate_limited`).",
         "headers": {
           "Retry-After": {
             "$ref": "#/components/headers/RetryAfter"
@@ -5564,13 +7905,21 @@
                   "name": "rate_limit_exceeded",
                   "message": "this API key reached its limit of 100 recipients per hour; retry after 600 seconds"
                 }
+              },
+              "recipient_rate_limited": {
+                "summary": "recipient_rate_limited",
+                "value": {
+                  "statusCode": 429,
+                  "name": "recipient_rate_limited",
+                  "message": "jane@example.org was sent 3 emails in the last 24 hours and this project allows at most 3 per recipient per day (max_per_recipient_per_day), across all its API keys. Retry after 5h12m0s (see the Retry-After header), or ask the project's owner to raise it with PATCH /project"
+                }
               }
             }
           }
         }
       },
       "SendRefused": {
-        "description": "The sender's domain is missing or unverified, or the key's policy refuses the sender or a recipient.",
+        "description": "The sender's domain is missing or unverified, the key's policy refuses the sender or a recipient, or a circuit breaker paused the key, the domain or the project.",
         "content": {
           "application/json": {
             "schema": {
@@ -5607,6 +7956,42 @@
                   "statusCode": 403,
                   "name": "recipient_not_allowed",
                   "message": "this API key may not send to bob@other.example; its policy allows *@acme.com"
+                }
+              },
+              "sending_paused": {
+                "summary": "sending_paused",
+                "value": {
+                  "statusCode": 403,
+                  "name": "sending_paused",
+                  "message": "sending is paused for the API key \"newsletter-agent\" (6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d): its bounce rate over the last 24 hours is 7.5% (45 of 600 recipients), above the 5% limit. Nothing is sent from it until a full_access key resumes it with POST /pauses/4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a/resume, after finding out why recipients bounce (GET /emails, GET /suppressions) and remove bad addresses"
+                }
+              }
+            }
+          }
+        }
+      },
+      "SendValidationError": {
+        "description": "The request is malformed (the message names the field), or a broadcast email cannot get its unsubscribe link.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "validation_error": {
+                "summary": "validation_error",
+                "value": {
+                  "statusCode": 422,
+                  "name": "validation_error",
+                  "message": "subject is required"
+                }
+              },
+              "unsubscribe_unavailable": {
+                "summary": "unsubscribe_unavailable",
+                "value": {
+                  "statusCode": 422,
+                  "name": "unsubscribe_unavailable",
+                  "message": "broadcast emails carry a one-click unsubscribe link (RFC 8058) on this server's public address, and OMW_PUBLIC_URL is not set. Ask the operator to set OMW_PUBLIC_URL (e.g. https://mail.example.com); until then only transactional mail can be sent"
                 }
               }
             }

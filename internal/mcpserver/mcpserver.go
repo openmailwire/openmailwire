@@ -35,6 +35,8 @@ type APIClient struct {
 	Base string
 	Key  string
 	HTTP *http.Client
+	// Access, when known, leaves out tools the key cannot use (safety.go).
+	Access *KeyAccess
 }
 
 // APIError is an error answer from the API, passed to the agent verbatim:
@@ -104,9 +106,10 @@ func pretty(v any) string {
 // New returns an MCP server whose tools act through c.
 func New(c *APIClient, version string) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "openmailwire", Title: "OpenMailWire", Version: version},
-		&mcp.ServerOptions{Instructions: instructions + inboxInstructions})
+		&mcp.ServerOptions{Instructions: instructions + inboxInstructions + safetyInstructions})
 	t := &tools{c: c}
 	addInboxTools(s, t)
+	addSafetyTools(s, t) // lane B
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:  "send_email",
@@ -114,7 +117,8 @@ func New(c *APIClient, version string) *mcp.Server {
 		Description: "Queue an email for delivery and return its id. The sender's domain must be verified (see list_domains). " +
 			"Pass idempotency_key and reuse it on retries so the same email is never sent twice. " +
 			"Set scheduled_at to send it later (up to 30 days ahead); cancel_email can stop it until then. " +
-			"Delivery happens in the background: call get_email with the returned id to see the result.",
+			"Delivery happens in the background: call get_email with the returned id to see the result. " +
+			"Your key may hold the email for approval instead; the result then says so. Bulk mail goes with stream broadcast.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(true), OpenWorldHint: ptr(true)},
 	}, t.sendEmail)
 
@@ -183,46 +187,27 @@ type SendInput struct {
 	IdempotencyKey string            `json:"idempotency_key,omitempty" jsonschema:"a unique key for this email; reuse it when retrying so the email is sent at most once"`
 	ExpiresAt      string            `json:"expires_at,omitempty" jsonschema:"RFC 3339 time after which no new delivery attempts are made, useful for one-time codes"`
 	ScheduledAt    string            `json:"scheduled_at,omitempty" jsonschema:"RFC 3339 time to send the email at, in the future and at most 30 days ahead; leave it out to send now"`
+	Stream         string            `json:"stream,omitempty" jsonschema:"transactional (default: mail the recipient expects) or broadcast (newsletters and other bulk mail: one recipient per email, gets a one-click unsubscribe link)"`
 }
 
 type SendOutput struct {
-	ID       string `json:"id"`
-	Replayed bool   `json:"replayed"`
-	Next     string `json:"next"`
+	ID          string   `json:"id"`
+	Replayed    bool     `json:"replayed"`
+	Held        bool     `json:"held"`
+	HoldReasons []string `json:"hold_reasons,omitempty"`
+	Next        string   `json:"next"`
 }
 
 func (t *tools) sendEmail(ctx context.Context, _ *mcp.CallToolRequest, in SendInput) (*mcp.CallToolResult, SendOutput, error) {
-	body := map[string]any{"from": in.From, "to": in.To, "subject": in.Subject}
-	for k, v := range map[string][]string{"cc": in.Cc, "bcc": in.Bcc, "reply_to": in.ReplyTo} {
-		if len(v) > 0 {
-			body[k] = v
-		}
-	}
-	if in.Text != "" {
-		body["text"] = in.Text
-	}
-	if in.HTML != "" {
-		body["html"] = in.HTML
-	}
-	if in.ExpiresAt != "" {
-		body["expires_at"] = in.ExpiresAt
-	}
-	if in.ScheduledAt != "" {
-		body["scheduled_at"] = in.ScheduledAt
-	}
-	if len(in.Tags) > 0 {
-		var tags []map[string]string
-		for k, v := range in.Tags {
-			tags = append(tags, map[string]string{"name": k, "value": v})
-		}
-		body["tags"] = tags
-	}
+	body := sendBody(in.From, in.To, in.Cc, in.Bcc, in.ReplyTo, in.Subject, in.Text, in.HTML, in.Stream, in.ExpiresAt, in.ScheduledAt, in.Tags)
 	header := map[string]string{}
 	if in.IdempotencyKey != "" {
 		header["Idempotency-Key"] = in.IdempotencyKey
 	}
 	var resp struct {
-		ID string `json:"id"`
+		ID          string   `json:"id"`
+		Held        bool     `json:"held"`
+		HoldReasons []string `json:"hold_reasons"`
 	}
 	if err := t.c.do(ctx, http.MethodPost, "/emails", body, header, &resp); err != nil {
 		return nil, SendOutput{}, err
@@ -230,6 +215,11 @@ func (t *tools) sendEmail(ctx context.Context, _ *mcp.CallToolRequest, in SendIn
 	next := "call get_email with this id and wait_seconds to see the delivery result"
 	if in.ScheduledAt != "" {
 		next = "the email is scheduled; call cancel_email with this id to stop it before then, or get_email to check on it"
+	}
+	if resp.Held {
+		next = heldNext(resp.HoldReasons)
+		return text(fmt.Sprintf("Email %s is held for approval, not sent: %s.", resp.ID, next)),
+			SendOutput{ID: resp.ID, Held: true, HoldReasons: resp.HoldReasons, Next: next}, nil
 	}
 	return nil, SendOutput{ID: resp.ID, Next: next}, nil
 }
@@ -363,6 +353,9 @@ func (t *tools) getEmail(ctx context.Context, _ *mcp.CallToolRequest, in GetEmai
 		fmt.Fprintf(&b, "- %s: %s", r.Email, r.Status)
 		if r.Status == "deferred" && r.NextAttemptAt != nil {
 			fmt.Fprintf(&b, ", next attempt at %s", *r.NextAttemptAt)
+		}
+		if r.Status == "held" {
+			b.WriteString(" (waiting for approval; not sent yet)")
 		}
 		if r.LastResponse != "" {
 			fmt.Fprintf(&b, " (server said: %s)", r.LastResponse)
