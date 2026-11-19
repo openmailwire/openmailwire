@@ -15,26 +15,37 @@ Standard library only. Python 3.9+.
 from ._client import (
     DEFAULT_BASE_URL,
     ApiKeys,
+    AuditLog,
+    DeliveryInsights,
     Domains,
     Emails,
     Inboxes,
     Messages,
     OpenMailWire,
+    Pauses,
+    ProjectSettings,
+    Suppressions,
     Webhooks,
     __version__,
 )
-from ._errors import OpenMailWireError, WaitTimeoutError, WebhookVerificationError
+from ._errors import ErrorNames, OpenMailWireError, WaitTimeoutError, WebhookVerificationError
 from ._webhook import verify_webhook
 
 __all__ = [
     "DEFAULT_BASE_URL",
     "ApiKeys",
+    "AuditLog",
+    "DeliveryInsights",
     "Domains",
     "Emails",
+    "ErrorNames",
     "Inboxes",
     "Messages",
     "OpenMailWire",
     "OpenMailWireError",
+    "Pauses",
+    "ProjectSettings",
+    "Suppressions",
     "WaitTimeoutError",
     "Webhooks",
     "WebhookVerificationError",
