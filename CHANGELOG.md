@@ -1,178 +1,55 @@
 # Changelog
 
-## Unreleased
+## v0.6.0: security hardening, deliverability, agent safety
 
-### API correctness and hardening (v0.6, lane A)
+This release fixes every problem found in an independent review of v0.5, each with a regression test, and adds the safety and deliverability features below. Read **Upgrading** before you deploy it.
 
-**Security fixes** (from the v0.5.0 audit; each has a regression test):
-- **Smuggled From in raw messages (R1#3).** A header written `From :` (whitespace before the colon) slipped past `POST /emails/raw` and SMTP submission: Go kept it apart from `From`, so a key limited by `allowed_from` could queue and DKIM-sign mail from any address. Header names with whitespace before the colon are now refused, From/To/Cc/Bcc are counted ignoring case on exact names, and a second `Sender`, `Reply-To` or `Subject` is refused.
-- **Domain squatting (R1#4).** Domain names were unique across all projects, so any project could hold a name forever, and the `409` told it which names existed elsewhere. Names are now unique within a project and among verified domains: any project may add a name, only the one that proves control of the DNS can verify it (`409 domain_verified_elsewhere` for a second), and an unverified claim is removed after 7 days (`claim_expires_at`). `openmailwire domains force-verify` takes an optional project id.
-- **Idempotency keys per API key (R1#6).** Keys were per project and checked before the key's policy, so one key could tell which keys another had used (409 against 422), replay another key's request (getting its email id even for recipients outside its own allowlist), and pre-claim keys to block it. They now belong to the API key.
-- **Batch idempotency namespace (R1#7).** A batch item's key `<key>:<index>` collided with a single send that used that literal key. Batch items now have a namespace of their own. A batch sent before the upgrade and retried after it is not recognised as a replay.
-- **Memory per large request (R1#5).** One 13 MB send allocated about 363 MB, with no bound on how many ran at once. Bodies are read into one buffer of their exact size, attachments and raw messages are decoded straight from the request (no string copies), JSON is checked for unknown fields without a second buffer, and attachments are base64-encoded in place: the same send now allocates about 130 MB. Requests with bodies over 1 MB need one of `OMW_MAX_LARGE_REQUESTS` slots (default 4); one that waits more than 30 seconds gets `503 server_busy` with `Retry-After`.
-- **Per-key request rate limit (R1#5).** Each API key may make `OMW_RATE_LIMIT` requests per second (default 20, bursts of `OMW_RATE_LIMIT_BURST`, default twice the rate); more get `429 rate_limit_exceeded` with `Retry-After`. A remote MCP tool call counts once.
-- **Unstorable text (R1#8).** A NUL in a JSON subject, or a raw Subject that is not UTF-8 (8-bit Latin-1, or an encoded-word that decodes to invalid UTF-8), answered `500` (`451` over SMTP, so clients retried forever). Such text is now refused with `422` naming the field, and any text the database refuses is a `422` on every path, never a `500`. Custom header values may not hold control characters, and API key names neither.
-- **Header lines over 998 bytes (R1#9, R3#10).** A 998-byte subject made a 1,007-byte line, long display names lines of 1,222 bytes and more, a long Persian name 1,834 bytes, a long `content_type` 1,108 bytes. Subjects are folded at spaces or written as encoded-words, one per line; address lists are folded between encoded-words and before the address. Display names are capped at 256 characters, addresses at 254 and attachment `content_type` at 255.
-- **Long reply subjects (R1#10).** A received subject that already started with "Re:" was never shortened, so a reply to a 1,000-byte subject was refused. Reply subjects are now always cut to 998 bytes.
-- **HTTP server limits (R4#5).** The control plane set only a header timeout. It now has `ReadTimeout` (3 min), `WriteTimeout` (4 min), `IdleTimeout` (2 min) and `MaxHeaderBytes` (64 KB). **`OMW_LISTEN` now defaults to `127.0.0.1:8080`**: set `:8080` to accept connections from other machines (the compose file already does).
-- Every answer carries `X-Content-Type-Options: nosniff`, and API answers `Cache-Control: no-store`. `GET /health` shows the version only to a caller with a valid API key or worker token.
+### Security
+- Sending: raw and SMTP-submitted messages must have well-formed header names and exactly one `From`; NUL bytes and invalid UTF-8 are refused with `422`; header lines are folded and never exceed 998 bytes; domain names can be claimed by several projects until one verifies them (unverified claims expire after 7 days).
+- Idempotency keys belong to the API key that used them, and batch items have their own namespace.
+- The control plane limits request bodies and memory per request, rate-limits each API key (`OMW_RATE_LIMIT`), sets HTTP read, write and idle timeouts, and listens on loopback by default.
+- API keys can be limited to IP ranges (`allowed_ips`) and expire (`expires_at`). Every administrative change is written to a hash-chained, append-only audit log (`GET /audit-log`, `/audit-log/verify`).
+- Inbound mail: every received message gets a sender verdict from SPF, DKIM and DMARC (`trust`). Unauthenticated mail is held from agent keys until a full-access key releases it. Sender-written text is clearly fenced in MCP output, and text aimed at agents is flagged (`suspicious_instructions`). Complaint reports only suppress an address when a signed bounce address identifies the delivery, or when a trusted feedback loop has DKIM-signed them (`OMW_FBL_TRUSTED_DOMAINS`). Inbound and submission servers limit connections, refused recipients and failed logins per client address.
+- `sending_access` keys see an inbox only when their policy's `inboxes` lists it, so an SMTP submission password cannot read mail.
+- Webhooks: every event is delivered once per webhook, also under concurrent load; deliveries are fair across projects and endpoints, with a circuit breaker per endpoint and 10 webhooks per project; private and special-purpose addresses (NAT64 and 6to4 included) are refused; errors shown to tenants reveal nothing about internal names.
+- Secrets: `OMW_SECRET_KEYS` holds several keys for online rotation (`openmailwire rotate-secrets`); the control plane refuses to start with keys that don't open the stored data. Webhook secrets rotate with an overlap (`POST /webhooks/{id}/rotate-secret`), and webhooks can be signed with Ed25519 (`v1a`). Inbox snippets are encrypted at rest.
+- Supply chain: builds use the newest Go (1.27) and current Alpine, actions are pinned by commit, workflows have least-privilege permissions, `govulncheck` runs in CI, and releases carry build provenance. The SDKs refuse redirects, so an API key is never sent to another host.
 
-**Features:**
-- **Generated text part:** an email with only `html` gets a `text/plain` part made from it (links keep their address, lists their bullets).
-- **API key `allowed_ips` and `expires_at`:** a key can be limited to networks (`403 ip_not_allowed`) and in time (`401 api_key_expired`). Set them on `POST /api-keys`, change or remove them (`null`) with `PATCH`, or use `openmailwire apikey create … --allow-ip CIDR --expires-in 720h`. Behind a reverse proxy, `OMW_TRUSTED_PROXIES` names the proxies whose `X-Forwarded-For` is believed.
-- **Audit log:** `GET /audit-log` (full access) lists who created, changed or removed API keys, domains, webhooks and inboxes, with the acting key. It is append-only (the database refuses `UPDATE` and `DELETE`) and hash-chained per project; `GET /audit-log/verify` recomputes the chain and names the first entry that does not check out. Other parts of the server record their own actions with `store.AppendAudit` / `store.AppendAuditTx`.
-- **Domain records:**
-  - DMARC (at least `p=none`) is now required. A subdomain may rely on its parent's record; two records, or one without a valid policy, fail.
-  - The return-path MX is always shown. It points at `OMW_BOUNCE_MX`, or else `OMW_INBOUND_MX`, and is required when either is set.
-  - Each record's `detail` explains the Gmail, Yahoo and Microsoft sender rules behind it until it checks out.
-  - Existing domains keep their status until they are verified again; a re-check now needs the DMARC record.
+### Agent safety and compliance
+- **Approval holds:** key policy `require_approval` (`always`, `first_contact`, `has_attachments`, `has_links`, `recipients_over`) holds a send until a person approves it (`POST /emails/{id}/approve`, `/reject`; a key never approves its own email).
+- **Circuit breakers:** sending pauses automatically for a key, domain or project whose bounce or complaint rate is too high (`GET /pauses`, `POST /pauses/{id}/resume`).
+- **Suppressions API:** `GET`, `POST`, `DELETE /suppressions`, and CSV export.
+- **Streams and one-click unsubscribe:** `stream: "broadcast"` adds a signed RFC 8058 one-click unsubscribe (`OMW_PUBLIC_URL`). Every message carries a `Feedback-ID` for Gmail's feedback loop.
+- **Per-recipient cap** across all agents (`PATCH /project`), and **`POST /emails/check`**, which reports what a send would do without sending.
+- New MCP tools: `check_email`, `list_held`, `approve_email`, `reject_email`, `list_suppressions`, `add_suppression`, `list_pauses`.
 
-**Upgrade notes:** migration `0006_api_hardening.sql` drops the global unique index on domain names and gives every currently unverified domain a claim that expires 7 days after the upgrade.
+### Deliverability
+- Throttling learns limits per mailbox provider and sending IP, from connection-level signals only, so one mailbox or one tenant cannot slow a provider down for everyone. Rules: `internal/policy/providers.json` (`OMW_PROVIDER_RULES`).
+- New IPs warm up per provider on a daily schedule, with overflow to a relay worker (`OMW_WARMUP`, `openmailwire workers warm`).
+- Workers check at start that their EHLO name, address and reverse DNS agree and that port 25 is open (`OMW_SKIP_SELF_CHECK` for development).
+- Retries wait 5–15 minutes first and recognise greylisting. DATA uses RFC 5321 timeouts, jobs end before their lease does, 8-bit and SMTPUTF8 mail goes only to servers that announce them, and opportunistic TLS accepts TLS 1.0+.
+- DKIM oversigns the key headers, can add an Ed25519 signature, and rotates with two selectors (`POST /domains/{id}/dkim/rotate`). Scheduled mail is dated and signed when it is sent.
+- Connections to an MX are reused; cancel and expiry can no longer race a lease; the lease cost no longer grows with the queue.
+- Domains require a DMARC record, show the return-path MX, and receive DMARC aggregate and TLS-RPT reports (`GET /domains/{id}/reports`).
+- `GET /insights`: acceptance, deferral and bounce rates and time to acceptance per mailbox provider and sending IP.
 
-### Inbound trust (v0.6)
-
-**Sender verdict on received mail.**
-- Every message to an inbox is checked: SPF for the envelope sender and the HELO name (with the client address the inbound node saw), every DKIM signature, and DMARC alignment with the `From` domain (relaxed or strict, organizational domains from the public-suffix list).
-- `trust` is `authenticated`, `unauthenticated` or `failed`; the details are stored as `authentication_results` (with an RFC 8601 `header`). They are returned by `GET /messages/{id}` and the message list, sent in `email.received` (`data.trust`, `data.authentication`, `data.held`) and shown by the MCP tools.
-- Inbox setting `hold_unauthenticated` (default on; `POST /inboxes`, new `PATCH /inboxes/{id}`): messages that are not `authenticated` are hidden from `sending_access` keys until a full-access key calls the new `POST /messages/{id}/release`. Messages received before the upgrade are not held; they show `trust: "unauthenticated"` with empty `authentication_results`, since they were never checked.
-
-**Agents and received text.**
-- MCP inbox tools print every sender-written field (names, addresses, subject, snippet, body, attachment names) quoted, between two marker lines whose tag is random for each call; text shaped like a marker is removed. `read_message` is marked open-world and shows the verdict and warnings. `list_messages` and `wait_for_reply` snippets are framed too.
-- Display names, addresses and subjects lose line breaks (CR, LF, U+2028, U+2029) and bidirectional controls. Attachment names lose Unicode format characters (such as U+202E) and leading dots.
-- HTML is turned into text with a tokenizer and without its hidden parts (`display:none`, `visibility:hidden`, zero font size or opacity, collapsed or off-page boxes, the `hidden` attribute).
-- `suspicious_instructions` and `suspicious_rules` flag text aimed at agents, from a short documented rule list.
-- `POST /messages/{id}/reply` answers only the first `Reply-To` address (or `From`); pass `to` for more. The answer includes `to` and `warnings`. `reply_to_mismatch` flags a `Reply-To` on another domain than `From`.
-
-**Permissions.** `sending_access` keys (SMTP submission passwords too) no longer read every inbox: only those the new policy field `inboxes` lists, e.g. `["support@acme.com", "*@agents.acme.com"]` (`--inbox` on `openmailwire apikey create`). This applies to listing inboxes, messages, attachments, replies and the MCP tools. **Upgrade note:** give existing agent keys an `inboxes` policy, or they lose inbox access.
-
-**Complaints (ARF).**
-- A report suppresses an address only when a valid VERP address identifies the delivery (the address it was sent to, `Original-Mail-From`, or the quoted original's `Return-Path`). Forged reports to `OMW_FBL_ADDRESS` can no longer suppress other recipients.
-- A report that names the email only by Message-ID counts only when a feedback loop in the new `OMW_FBL_TRUSTED_DOMAINS` signed it (DKIM; a documented default list). It is looked up only among emails on the return path or sending domain the report names (Message-IDs are chosen by clients on `/emails/raw`), records at most one complaint per email, suppresses nobody, and its `email.complained` has `data.to: []`.
-
-**Webhooks.** `email.received`'s `data.to` is the inbox that received the message; the message's `To` header moves to `data.header_to`.
-
-**DMARC and TLS reports.**
-- Each domain shows `report_addresses`: `dmarc@bounce.<domain>` for the DMARC `rua=` and `tls-rpt@bounce.<domain>` for a TLS-RPT record.
-- Reports arriving there (RFC 7489 and DMARCbis XML, RFC 8460 JSON; gzip, zip or plain) are parsed with size, zip-entry, nesting and row limits, stored for 180 days, and summarized by the new `GET /domains/{id}/reports` (full access): pass rates by source IP and by reporter, unknown senders using the domain, and TLS failures.
-
-**Inbound limits.**
-- Inbound nodes close a connection after 10 refused recipients, rate-limit recipient checks per client address, cache answers (1 minute; refusals 15 seconds), cap connections per address (`OMW_INBOUND_MAX_CONNS_PER_IP`, 20) and allow a minute per command before `MAIL`.
-- A recipient the control plane refuses or defers at `DATA` now reaches the sender (`550` or `451`).
-- The control plane processes at most `OMW_INBOUND_CONCURRENCY` (8) inbound messages at once, and an inbox accepts at most `OMW_INBOX_MAX_PER_HOUR` (1000) messages an hour; more are deferred.
-- `postmaster@` and `abuse@` are accepted on every domain the inbound nodes serve, and go to `OMW_POSTMASTER_INBOX` or are logged.
-- SMTP submission caps connections in total (`OMW_SUBMISSION_MAX_CONNS`, 200) and per address (`OMW_SUBMISSION_MAX_CONNS_PER_IP`, 20) over both ports, ends connections after 30 minutes, allows a minute per command before login, and refuses logins from an address after 10 failures in 15 minutes.
-
-**Storage.**
-- Deduplication of inbox messages uses the Message-ID and a hash of the content: a copy with a stolen Message-ID no longer hides the genuine message; differing copies are both kept and flagged `message_id_conflict`.
-- Message snippets are sealed like bodies. Plaintext snippets from earlier versions are cleared by the migration and derived again from the sealed body when listed.
-- The MIME parser stops splitting a multipart body at its part limit and compares delimiter lines as bytes (an 8 MB body of delimiters allocated 271 MB).
-
-Migration `0009_inbound_trust.sql`. `golang.org/x/net` becomes a direct dependency (`html`, `publicsuffix`).
+### Upgrading
+1. Back up the database and `OMW_SECRET_KEY`. Upgrade the control plane before the workers and inbound nodes.
+2. Migrations `0006` to `0010` run on start. `0010` builds an index on `events`; on a large install, start it in a quiet hour.
+3. `OMW_LISTEN` now defaults to `127.0.0.1:8080`. The container image sets `:8080`; set it yourself when the control plane must accept connections from other machines.
+4. New worker tokens have a role (`delivery`, `inbound` or `relay`); create inbound tokens with `openmailwire workers add <name> --role inbound`. Existing tokens keep working.
+5. Warm-up is on by default: run `openmailwire workers warm <name>` for IPs that already send at volume, or set `OMW_WARMUP=false`.
+6. Direct workers refuse to start when their DNS is wrong; fix the records the check names.
+7. `sending_access` keys that read inboxes need an `inboxes` policy (CLI: `--inbox`). Unauthenticated inbound mail is held from agent keys: release it, or set `hold_unauthenticated: false` on the inbox.
+8. `email.received` webhooks: `data.to` is now the inbox address; the message's To header is `data.header_to`.
+9. Idempotency keys are now per API key, and a batch stored before the upgrade isn't recognised as a replay after it.
+10. Domains need a DMARC record to stay verified on their next check.
+11. Webhook endpoints must answer within 10 seconds, and a project may have 10 webhooks (`OMW_WEBHOOKS_PER_PROJECT`).
 
 ## v0.5.1: parser hardening, current Go
 
 - The mail parser reads only the header of an embedded `message/*` part instead of parsing it again, and unfolds header lines in linear time with limits on header size and field count. Hostile inbound mail can no longer use excessive stack or CPU.
 - Release binaries, CI and the container image are built with the newest stable Go instead of `go.mod`'s minimum version, so they include current standard-library security fixes. The container image now uses current Alpine.
-
-### Agent safety and compliance
-
-Server-enforced rules for agents, on every path that sends (`POST /emails`, batches, `POST /emails/raw` and SMTP submission, inbox replies, MCP).
-
-**Approval holds.**
-- Key policy `require_approval` with the rules `always`, `first_contact`, `has_attachments`, `has_links` and `recipients_over: N`. A matching email is stored with delivery status `held` and answers `{"id", "held": true, "hold_reasons"}`.
-- `GET /emails/held`, `POST /emails/{id}/approve` and `POST /emails/{id}/reject` (with an optional `note`), for `full_access` keys and keys whose policy has `can_approve`. A key never approves its own email (`403 cannot_approve_own_email`); deciding twice answers `409 not_held`.
-- New delivery statuses `held` and `rejected`; webhooks `email.held`, `email.approved` and `email.rejected`.
-- Held mail expires at its `expires_at` (`email.failed`), and its body is not purged before.
-
-**Streams and one-click unsubscribe.**
-- `stream: "transactional" | "broadcast"` on `POST /emails` and batches; `stream` or an `X-OMW-Stream` header on `POST /emails/raw`.
-- Broadcast mail goes to one recipient and gets `List-Unsubscribe` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058), DKIM-signed, pointing at `OMW_PUBLIC_URL/u/{token}`. The token is HMAC-signed over the project and the address.
-- `POST /u/{token}` (no key) suppresses the address for broadcast mail at once; `GET` only shows a confirm page. Both are rate-limited per client IP. Without `OMW_PUBLIC_URL`, broadcast mail is refused with `422 unsubscribe_unavailable`.
-- Every message gets `Feedback-ID: <stream>:<api key id>:<project id>:omw`.
-- Suppressions now have a stream: `all` (bounces, complaints) or `broadcast` (unsubscribes).
-
-**Suppressions API.** `GET /suppressions` (filters and pagination), `POST /suppressions`, `DELETE /suppressions/{address}` and `GET /suppressions/export` (CSV). Sending keys may read.
-
-**Project settings.** `GET /project` and `PATCH /project` (full access):
-- `max_per_recipient_per_day`: at most N emails per recipient in any 24 hours, across all keys, checked under a project lock; `429 recipient_rate_limited` with `Retry-After`.
-- `circuit_breaker`: `enabled`, `bounce_rate` (default 0.05), `complaint_rate` (default 0.001), `min_recipients` (default 50).
-
-**Circuit breakers.** Rolling 24-hour bounce and complaint rates per API key, per sending domain and per project, counted from every bounce and complaint however it arrives. A tripped breaker refuses sends with `403 sending_paused` (naming the rate, the scope and how to resume) and fires `sending.paused`. `GET /pauses` and `POST /pauses/{id}/resume` (full access). The send path only looks up active pauses.
-
-**`POST /emails/check`.** The body of `POST /emails`; sends nothing. Answers `would` (`send`, `hold` or `refuse`), every refusal that would apply, the hold reasons, the size and warnings (`no_text_part`, `html_too_large`, `link_domain_mismatch`, `missing_unsubscribe`, `domain_not_verified`, `large_message`).
-
-**MCP.** New tools `check_email`, `list_held`, `approve_email`, `reject_email` (offered only to keys that may approve; destructive), `list_suppressions`, `add_suppression` and `list_pauses`. `send_email` takes `stream`, and it and `reply_to_message` say when a send is held.
-
-**Configuration.** `OMW_PUBLIC_URL`. **Migration** `0007_agent_safety.sql`, which also backfills the project contacts from past deliveries. `golang.org/x/net` (already in the module graph) becomes a direct dependency, for the public suffix list.
-
-### Platform, webhooks and supply chain (v0.6, lane E)
-
-**Fixed**
-- **Webhook events were lost under concurrent sends (audit R1#1, R4#1).** Fan-out followed a cursor over event ids, which are taken at insert, not at commit, so an event committed after a higher id had been fanned out never got its webhook (up to 1,973 of 2,400 `email.sent` in the audit). Each event now carries a `fanned_out` flag. Fan-out claims events with `FOR UPDATE SKIP LOCKED` through a partial index, and sees an event only once its transaction has committed. Events not yet fanned out at upgrade are still delivered; older ones are marked done.
-- **One project's slow endpoints delayed every other project's webhooks (R4#4; 75 s in the audit).** Claims now pick webhooks, oldest due first, and give each a bounded share: at most 4 requests per endpoint and 8 per project in flight. A slot is refilled as soon as its request ends instead of after a whole batch. An endpoint must answer within 10 s (time to first byte; 15 s in all). A project has at most 10 webhooks (`OMW_WEBHOOKS_PER_PROJECT`; one more answers `409 webhook_limit_reached`).
-- **Circuit breaker per endpoint:** after 5 failures in a row, no requests for 30 s, doubling up to 10 minutes, then one probe at a time. Paused deliveries keep their retries. `GET /webhooks/{id}` shows `consecutive_failures` and `paused_until`.
-- **Webhook connections never closed (R4#6).** Idle connections now close after 30 s, with caps on idle connections overall and per host and on connections per host.
-- **The webhook address guard missed NAT64 and 6to4 (R4#7).** Only global unicast addresses are dialed now, minus every range in the IANA special-purpose registries. NAT64 addresses are judged by the IPv4 address they carry; local-use NAT64, 6to4 and Teredo are refused. An IP literal that is not public is refused when the webhook is created.
-- **`last_error` revealed internal addresses (R4#8)** such as `dial tcp [::1]:5432`. Projects now see a generic cause (`timed out: …`, `could not connect: …`); a name that doesn't resolve and one that resolves to a refused address read the same. Details go to the log.
-- **Releases were built with Go 1.25.0 (R4#2, R4#3)**, which govulncheck found reaching 45 standard-library vulnerabilities. CI and releases now build with the newest Go 1.27 patch release (`check-latest`), `go.mod` names `toolchain go1.27.4` (the `go` directive stays 1.25.0), and `govulncheck` runs on every push and weekly. The image builds on `golang:1.27-alpine` and runs on `alpine:3.24`.
-- **Workflow hardening (R4#11):** every action is pinned by commit SHA; every workflow defaults to `contents: read` and each release job asks only for what it needs; release binaries are built outside the checkout (`vcs.modified=false`, checked); release archives, `checksums.txt` and the image get signed build provenance (`actions/attest-build-provenance`, verifiable with `gh attestation verify`), and the attestation bundle is published with each release.
-- **The Python SDK sent the API key on redirects (R4#10).** It now refuses redirects (`redirect_refused`) and marks the key unredirectable even with a caller's own opener. The Node and Go SDKs now refuse redirects too (Go forwarded the key on same-host redirects, including to `http://`); PHP never followed them and now names the error the same way.
-- **The Go SDK accepted a timestamp of 9223372036854775807**, which overflowed the age check. Timestamps are limited to 15 digits, as in the other SDKs.
-- **Start-up key check:** the control plane refuses to start when `OMW_SECRET_KEY` doesn't open the data in the database, with a message that says which key is missing.
-
-**Added**
-- **Secret rotation.** `OMW_SECRET_KEYS=new,old` holds several keys: the first seals new values, all of them open old ones. Sealed values now record the id of their key. `openmailwire rotate-secrets` re-encrypts every stored secret online, in small transactions, and reports when the old keys can be removed. `OMW_SECRET_KEY` keeps working. Bounce (VERP) addresses keep verifying across rotations.
-- **Webhook secret rotation:** `POST /webhooks/{id}/rotate-secret` `{"overlap_seconds"}` (default one day, at most 7 days). During the overlap every request is signed with both secrets.
-- **Ed25519 webhook signatures** (Standard Webhooks `v1a`): `"asymmetric_signing": true` on `POST /webhooks`; the public key (`whpk_…`) is in `GET /webhooks/{id}`. The four SDK verifiers accept a `whpk_…` key (Python in pure Python, PHP through sodium).
-- **`GET /insights`** (full access): acceptance, deferral and bounce rates and p50/p95 time to acceptance, per mailbox provider (from the MX host) and per sending IP, over 24 hours, 7 days and 30 days. Bounded to the newest 100,000 emails of 30 days, through indexes.
-
-**Upgrade notes**
-- Migration `0010_platform.sql` adds `events.fanned_out` without rewriting the table, and builds small indexes on `events`, `webhooks` and `webhook_deliveries`. `webhook_cursor` is no longer used.
-- The first start of v0.6 registers the key it is given, after checking that it opens the existing data. Keep using the same `OMW_SECRET_KEY`.
-- Projects with more than 10 webhooks keep them, but cannot add more unless `OMW_WEBHOOKS_PER_PROJECT` is raised.
-- Webhook endpoints that take longer than 10 s to start answering now time out.
-
-### Delivery and deliverability
-
-**Throttling per mailbox provider and sending IP.**
-- Recipient domains are grouped by the provider their MX hosts belong to (Google, Microsoft, Yahoo, Apple, Zoho, Proton, Fastmail, Yandex, Mail.ru, GMX, Comcast, Mimecast, Proofpoint, Barracuda), learned from each attempt. A domain of no known provider is its own group. The rules ship in `internal/policy/providers.json`; `OMW_PROVIDER_RULES` points at your own.
-- Limits and backoff apply per group and sending IP: a throttled IP pauses for that provider while other IPs go on. `OMW_DOMAIN_CONCURRENCY` still caps each recipient domain across all workers.
-- Only connection- or IP-level replies count as "slow down": a 421, or `4.7.0`, `4.7.28`, `4.7.650` at the greeting, EHLO or MAIL FROM. Mailbox replies (`4.2.x`), `4.5.3` and authentication codes (`4.7.26`–`4.7.32` but `4.7.28`) never do, and the reply text is no longer matched. A limit halves only after two different recipients got such a reply within 15 minutes.
-- Authentication problems are recorded per project and sending domain: an `auth_problem` event, and `auth_issues` in `GET /domains/{id}/dkim`.
-- Events `throttled` and `throttle_relaxed` carry `scope` and `source_ip` instead of `rcpt_domain`.
-
-**Automatic IP warm-up** (`OMW_WARMUP`, default on): a new sending IP gets a daily cap per provider (50, 100, 200… for 12 days by default). Overflow waits for the next day or goes to a live relay worker. `openmailwire workers list` shows the remaining capacity; `openmailwire workers warm <name> [--restart]` marks an IP warm or starts over. IPs that sent before this version count as warm.
-
-**Retries.** The first retry comes 5 to 15 minutes after the first attempt (was 1 minute), then 30 minutes, 1, 2 and 4 hours. Greylisting is recognised: retried after 5 to 15 minutes, and not counted toward `OMW_RELAY_AFTER_ATTEMPTS`.
-
-**DKIM.**
-- `From`, `To`, `Subject`, `Date`, `Message-ID`, `Reply-To` and `Cc` are oversigned.
-- Optional Ed25519 signature next to RSA (RFC 8463): `POST /domains/{id}/dkim/ed25519`.
-- Key rotation with two selectors and an overlap: `POST /domains/{id}/dkim/rotate` creates a key, and switches to it once its record is published; the previous record stays listed for 8 days. `GET /domains/{id}/dkim` lists the keys. The domain view shows `DKIM_NEXT`, `DKIM_PREVIOUS` and `DKIM_ED25519` records.
-
-**Workers.**
-- Connection reuse: one connection per MX host carries several messages, with `RSET` in between (at most 50 per connection, idle for at most 20 seconds).
-- A self-check at start: `OMW_EHLO` is an FQDN, its A record is `OMW_PUBLIC_IP`, the IP's PTR names it, and port 25 is open (`OMW_SELF_CHECK_SMTP`). The worker refuses to start on failure unless `OMW_SKIP_SELF_CHECK=true`; the result is sent with the heartbeat and shown by `workers list`.
-- Worker tokens have a role: `openmailwire workers add <name> --role delivery|inbound|relay` (default `delivery`). Inbound endpoints refuse delivery and relay tokens and the reverse (`403 wrong_worker_role`); a delivery token cannot lease as a relay. Tokens created before keep working everywhere.
-- Opportunistic TLS accepts TLS 1.0 and 1.1 (any encryption beats plaintext); MTA-STS and DANE still require TLS 1.2.
-- Messages with 8-bit data go only to servers that announce `8BITMIME` (sent with `BODY=8BITMIME`), and those with non-ASCII addresses or header fields only to servers that announce `SMTPUTF8`. Otherwise the attempt is deferred with `4.6.3`, since converting would break the DKIM signature.
-- With `OMW_DNSSEC_RESOLVER`, MX and address lookups go through the validating resolver, and DANE applies only behind a secure MX answer. Authenticated TLSA records that are all unusable still require TLS.
-- MTA-STS policies are fetched again before they expire.
-
-**Fixed** (v0.5.0 audit):
-- A cancel or an expiry that committed while a lease was choosing deliveries was overwritten, and the canceled mail was sent. The lease now checks the status again on the locked rows.
-- One project's per-mailbox deferral (Gmail's `450 4.2.1 … receiving mail at a rate`) or authentication code halved gmail.com's limit and paused it for every project.
-- Scheduled mail kept the `Date` and DKIM signature of its request, up to 30 days old. It is dated and signed again when leased; nothing else in the message changes.
-- A long reply with multi-byte characters was cut inside a character; the report then failed with a 500 forever and the mail was sent again. Text is cut on character boundaries and made valid UTF-8, without NUL bytes, on the worker and the control plane.
-- The body of a large message and its final reply shared one 5-minute deadline. Each block now has 3 minutes, and the final reply 10 (RFC 5321 section 4.5.3.2).
-- A job could run past its lease, which the control plane then gave to another attempt. Jobs end before the lease, with a margin for the report, and are not started when the lease is nearly over.
-- A message the control plane could not decrypt stayed leased and could end `unknown`. It is released at once, with an `unseal_failed` event, and retried 5 minutes later.
-- A report and the sweep could deadlock (opposite lock order). Both now lock the delivery, then the attempt.
-- A 421 reply to EHLO lost its code, because the HELO fallback ran on the closed connection. HELO is used only after `500`/`502`, and every reply records its SMTP step (`stage` in reports and events).
-- A lease read the whole due backlog of domains at their limit (about 0.5 µs a row, inside the global lock). It now reads a fixed head of the queue, then domain by domain (new index `deliveries_domain_due`).
-- The worker API refused unknown fields, so a newer worker's reports were lost. They are ignored now; workers keep reports refused with 401, 403, or for unknown fields by an older control plane, and alert. A report for another worker's attempt answers `409 attempt_of_another_worker` (was 403).
-
-**Upgrading.** Upgrade the control plane before the workers. Migration `0008_deliverability.sql` resets `receiver_state` (now keyed by scope and sending IP). See [docs/production.md](docs/production.md#10-upgrading-to-v06).
 
 ## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
@@ -195,48 +72,6 @@ Server-enforced rules for agents, on every path that sends (`POST /emails`, batc
 - Logs never contain message content or full addresses.
 
 **New dependencies:** `github.com/emersion/go-smtp` v0.26.0 and `github.com/emersion/go-sasl`.
-
-## v0.4.0: API keys for agents, attachments, scheduling, batch
-
-### API keys for agents
-
-Give each agent its own key, with limits the server enforces on every path that sends, MCP included.
-
-- **Permission:** `full_access` (the default) or `sending_access`. A sending key can send, read and cancel its own emails, and read domains. Anything else answers `403 insufficient_permission`.
-- **Policy** (every field optional):
-  - `max_per_hour` and `max_per_day`: recipients queued in a rolling window. Suppressed and canceled recipients do not count.
-  - `allowed_from` and `allowed_recipients`: address patterns where `*` matches within the local part or the domain part.
-- **Refusals:** `403 sender_not_allowed`, `403 recipient_not_allowed` (naming the first such recipient), and `429 rate_limit_exceeded` with a `Retry-After` header that says when enough of the window frees up. Caps are checked again under a per-key lock when the email is stored, so parallel requests cannot overshoot them.
-- **Endpoints** (full access only): `GET /api-keys`, `POST /api-keys` (the token is shown once), `GET /api-keys/{id}`, `PATCH /api-keys/{id}` (name and policy) and `DELETE /api-keys/{id}` (revokes).
-- `last_used_at` is recorded, at most once a minute.
-- **CLI:** `openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N] [--allow-to PATTERN]... [--allow-from PATTERN]...` and `openmailwire apikey list <project-id>`.
-
-### Email API
-
-- **Attachments** on `POST /emails`: `[{filename, content (base64), content_type?, content_id?}]`.
-  - Regular files make the message `multipart/mixed`.
-  - A `content_id` makes a file inline, in a `multipart/related` part with the HTML.
-  - At most 20 files and 10 MB decoded. DKIM covers them.
-- **Request bodies** may be up to 20 MB for `/emails`, `/emails/batch` and `/emails/raw` (4 MB elsewhere).
-- **Scheduled sends:** `scheduled_at` (RFC 3339, at most 30 days ahead) adds a `scheduled` event, and `expires_at` counts from it.
-- **`POST /emails/{id}/cancel`** cancels every recipient still queued and never attempted. The new delivery status `canceled` comes with a `canceled` event and the `email.canceled` webhook. Answers `409 cannot_cancel` when nothing is left to cancel.
-- **`POST /emails/batch`:** 1 to 100 emails, all validated and policy-checked first, then stored in one transaction; all or nothing. `Idempotency-Key` applies per email as `<key>:<index>`.
-- **`GET /emails`:** newest first, with `limit`, `before` (cursor) and `api_key_id` filters.
-- Every email records the key that sent it (`api_key_id`, also in `GET /emails/{id}`). A sending key sees only its own emails.
-
-### MCP
-
-- `send_email` takes `scheduled_at`.
-- New tools: `list_emails` and `cancel_email` (marked destructive).
-
-### Migration
-
-`0003_keys_and_email_api.sql` runs on start. It adds:
-- `permission`, `policy` and `last_used_at` to `api_keys`;
-- `api_key_id`, `scheduled_at` and `quota_rcpts` to `emails`, with an index on `(project_id, api_key_id, created_at)`;
-- `canceled` to the delivery statuses.
-
-Existing keys keep full access with no limits.
 
 **Docs for people and models**
 - `GET /openapi.json`: an OpenAPI 3.1 description of every public endpoint:
@@ -344,6 +179,48 @@ The control plane serves a dashboard at `/dashboard/` (`/dashboard` redirects th
 - No build step, no framework, no CDN: plain HTML, CSS and JavaScript modules embedded with `go:embed` (`internal/dashboard`).
 
 Usable at phone width and in dark mode.
+
+## v0.4.0: API keys for agents, attachments, scheduling, batch
+
+### API keys for agents
+
+Give each agent its own key, with limits the server enforces on every path that sends, MCP included.
+
+- **Permission:** `full_access` (the default) or `sending_access`. A sending key can send, read and cancel its own emails, and read domains. Anything else answers `403 insufficient_permission`.
+- **Policy** (every field optional):
+  - `max_per_hour` and `max_per_day`: recipients queued in a rolling window. Suppressed and canceled recipients do not count.
+  - `allowed_from` and `allowed_recipients`: address patterns where `*` matches within the local part or the domain part.
+- **Refusals:** `403 sender_not_allowed`, `403 recipient_not_allowed` (naming the first such recipient), and `429 rate_limit_exceeded` with a `Retry-After` header that says when enough of the window frees up. Caps are checked again under a per-key lock when the email is stored, so parallel requests cannot overshoot them.
+- **Endpoints** (full access only): `GET /api-keys`, `POST /api-keys` (the token is shown once), `GET /api-keys/{id}`, `PATCH /api-keys/{id}` (name and policy) and `DELETE /api-keys/{id}` (revokes).
+- `last_used_at` is recorded, at most once a minute.
+- **CLI:** `openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N] [--allow-to PATTERN]... [--allow-from PATTERN]...` and `openmailwire apikey list <project-id>`.
+
+### Email API
+
+- **Attachments** on `POST /emails`: `[{filename, content (base64), content_type?, content_id?}]`.
+  - Regular files make the message `multipart/mixed`.
+  - A `content_id` makes a file inline, in a `multipart/related` part with the HTML.
+  - At most 20 files and 10 MB decoded. DKIM covers them.
+- **Request bodies** may be up to 20 MB for `/emails`, `/emails/batch` and `/emails/raw` (4 MB elsewhere).
+- **Scheduled sends:** `scheduled_at` (RFC 3339, at most 30 days ahead) adds a `scheduled` event, and `expires_at` counts from it.
+- **`POST /emails/{id}/cancel`** cancels every recipient still queued and never attempted. The new delivery status `canceled` comes with a `canceled` event and the `email.canceled` webhook. Answers `409 cannot_cancel` when nothing is left to cancel.
+- **`POST /emails/batch`:** 1 to 100 emails, all validated and policy-checked first, then stored in one transaction; all or nothing. `Idempotency-Key` applies per email as `<key>:<index>`.
+- **`GET /emails`:** newest first, with `limit`, `before` (cursor) and `api_key_id` filters.
+- Every email records the key that sent it (`api_key_id`, also in `GET /emails/{id}`). A sending key sees only its own emails.
+
+### MCP
+
+- `send_email` takes `scheduled_at`.
+- New tools: `list_emails` and `cancel_email` (marked destructive).
+
+### Migration
+
+`0003_keys_and_email_api.sql` runs on start. It adds:
+- `permission`, `policy` and `last_used_at` to `api_keys`;
+- `api_key_id`, `scheduled_at` and `quota_rcpts` to `emails`, with an index on `(project_id, api_key_id, created_at)`;
+- `canceled` to the delivery statuses.
+
+Existing keys keep full access with no limits.
 
 ## v0.3.0: MCP server for AI agents
 
