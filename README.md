@@ -91,7 +91,9 @@ openmailwire apikey create <project-id> support-agent --sending-only \
   --max-per-hour 50 --max-per-day 500 --allow-from 'support@acme.com' --allow-to '*@acme.com'
 ```
 
-A sending-only key can send, read and cancel its own emails, and read domains; it cannot add domains, webhooks or keys. The limits are enforced by the server, on every path that sends, MCP included. See [API keys](#api-keys).
+A sending-only key can send, read and cancel its own emails, and read domains; it cannot add domains, webhooks or keys. It reads only the inboxes you list for it (`--inbox support@acme.com`). The limits are enforced by the server, on every path that sends, MCP included. See [API keys](#api-keys).
+
+**Received mail is untrusted input.** The inbox tools show everything a sender wrote (names, addresses, subject, body, attachment names) quoted, between two marker lines with a random tag per call, and remove text hidden with CSS. Each message carries the server's sender verdict (`authenticated`, `unauthenticated` or `failed`, from SPF, DKIM and DMARC) and a warning when its text looks written to steer an agent. Mail whose sender is not authenticated is held from agent keys until you release it.
 
 ### Docs for models and tools
 
@@ -175,7 +177,10 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Inbound mail (`openmailwire inbound`), see [Inbound mail](#inbound-mail):
   - inboxes on your domains, with messages threaded to the emails they answer, attachments, and replies that go through the normal send path;
   - bounce processing: delivery status notifications (RFC 3464) to the signed VERP address mark a delivery `bounced`, even after `delivered`;
-  - complaint processing: feedback-loop reports (ARF, RFC 5965) become `email.complained` and suppress the address.
+  - complaint processing: feedback-loop reports (ARF, RFC 5965) become `email.complained` and suppress the address when a signed VERP address identifies it; forged reports change nothing;
+  - a sender verdict on every received message (SPF, DKIM, DMARC: `authenticated`, `unauthenticated` or `failed`), with unauthenticated mail held from agent keys until released, and flags for text aimed at agents;
+  - DMARC aggregate and TLS-RPT reports received for each domain and summarized: pass rates by source and reporter, unknown senders, TLS failures;
+  - abuse limits on the inbound nodes: refused-recipient and per-address limits, a recipient cache, connection caps, and an hourly cap per inbox.
 - Signed webhooks, verifiable by handlers written for Resend, and optionally with Ed25519 (Standard Webhooks `v1a`) against a published public key. Secrets rotate with an overlap in which both signatures are sent. Webhooks are retried for about a day, fairly across projects and endpoints, with a circuit breaker per endpoint, and blocked from internal networks.
 - `GET /insights`: acceptance, deferral and bounce rates and time to acceptance, per mailbox provider and per sending IP, over 24 hours, 7 days and 30 days.
 - Message bodies, DKIM keys and webhook secrets are encrypted at rest (AES-256-GCM). Keys rotate online (`OMW_SECRET_KEYS`, `openmailwire rotate-secrets`), and the control plane refuses to start with a key that doesn't match the data. Bodies are purged after the retention window.
@@ -421,7 +426,7 @@ Each key has a **permission**:
 | Permission | Can call |
 |---|---|
 | `full_access` (default) | everything |
-| `sending_access` | `POST /emails`, `POST /emails/batch`, `POST /emails/raw`; `GET /emails` and `GET /emails/{id}` for its own emails; `POST /emails/{id}/cancel` for its own emails; `GET /domains` and `GET /domains/{id}`; `POST /emails/check`; `GET /emails/held` (its own held emails); reading `GET /suppressions`, `/suppressions/export`, `/pauses` and `/project`; approving and rejecting held emails with `can_approve`; and `/mcp`, whose tools have the same limits |
+| `sending_access` | `POST /emails`, `POST /emails/batch`, `POST /emails/raw`; `GET /emails` and `GET /emails/{id}` for its own emails; `POST /emails/{id}/cancel` for its own emails; `GET /domains` and `GET /domains/{id}`; `POST /emails/check`; `GET /emails/held` (its own held emails); reading `GET /suppressions`, `/suppressions/export`, `/pauses` and `/project`; approving and rejecting held emails with `can_approve`; for the inboxes its policy's `inboxes` lists (and none otherwise): `GET /inboxes`, `GET /inboxes/{id}`, `GET /inboxes/{id}/messages`, `GET /messages/{id}`, its attachments, `POST /messages/{id}/reply`, and `GET /emails/{id}/replies` for its own emails, never showing held messages; and `/mcp`, whose tools have the same limits |
 
 Anything else answers `403 insufficient_permission`.
 
@@ -432,12 +437,14 @@ Each key can also have a **policy**. Every field is optional; a missing field me
   "max_per_hour": 100,
   "max_per_day": 1000,
   "allowed_recipients": ["*@acme.com", "ops@example.org"],
-  "allowed_from": ["agent@acme.com", "*@support.acme.com"]
+  "allowed_from": ["agent@acme.com", "*@support.acme.com"],
+  "inboxes": ["support@acme.com", "*@agents.acme.com"]
 }
 ```
 
 - `max_per_hour` and `max_per_day` count the recipients the key queued in a rolling hour and a rolling 24 hours. Suppressed and canceled recipients do not count.
 - `require_approval` and `can_approve` hold the key's mail for approval, and let a key approve others' held mail: see [Approval holds](#approval-holds).
+- `inboxes` lists the inboxes a `sending_access` key may read and reply from. Without it the key sees no inbox, so an SMTP submission password (which is an API key) cannot read mail. Full-access keys see every inbox.
 - Patterns match lowercase addresses. `*` matches any characters within the local part or within the domain part, so `*@acme.com` does not match `a@mail.acme.com`; add `*@*.acme.com` for that.
 
 Refusals:
@@ -500,6 +507,7 @@ Events also show what the control plane learned from an attempt: `throttled` (th
 | `GET` | `/domains/{id}/dkim` | Every DKIM key with its record and state (`active`, `pending`, `retiring`), and the authentication problems receivers reported for the domain. |
 | `POST` | `/domains/{id}/dkim/rotate` | Rotates the DKIM key in two steps: the first call creates a key under a new selector and answers `202` with the TXT record to publish (`DKIM_NEXT`); call again once it is published and signing switches to it (`200`). The previous record stays listed as `DKIM_PREVIOUS` until its `retire_at`, 8 days later, because mail queued before the switch carries its signature. `409 dkim_record_not_found` until the new record is in DNS. Full access. |
 | `POST` | `/domains/{id}/dkim/ed25519` | `{"enabled": true}`: an Ed25519 key (RFC 8463) in the same two steps (record `DKIM_ED25519`); then mail carries an Ed25519 signature next to the RSA one. `{"enabled": false}` removes it. Full access. |
+| `GET` | `/domains/{id}/reports` | DMARC aggregate and TLS reports the domain received (see [DMARC and TLS reports](#dmarc-and-tls-reports)). `?days=30` (1–180). Full-access keys only. |
 
 The records you publish:
 
@@ -516,6 +524,8 @@ Each record's `detail` says why it is needed until it checks out. Gmail and Yaho
 Mail is sent with the envelope sender `b-<delivery>-<mac>@bounce.example.com`. DMARC passes through the DKIM signature, which is aligned with your `From` domain, and through SPF on the return path (relaxed alignment).
 
 A domain name is unique within a project, and among verified domains. Any project may add a name, and only the project that proves control of its DNS can verify it; a second project that tries gets `409 domain_verified_elsewhere`. An unverified domain is removed 7 days after it was added (`claim_expires_at`), and so is a failing one once another project has verified the name.
+
+Each domain also shows `report_addresses`: `dmarc@bounce.example.com` for the DMARC record's `rua=` and `tls-rpt@bounce.example.com` for a TLS-RPT record (`_smtp._tls.example.com TXT "v=TLSRPTv1; rua=mailto:tls-rpt@bounce.example.com"`). Reports sent there are read by the inbound nodes, so the return-path domain's MX must point to one (`OMW_BOUNCE_MX`).
 
 ### Webhooks
 
@@ -548,7 +558,7 @@ Event types:
 
 Every event about a sent email is about **one recipient**, and `data.to` holds only that recipient. A bounce reported later by a delivery status notification is an `email.bounced` too, with the DSN's status and diagnostic in `data.delivery`.
 
-`email.received` describes an inbound message without its content: `data.email_id` is the message id (read it with `GET /messages/{id}`), plus `data.inbox`, `data.inbox_id`, `data.thread_id`, `data.in_reply_to_email_id` and `data.message_id`. The body uses Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
+`email.received` describes an inbound message without its content: `data.email_id` is the message id (read it with `GET /messages/{id}`), `data.to` and `data.inbox` the inbox address that received it (`data.header_to` is the message's own `To` header, which the sender chose), plus `data.inbox_id`, `data.thread_id`, `data.in_reply_to_email_id`, `data.message_id`, the sender verdict `data.trust` with `data.authentication` (`spf`, `dkim`, `dmarc`), `data.held` and `data.suspicious_instructions`. An `email.complained` that does not say which recipient complained has `data.to: []`. The body uses Resend's field names (`type`, `created_at`, `data.email_id`, `data.from`, `data.to`, `data.subject`, `data.tags`, `data.bounce`), plus `data.delivery` with the SMTP details.
 
 Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's Svix headers (`svix-id`, `svix-timestamp`, `svix-signature`) and once in the [Standard Webhooks](https://www.standardwebhooks.com) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`). A handler written for Resend webhooks verifies them unchanged.
 
@@ -679,21 +689,55 @@ Mail to an inbox is received by an inbound node (see [Inbound mail](#inbound-mai
 
 | Method | Path | |
 |---|---|---|
-| `POST` | `/inboxes` | `{"address": "support@example.com"}`. The domain must be added to the project and verified. Full-access keys only. |
-| `GET` | `/inboxes` | Lists inboxes. |
+| `POST` | `/inboxes` | `{"address": "support@example.com", "hold_unauthenticated"?: true}`. The domain must be added to the project and verified. Full-access keys only. |
+| `GET` | `/inboxes` | Lists inboxes (for a `sending_access` key, those its policy lists). |
 | `GET` | `/inboxes/{id}` | One inbox. |
+| `PATCH` | `/inboxes/{id}` | `{"hold_unauthenticated": false}` turns the hold off (see below). Full-access keys only. |
 | `DELETE` | `/inboxes/{id}` | Deletes the inbox **and its messages**. Full-access keys only. |
-| `GET` | `/inboxes/{id}/messages` | `?limit=20&before=<message id>&thread_id=<id>`. Newest first: `{data:[{id, from, to, subject, received_at, thread_id, in_reply_to_email_id, snippet}], has_more, next_before}`. |
-| `GET` | `/messages/{id}` | `from`, `to`, `cc`, `reply_to`, `subject`, `text`, `html`, `headers` (`message-id`, `in-reply-to`, `references`, `date`), `attachments[]` (`index`, `filename`, `content_type`, `size`), `thread_id`, `in_reply_to_email_id`, `received_at`, `body_purged`. |
+| `GET` | `/inboxes/{id}/messages` | `?limit=20&before=<message id>&thread_id=<id>`. Newest first: `{data:[{id, from, to, subject, received_at, thread_id, in_reply_to_email_id, snippet, trust, held, suspicious_instructions}], has_more, next_before}`. |
+| `GET` | `/messages/{id}` | `from`, `to`, `cc`, `reply_to`, `subject`, `text`, `html`, `headers` (`message-id`, `in-reply-to`, `references`, `date`), `attachments[]` (`index`, `filename`, `content_type`, `size`), `thread_id`, `in_reply_to_email_id`, `received_at`, `body_purged`; the sender check: `mail_from`, `trust`, `authentication_results`; and the flags `held`, `released_at`, `suspicious_instructions`, `suspicious_rules`, `reply_to_mismatch`, `message_id_conflict`. |
 | `GET` | `/messages/{id}/attachments/{index}` | The attachment's bytes, as a download. Indexes start at 0. |
-| `POST` | `/messages/{id}/reply` | `{"text": "…", "html": "…"}`. Sends from the inbox address to the message's `Reply-To` (or `From`), with `Re: …`, `In-Reply-To` and `References`. Returns `{"id", "thread_id"}`. |
+| `POST` | `/messages/{id}/reply` | `{"text": "…", "html": "…", "to"?: [...]}`. Sends from the inbox address to the message's first `Reply-To` address (or `From`), with `Re: …`, `In-Reply-To` and `References`. To answer more or other people, name them in `to`. Returns `{"id", "thread_id", "to", "warnings"?}`; `warnings` says when other `Reply-To` addresses were left out or `Reply-To` is on another domain than `From`. |
+| `POST` | `/messages/{id}/release` | Shows a held message to `sending_access` keys. Full-access keys only. |
 | `GET` | `/emails/{id}/replies` | The received messages that answer a sent email, and its `thread_id`. |
+
+**Sender verdict.** Every message is checked when it arrives: SPF for the envelope sender and the HELO name (using the address of the server that connected to the inbound node), every DKIM signature, and DMARC alignment with the `From` domain (relaxed or strict as the domain asks, with the public-suffix list for organizational domains). `trust` is:
+
+| `trust` | Meaning |
+|---|---|
+| `authenticated` | The `From` domain is proven: a valid DKIM signature by it, or an SPF pass for an envelope sender on it (DMARC's "pass", whether or not the domain publishes a policy). |
+| `failed` | The `From` domain publishes a DMARC policy and the message fails it, or SPF says the server may not send for an envelope sender on the `From` domain. Probably forged. |
+| `unauthenticated` | Nothing proves who sent it. Most personal mail from small domains, and mail forwarded by lists, lands here. |
+
+`authentication_results` holds the details (`spf`, `spf_helo`, `dkim[]`, `dmarc` with the domain's `policy`, the `reason` for the verdict) and the same as an `Authentication-Results` header (`header`).
+
+**Holds.** An inbox holds messages that are not `authenticated` by default (`hold_unauthenticated: true`): full-access keys see them with `held: true`; `sending_access` keys (agents) do not see them at all until a full-access key calls `POST /messages/{id}/release`. Turn it off for inboxes whose senders cannot authenticate, with `PATCH /inboxes/{id}`. `email.received` is sent for held messages too, with `data.held`.
+
+**Flags for agents.** `suspicious_instructions` is set when the text (subject, sender name, body, and HTML including its hidden parts) matches one of a few rules for text aimed at AI agents, listed in `suspicious_rules`: `override_instructions` ("ignore previous instructions"), `role_marker` ("System:", `<|im_start|>`), `addresses_agent` ("note to the AI"), `tool_instruction` ("call send_email", "forward all emails"), `conceal_from_user` ("do not tell the user") and `claims_approval` ("the user has approved"). It is a hint, never a reason to drop mail. `reply_to_mismatch` says `Reply-To` is on another domain than `From`. `message_id_conflict` says another message in the inbox has the same Message-ID but different content: one of them may be forged.
 
 **Threading.** A received message whose `In-Reply-To` or `References` names one of the project's sent emails gets `in_reply_to_email_id`. `thread_id` is the id of the first email or message of the conversation: a reply sent with `POST /messages/{id}/reply` joins the thread of the message it answers, and the answer to that reply joins it too. For replies to reach an inbox, send from the inbox address.
 
 **Replies are ordinary emails.** `POST /messages/{id}/reply` calls `POST /emails` with your own API key, so the domain must be verified and every send rule (key policies, suppression list) applies. An `Idempotency-Key` header is passed on. Refusals come back unchanged.
 
-**Retention.** Message content (body and attachments) is deleted `OMW_INBOUND_RETENTION` after arrival (default 30 days). The message stays listed with its sender, subject and thread, and `body_purged` becomes `true`.
+**Retention.** Message content (body, attachments and the sealed snippet) is deleted `OMW_INBOUND_RETENTION` after arrival (default 30 days). The message stays listed with its sender, subject and thread, and `body_purged` becomes `true`.
+
+**Duplicates.** A copy with the Message-ID **and the content** of a message the inbox holds (the same envelope sender, verdict, headers a reader sees, body and attachments) is stored once, so a retried SMTP transaction is not stored twice. A different message that reuses a Message-ID is kept, and both are flagged `message_id_conflict`.
+
+### DMARC and TLS reports
+
+Receivers send daily DMARC aggregate reports (RFC 7489, and DMARCbis) to the `rua=` address of your DMARC record, and SMTP TLS reports (RFC 8460) to the `rua=` of your `_smtp._tls` record. Point both at the domain's `report_addresses` (`dmarc@bounce.<domain>` and `tls-rpt@bounce.<domain>`, shown by `GET /domains/{id}`):
+
+```
+_dmarc.example.com.     TXT  "v=DMARC1; p=none; rua=mailto:dmarc@bounce.example.com"
+_smtp._tls.example.com. TXT  "v=TLSRPTv1; rua=mailto:tls-rpt@bounce.example.com"
+```
+
+The return-path domain shares `example.com`'s organizational domain, so reporters need no extra authorization record. Reports arrive through the inbound nodes, compressed (gzip or zip) or not. They are parsed with limits (16 MB decompressed whatever the archive claims, 16 zip entries, 10 000 rows, no XML entities, shallow nesting), stored for 180 days, and ignored when they are about another domain. A report sent twice is stored once.
+
+`GET /domains/{id}/reports?days=30` (full access) returns:
+- `dmarc`: messages, `pass`, `fail` and `pass_rate`; `by_organization` (Google, Microsoft, …); `by_source` (each sending IP with its DKIM and SPF passes and `openmailwire_worker` when it is one of your workers); and `unknown_senders`, the IPs none of whose mail passed DMARC and that are not your workers: spoofers, or a service that still needs SPF or DKIM;
+- `tls`: successful and failed sessions per reporter and policy, and each failure (`result_type` such as `certificate-expired`, the sending and receiving hosts);
+- `reports`: the 50 most recent reports.
 
 ## Inbound mail
 
@@ -704,8 +748,12 @@ It receives three kinds of mail:
 | Sent to | What happens |
 |---|---|
 | a bounce address `b-<delivery>-<hmac>@bounce.example.com` | The HMAC is checked first; forged addresses are refused. A delivery status notification (RFC 3464, and the plain-text "failure notice" some providers still send) with `Action: failed` marks that delivery `bounced`, even if it was `delivered`, records the status and the remote server's diagnostic, suppresses the address on 5.1.x, and sends `email.bounced`. Delays, auto-replies and anything else are ignored. |
-| `OMW_FBL_ADDRESS` (or a bounce address) | A feedback-loop complaint (ARF, RFC 5965; Yahoo, Microsoft and others). The email is found through the VERP envelope sender in the report, or else its Message-ID and `Original-Rcpt-To`. The address is suppressed with reason `complaint` and `email.complained` is sent. DMARC failure reports and `not-spam` feedback are ignored. |
-| an inbox address | The message is sealed (AES-256-GCM), threaded, stored, and announced with `email.received`. A copy with a Message-ID the inbox already holds is stored once. |
+| `OMW_FBL_ADDRESS` (or a bounce address) | A feedback-loop complaint (ARF, RFC 5965; Yahoo, Microsoft and others). Anyone can send one, so: a report that carries a valid VERP address (it was sent to one, or its `Original-Mail-From` or the quoted original's `Return-Path` is one) names exactly one delivery, which gets `complained`, its address suppressed with reason `complaint`, and `email.complained`. A report that names the email only by its Message-ID counts only when a feedback loop in `OMW_FBL_TRUSTED_DOMAINS` signed it with DKIM; it is looked up only among emails on the return path or sending domain the report names, records at most one complaint per email, suppresses nobody and has `data.to: []`. DMARC failure reports and `not-spam` feedback are ignored. |
+| an inbox address | The sender is checked (SPF, DKIM, DMARC: the `trust` verdict). The message is sealed (AES-256-GCM), threaded, stored, held from agent keys when not authenticated, and announced with `email.received`. A copy with the Message-ID and content of one the inbox already holds is stored once. An inbox takes at most `OMW_INBOX_MAX_PER_HOUR` messages an hour; more get `451` and are retried by the sender. |
+| `dmarc@` or `tls-rpt@` a return-path domain | DMARC aggregate or TLS-RPT reports, stored for `GET /domains/{id}/reports`. |
+| `postmaster@` or `abuse@` a domain the nodes serve | Accepted, as RFC 5321 requires: delivered to the inbox `OMW_POSTMASTER_INBOX` names, or logged (sender domain and size) and dropped. An inbox with that exact address takes precedence. |
+
+**Abuse limits.** A node closes a connection after 10 refused recipients, limits the recipient checks one address (an IPv6 /64) causes on the control plane (120 a minute, bursts of 60), keeps recent answers for a minute (refusals for 15 seconds), takes at most 20 connections from one address, and waits at most a minute for each command until the client sends `MAIL`. The control plane processes at most `OMW_INBOUND_CONCURRENCY` messages at once; the rest get `451` and are retried.
 
 Run it next to the control plane or anywhere that can reach it:
 
@@ -811,6 +859,10 @@ Control plane (`openmailwire serve`):
 | `OMW_FBL_ADDRESS` | none | Address you registered with feedback loops, e.g. `fbl@mail.example.net`. Its domain's MX must point to an inbound node. |
 | `OMW_INBOUND_RETENTION` | `720h` | Inbound message content is deleted this long after arrival. |
 | `OMW_INBOUND_MAX_SIZE` | `25MB` | Largest inbound message the control plane accepts (MB = 1024 × 1024 bytes). |
+| `OMW_FBL_TRUSTED_DOMAINS` | Yahoo, AOL, Microsoft, Comcast, Validity, Fastmail, Zoho, Mail.ru, Yandex | Feedback loops whose DKIM-signed reports count when they name an email only by Message-ID: `yahoo.com,aol.com,hotmail.com,outlook.com,comcast.net,returnpath.net,fastmail.com,messagingengine.com,zoho.com,mail.ru,yandex.ru,yandex.net`. A signing domain matches an entry or its subdomains. `none` keeps only reports that carry a VERP address. |
+| `OMW_POSTMASTER_INBOX` | none | An inbox (e.g. `ops@example.com`) that receives `postmaster@` and `abuse@` mail for every served domain. Unset: such mail is logged and dropped. |
+| `OMW_INBOX_MAX_PER_HOUR` | `1000` | Messages one inbox accepts per hour; more get `451` and are retried. |
+| `OMW_INBOUND_CONCURRENCY` | `8` | Inbound messages the control plane processes at once. |
 | `OMW_RETURN_PATH_LABEL` | `bounce` | Gives `bounce.<domain>`. |
 | `OMW_DEFAULT_EXPIRY` | `48h` | |
 | `OMW_RETENTION` | `72h` | Message bodies are deleted this long after their last delivery. |
@@ -853,6 +905,8 @@ SMTP submission (`openmailwire submission`):
 | `OMW_SUBMISSION_TLS_LISTEN` | none | e.g. `:465`, for implicit TLS. |
 | `OMW_SUBMISSION_HOSTNAME` | hostname | Announced in the greeting. Use the name on the certificate. |
 | `OMW_SUBMISSION_MAX_SIZE` | `14MB` | The largest message. 14MB is also the maximum, because `/emails/raw` takes 20 MB of base64. |
+| `OMW_SUBMISSION_MAX_CONNS` | `200` | Concurrent connections over both ports. Each lasts at most 30 minutes, and gets a minute per command until it logs in. |
+| `OMW_SUBMISSION_MAX_CONNS_PER_IP` | `20` | Concurrent connections from one address (an IPv6 /64). After 10 failed logins in 15 minutes, an address's logins are refused until the window passes. |
 
 Inbound node (`openmailwire inbound`):
 
@@ -864,6 +918,7 @@ Inbound node (`openmailwire inbound`):
 | `OMW_INBOUND_HOSTNAME` | hostname | Announced in the greeting and in `Received` headers. Use the name your MX records point to. |
 | `OMW_TLS_CERT`, `OMW_TLS_KEY` | none | PEM files. When set, STARTTLS is offered. |
 | `OMW_INBOUND_MAX_SIZE` | `25MB` | Larger messages are refused with `552 5.3.4`. |
+| `OMW_INBOUND_MAX_CONNS_PER_IP` | `20` | Concurrent connections from one address (an IPv6 /64). |
 
 Worker admin: `openmailwire workers list`, `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
 
@@ -894,11 +949,11 @@ API key admin (it reads `DATABASE_URL`):
 
 ```sh
 openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N] \
-  [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
+  [--allow-to PATTERN]... [--allow-from PATTERN]... [--inbox PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
 openmailwire apikey list <project-id>
 ```
 
-`--allow-to`, `--allow-from` and `--allow-ip` can be repeated; `--expires-in 720h` makes the key stop working after 30 days. The same keys can be managed over the API (`/api-keys`). Keys created on the command line are recorded in the audit log with the actor `cli`.
+`--allow-to`, `--allow-from`, `--inbox` and `--allow-ip` can be repeated; `--expires-in 720h` makes the key stop working after 30 days. The same keys can be managed over the API (`/api-keys`). Keys created on the command line are recorded in the audit log with the actor `cli`.
 
 The control plane's HTTP server limits each request: 10 seconds for the header, 3 minutes for the whole request (a 20 MB body needs about 1 Mbit/s), 4 minutes to answer, 64 KB of headers, and 2 minutes for an idle keep-alive connection. Every answer carries `X-Content-Type-Options: nosniff`, and API answers `Cache-Control: no-store`. `GET /health` shows the version only to a caller with a valid API key or worker token.
 

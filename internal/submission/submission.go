@@ -29,6 +29,8 @@ import (
 
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
+
+	"github.com/openmailwire/openmailwire/internal/smtplimit"
 )
 
 // maxRecipients matches the API's limit per email. Further RCPTs get a
@@ -44,6 +46,21 @@ type Config struct {
 	// MaxAuthFailures is how many failed logins a connection may make
 	// before it is closed. Default 3.
 	MaxAuthFailures int
+	// MaxAuthFailuresPerIP is how many failed logins one address (an IPv6
+	// /64) may make in AuthFailureWindow, over all its connections, before
+	// its logins are refused until the window has passed. Defaults 10 and
+	// 15 minutes. It stops password guessing spread over many connections.
+	MaxAuthFailuresPerIP int
+	AuthFailureWindow    time.Duration
+	// MaxConns caps concurrent connections over both ports (default 200),
+	// MaxConnsPerIP those from one address (default 20), and
+	// MaxConnDuration the lifetime of each (default 30 minutes).
+	// IdleTimeout bounds the wait for each command until the client has
+	// logged in (default 1 minute).
+	MaxConns        int
+	MaxConnsPerIP   int
+	MaxConnDuration time.Duration
+	IdleTimeout     time.Duration
 	// ReadTimeout bounds each command and the whole DATA transfer.
 	// Default 5 minutes. WriteTimeout bounds each reply. Default 1 minute.
 	ReadTimeout  time.Duration
@@ -54,8 +71,10 @@ type Config struct {
 }
 
 type Server struct {
-	cfg  Config
-	smtp *smtp.Server
+	cfg       Config
+	smtp      *smtp.Server
+	limits    *smtplimit.Limits
+	authFails *smtplimit.Window // failed logins per client address
 }
 
 // New checks cfg and fills in defaults. Start it with Serve and ServeTLS.
@@ -73,6 +92,24 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxAuthFailures <= 0 {
 		cfg.MaxAuthFailures = 3
 	}
+	if cfg.MaxAuthFailuresPerIP <= 0 {
+		cfg.MaxAuthFailuresPerIP = 10
+	}
+	if cfg.AuthFailureWindow <= 0 {
+		cfg.AuthFailureWindow = 15 * time.Minute
+	}
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = 200
+	}
+	if cfg.MaxConnsPerIP <= 0 {
+		cfg.MaxConnsPerIP = 20
+	}
+	if cfg.MaxConnDuration <= 0 {
+		cfg.MaxConnDuration = 30 * time.Minute
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = time.Minute
+	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = 5 * time.Minute
 	}
@@ -88,7 +125,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Hostname == "" {
 		cfg.Hostname = "localhost"
 	}
-	s := &Server{cfg: cfg}
+	s := &Server{cfg: cfg, authFails: &smtplimit.Window{Span: cfg.AuthFailureWindow},
+		limits: smtplimit.NewLimits(smtplimit.Config{
+			MaxConns: cfg.MaxConns, MaxPerIP: cfg.MaxConnsPerIP, MaxDuration: cfg.MaxConnDuration,
+			IdleBeforeActive: cfg.IdleTimeout, Log: cfg.Log, What: "submission",
+		})}
 	ss := smtp.NewServer(s)
 	ss.Domain = cfg.Hostname
 	ss.TLSConfig = cfg.TLS
@@ -103,10 +144,13 @@ func New(cfg Config) (*Server, error) {
 }
 
 // Serve accepts SMTP on l (port 587). Clients must STARTTLS before AUTH.
-func (s *Server) Serve(l net.Listener) error { return s.smtp.Serve(l) }
+// Both ports share the connection limits.
+func (s *Server) Serve(l net.Listener) error { return s.smtp.Serve(s.limits.Wrap(l)) }
 
 // ServeTLS accepts SMTP over implicit TLS on l (port 465).
-func (s *Server) ServeTLS(l net.Listener) error { return s.smtp.Serve(tls.NewListener(l, s.cfg.TLS)) }
+func (s *Server) ServeTLS(l net.Listener) error {
+	return s.smtp.Serve(tls.NewListener(s.limits.Wrap(l), s.cfg.TLS))
+}
 
 // Close closes the listeners and every connection now.
 func (s *Server) Close() error { return s.smtp.Close() }
@@ -147,6 +191,8 @@ var (
 		Message: "Temporary authentication failure: the control plane is unreachable; try again later"}
 	errTemp = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0},
 		Message: "Temporary failure: the message was not queued; try again later"}
+	errAuthBlocked = &smtp.SMTPError{Code: 454, EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+		Message: "Too many failed logins from your address; try again later"}
 )
 
 type session struct {
@@ -175,6 +221,14 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 // rather than after the client has sent a whole message.
 func (s *session) login(password string) error {
 	log := s.srv.cfg.Log.With("remote", s.remoteIP())
+	ipKey := smtplimit.KeyOf(s.remoteIP())
+	if s.srv.authFails.Count(ipKey) >= s.srv.cfg.MaxAuthFailuresPerIP {
+		// The address has guessed too often: refuse without checking, so a
+		// correct guess is not confirmed either.
+		log.Warn("submission: login refused: too many failed logins from this address")
+		s.hangUp(errAuthBlocked, "421 4.7.0 Too many failed logins from your address; try again later")
+		return errAuthBlocked
+	}
 	if strings.HasPrefix(password, "omw_") {
 		ok, err := s.srv.checkKey(password)
 		if err != nil {
@@ -183,21 +237,30 @@ func (s *session) login(password string) error {
 		}
 		if ok {
 			s.key = password
+			if c := smtplimit.Of(s.conn.Conn()); c != nil {
+				c.Activate()
+			}
 			log.Info("submission: logged in", "key", keyPrefix(password))
 			return nil
 		}
 	}
 	s.failures++
-	log.Warn("submission: authentication failed", "failures", s.failures)
-	if s.failures >= s.srv.cfg.MaxAuthFailures {
+	perIP := s.srv.authFails.Add(ipKey, 1)
+	log.Warn("submission: authentication failed", "failures", s.failures, "failures_from_address", perIP)
+	if s.failures >= s.srv.cfg.MaxAuthFailures || perIP >= s.srv.cfg.MaxAuthFailuresPerIP {
 		// Answer, then hang up: further guesses need a new connection.
-		c := s.conn.Conn()
-		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		io.WriteString(c, fmt.Sprintf("%d %d.%d.%d %s\r\n421 4.7.0 Too many failed authentication attempts; closing the connection\r\n",
-			errAuthFailed.Code, errAuthFailed.EnhancedCode[0], errAuthFailed.EnhancedCode[1], errAuthFailed.EnhancedCode[2], errAuthFailed.Message))
-		s.conn.Close()
+		s.hangUp(errAuthFailed, "421 4.7.0 Too many failed authentication attempts; closing the connection")
 	}
 	return errAuthFailed
+}
+
+// hangUp writes the reply to the current command and a 421 itself, then
+// closes the connection.
+func (s *session) hangUp(e *smtp.SMTPError, line string) {
+	c := s.conn.Conn()
+	c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	io.WriteString(c, fmt.Sprintf("%d %d.%d.%d %s\r\n%s\r\n", e.Code, e.EnhancedCode[0], e.EnhancedCode[1], e.EnhancedCode[2], e.Message, line))
+	s.conn.Close()
 }
 
 func (s *session) Mail(from string, _ *smtp.MailOptions) error {

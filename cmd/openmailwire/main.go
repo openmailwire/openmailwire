@@ -53,7 +53,7 @@ Usage:
   openmailwire rotate-secrets                 reseal stored secrets with the first key of OMW_SECRET_KEYS (online)
   openmailwire project create <name>          create a project and its first API key
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
-                       [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
+                       [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION] [--inbox PATTERN]...
                                               create an API key, e.g. one per agent, with its limits
   openmailwire apikey list <project-id>       list a project's live API keys
   openmailwire workers add <name> [--role delivery|inbound|relay]
@@ -272,7 +272,7 @@ func runInbound(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	srv := inbound.New(inbound.Config{Hostname: cfg.Hostname, TLS: tlsConfig, MaxSize: cfg.MaxSize},
+	srv := inbound.New(inbound.Config{Hostname: cfg.Hostname, TLS: tlsConfig, MaxSize: cfg.MaxSize, MaxConnsPerIP: cfg.MaxConnsPerIP},
 		&inbound.Client{URL: cfg.ControlURL, Token: cfg.Token, HTTP: &http.Client{Timeout: 3 * time.Minute}}, log)
 	go func() {
 		<-ctx.Done()
@@ -323,12 +323,13 @@ func projectCmd(ctx context.Context, args []string) error {
 
 const apikeyUsage = `usage:
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
-                             [--allow-to PATTERN]... [--allow-from PATTERN]...
+                             [--allow-to PATTERN]... [--allow-from PATTERN]... [--inbox PATTERN]...
                              [--allow-ip CIDR]... [--expires-in DURATION]
   openmailwire apikey list <project-id>
 
 Patterns match addresses; "*" matches any characters within the local part
 or the domain part: --allow-to '*@acme.com' --allow-from agent@acme.com.
+A --sending-only key reads only the inboxes --inbox names: --inbox support@acme.com.
 --allow-ip limits where the key may be used from (203.0.113.7, 10.0.0.0/8);
 --expires-in makes it stop working after a while (720h).`
 
@@ -377,10 +378,11 @@ func apikeyCreate(ctx context.Context, args []string) error {
 	sendingOnly := fs.Bool("sending-only", false, "")
 	perHour := fs.Int("max-per-hour", 0, "")
 	perDay := fs.Int("max-per-day", 0, "")
-	var allowTo, allowFrom, allowIP patterns
+	var allowTo, allowFrom, allowIP, inboxes patterns
 	fs.Var(&allowTo, "allow-to", "")
 	fs.Var(&allowFrom, "allow-from", "")
 	fs.Var(&allowIP, "allow-ip", "")
+	fs.Var(&inboxes, "inbox", "") // policy.inboxes
 	expiresIn := fs.Duration("expires-in", 0, "")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
@@ -404,6 +406,9 @@ func apikeyCreate(ctx context.Context, args []string) error {
 	}
 	if len(allowFrom) > 0 {
 		policy.AllowedFrom = allowFrom
+	}
+	if len(inboxes) > 0 {
+		policy.Inboxes = inboxes
 	}
 	if err := policy.Normalize(); err != nil {
 		return err

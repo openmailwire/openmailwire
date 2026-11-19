@@ -2096,6 +2096,55 @@
             "$ref": "#/components/responses/NotFound"
           }
         }
+      },
+      "patch": {
+        "operationId": "updateInbox",
+        "tags": [
+          "Inboxes"
+        ],
+        "summary": "Change an inbox's settings",
+        "description": "Sets `hold_unauthenticated`.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateInboxRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The inbox.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inbox"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
       }
     },
     "/inboxes/{id}/messages": {
@@ -4069,6 +4118,107 @@
                 }
               }
             }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/messages/{id}/release": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MessageId"
+        }
+      ],
+      "post": {
+        "operationId": "releaseMessage",
+        "tags": [
+          "Inboxes"
+        ],
+        "summary": "Release a held message",
+        "description": "Makes a held message (its sender is not authenticated and its inbox holds such mail) visible to `sending_access` keys whose policy lists the inbox. Releasing a message that is not held changes nothing.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The message, without its content.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/domains/{id}/reports": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DomainId"
+        }
+      ],
+      "get": {
+        "operationId": "getDomainReports",
+        "tags": [
+          "Domains"
+        ],
+        "summary": "DMARC and TLS reports for a domain",
+        "description": "Summarizes the DMARC aggregate reports (RFC 7489) and SMTP TLS reports (RFC 8460) the domain received at its `report_addresses`: pass rates by source IP and by reporting organization, senders using the domain without authorization, and TLS failures.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 180,
+              "default": 30
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainReports"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           },
           "422": {
             "$ref": "#/components/responses/ValidationError"
@@ -6067,6 +6217,32 @@
             ],
             "format": "date-time",
             "description": "An unverified domain is removed at this time (7 days after it was added); `null` once verified. Domain names are unique only among verified domains: any project may add a name, and only one that proves control of its DNS can verify it."
+          },
+          "report_addresses": {
+            "type": "object",
+            "description": "Where to send this domain's aggregate reports: put `dmarc_rua` in the DMARC record's `rua=` and publish `tls_rpt_record`. They are on the return-path domain, so its MX must point to an inbound node.",
+            "properties": {
+              "dmarc_rua": {
+                "type": "string"
+              },
+              "tls_rpt_rua": {
+                "type": "string"
+              },
+              "dmarc_record_example": {
+                "type": "string"
+              },
+              "tls_rpt_record": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -6379,6 +6555,13 @@
           "can_approve": {
             "type": "boolean",
             "description": "This key may approve and reject held emails of other keys. `full_access` keys always can. No key approves its own emails."
+          },
+          "inboxes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Inbox address patterns a `sending_access` key may read and reply from, like `support@acme.com` or `*@agents.acme.com`. Without it such a key sees no inbox. Full-access keys see every inbox."
           }
         },
         "additionalProperties": false
@@ -6601,6 +6784,10 @@
             "type": "string",
             "format": "uuid",
             "description": "The domain the address is on."
+          },
+          "hold_unauthenticated": {
+            "type": "boolean",
+            "description": "Mail whose sender is not `authenticated` is held: hidden from `sending_access` keys until a full-access key releases it. Default `true`."
           }
         }
       },
@@ -6631,6 +6818,11 @@
           "address": {
             "type": "string",
             "description": "An address on one of the project's domains, e.g. `support-agent@acme.com`. The domain needs an MX record pointing at the server's inbound host (its `INBOUND` record)."
+          },
+          "hold_unauthenticated": {
+            "type": "boolean",
+            "default": true,
+            "description": "Hold mail whose sender is not authenticated (see `Inbox`)."
           }
         },
         "additionalProperties": false
@@ -6685,6 +6877,23 @@
           "snippet": {
             "type": "string",
             "description": "The start of the text body."
+          },
+          "trust": {
+            "type": "string",
+            "enum": [
+              "authenticated",
+              "unauthenticated",
+              "failed"
+            ],
+            "description": "The sender verdict from SPF, DKIM and DMARC: `authenticated` (the From domain is proven by an aligned DKIM signature or SPF pass), `unauthenticated` (nothing proves it) or `failed` (the From domain's DMARC policy, or SPF for an aligned envelope sender, says the message is not from it)."
+          },
+          "held": {
+            "type": "boolean",
+            "description": "Held messages are visible only to full-access keys until released."
+          },
+          "suspicious_instructions": {
+            "type": "boolean",
+            "description": "The text matches one of the prompt-injection rules (see `suspicious_rules`)."
           }
         }
       },
@@ -6834,6 +7043,75 @@
           "received_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "trust": {
+            "type": "string",
+            "enum": [
+              "authenticated",
+              "unauthenticated",
+              "failed"
+            ],
+            "description": "The sender verdict from SPF, DKIM and DMARC: `authenticated` (the From domain is proven by an aligned DKIM signature or SPF pass), `unauthenticated` (nothing proves it) or `failed` (the From domain's DMARC policy, or SPF for an aligned envelope sender, says the message is not from it)."
+          },
+          "held": {
+            "type": "boolean",
+            "description": "Held messages are visible only to full-access keys until released."
+          },
+          "suspicious_instructions": {
+            "type": "boolean",
+            "description": "The text matches one of the prompt-injection rules (see `suspicious_rules`)."
+          },
+          "reply_to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mail_from": {
+            "type": "string",
+            "description": "The envelope sender (MAIL FROM)."
+          },
+          "authentication_results": {
+            "type": "object",
+            "description": "SPF (envelope sender and HELO), each DKIM signature, DMARC, the verdict's reason, and the same as an Authentication-Results header (`header`)."
+          },
+          "released_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "suspicious_rules": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "override_instructions",
+                "role_marker",
+                "addresses_agent",
+                "tool_instruction",
+                "conceal_from_user",
+                "claims_approval"
+              ]
+            }
+          },
+          "reply_to_mismatch": {
+            "type": "boolean",
+            "description": "A Reply-To address is on another organizational domain than From."
+          },
+          "message_id_conflict": {
+            "type": "boolean",
+            "description": "Another message in the inbox has the same Message-ID but different content; one of them may be forged."
+          },
+          "size": {
+            "type": "integer"
+          },
+          "tls": {
+            "type": "boolean"
+          },
+          "body_purged": {
+            "type": "boolean"
           }
         }
       },
@@ -6858,6 +7136,14 @@
           },
           "html": {
             "type": "string"
+          },
+          "to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "description": "Recipients. Default: only the first Reply-To address, or From."
           }
         },
         "additionalProperties": false
@@ -7065,7 +7351,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The To addresses; the inbox address when the inbox was only in Bcc."
+            "description": "The inbox address that received the message."
           },
           "cc": {
             "type": "array",
@@ -7097,6 +7383,42 @@
             "type": "string",
             "format": "uuid",
             "description": "The email of ours it answers, when there is one; omitted otherwise."
+          },
+          "header_to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The message's own To header."
+          },
+          "trust": {
+            "type": "string",
+            "enum": [
+              "authenticated",
+              "unauthenticated",
+              "failed"
+            ],
+            "description": "The sender verdict from SPF, DKIM and DMARC: `authenticated` (the From domain is proven by an aligned DKIM signature or SPF pass), `unauthenticated` (nothing proves it) or `failed` (the From domain's DMARC policy, or SPF for an aligned envelope sender, says the message is not from it)."
+          },
+          "authentication": {
+            "type": "object",
+            "properties": {
+              "spf": {
+                "type": "string"
+              },
+              "dkim": {
+                "type": "string"
+              },
+              "dmarc": {
+                "type": "string"
+              }
+            }
+          },
+          "held": {
+            "type": "boolean"
+          },
+          "suspicious_instructions": {
+            "type": "boolean"
           }
         }
       },
@@ -7137,6 +7459,20 @@
             "type": "string",
             "format": "uuid",
             "description": "The thread the reply belongs to."
+          },
+          "to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Who the reply was sent to."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Present when other Reply-To addresses were left out, or Reply-To is on another domain than From."
           }
         }
       },
@@ -8268,6 +8604,64 @@
           "object",
           "keys"
         ]
+      },
+      "UpdateInboxRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hold_unauthenticated"
+        ],
+        "properties": {
+          "hold_unauthenticated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DomainReports": {
+        "type": "object",
+        "description": "DMARC aggregate and TLS-RPT reports received for a domain over `days`.",
+        "required": [
+          "object",
+          "domain_id",
+          "domain",
+          "days",
+          "dmarc",
+          "tls",
+          "reports"
+        ],
+        "properties": {
+          "object": {
+            "const": "domain_reports"
+          },
+          "domain_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "days": {
+            "type": "integer"
+          },
+          "addresses": {
+            "type": "object"
+          },
+          "dmarc": {
+            "type": "object",
+            "description": "Messages, `pass`, `fail` and `pass_rate`; `by_organization` (reporter); `by_source` (source IP, with `openmailwire_worker`); `unknown_senders`: sources none of whose mail passed DMARC and that are not OpenMailWire workers."
+          },
+          "tls": {
+            "type": "object",
+            "description": "`successful_sessions`, `failed_sessions`, `by_organization` and `failures` (result type, sending and receiving hosts)."
+          },
+          "reports": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "The 50 most recent reports."
+          }
+        }
       }
     },
     "parameters": {

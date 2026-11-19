@@ -157,7 +157,7 @@ func requireFull(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	writeError(w, http.StatusForbidden, "insufficient_permission", fmt.Sprintf(
-		"this API key has sending_access: it can send email, read and cancel its own emails, and read domains. %s %s needs a full_access key",
+		"this API key has sending_access: it can send email, read and cancel its own emails, read domains, and read and answer mail in the inboxes its policy.inboxes lists. %s %s needs a full_access key",
 		r.Method, r.URL.Path))
 	return false
 }

@@ -29,6 +29,46 @@
 
 **Upgrade notes:** migration `0006_api_hardening.sql` drops the global unique index on domain names and gives every currently unverified domain a claim that expires 7 days after the upgrade.
 
+### Inbound trust (v0.6)
+
+**Sender verdict on received mail.**
+- Every message to an inbox is checked: SPF for the envelope sender and the HELO name (with the client address the inbound node saw), every DKIM signature, and DMARC alignment with the `From` domain (relaxed or strict, organizational domains from the public-suffix list).
+- `trust` is `authenticated`, `unauthenticated` or `failed`; the details are stored as `authentication_results` (with an RFC 8601 `header`). They are returned by `GET /messages/{id}` and the message list, sent in `email.received` (`data.trust`, `data.authentication`, `data.held`) and shown by the MCP tools.
+- Inbox setting `hold_unauthenticated` (default on; `POST /inboxes`, new `PATCH /inboxes/{id}`): messages that are not `authenticated` are hidden from `sending_access` keys until a full-access key calls the new `POST /messages/{id}/release`. Messages received before the upgrade are not held; they show `trust: "unauthenticated"` with empty `authentication_results`, since they were never checked.
+
+**Agents and received text.**
+- MCP inbox tools print every sender-written field (names, addresses, subject, snippet, body, attachment names) quoted, between two marker lines whose tag is random for each call; text shaped like a marker is removed. `read_message` is marked open-world and shows the verdict and warnings. `list_messages` and `wait_for_reply` snippets are framed too.
+- Display names, addresses and subjects lose line breaks (CR, LF, U+2028, U+2029) and bidirectional controls. Attachment names lose Unicode format characters (such as U+202E) and leading dots.
+- HTML is turned into text with a tokenizer and without its hidden parts (`display:none`, `visibility:hidden`, zero font size or opacity, collapsed or off-page boxes, the `hidden` attribute).
+- `suspicious_instructions` and `suspicious_rules` flag text aimed at agents, from a short documented rule list.
+- `POST /messages/{id}/reply` answers only the first `Reply-To` address (or `From`); pass `to` for more. The answer includes `to` and `warnings`. `reply_to_mismatch` flags a `Reply-To` on another domain than `From`.
+
+**Permissions.** `sending_access` keys (SMTP submission passwords too) no longer read every inbox: only those the new policy field `inboxes` lists, e.g. `["support@acme.com", "*@agents.acme.com"]` (`--inbox` on `openmailwire apikey create`). This applies to listing inboxes, messages, attachments, replies and the MCP tools. **Upgrade note:** give existing agent keys an `inboxes` policy, or they lose inbox access.
+
+**Complaints (ARF).**
+- A report suppresses an address only when a valid VERP address identifies the delivery (the address it was sent to, `Original-Mail-From`, or the quoted original's `Return-Path`). Forged reports to `OMW_FBL_ADDRESS` can no longer suppress other recipients.
+- A report that names the email only by Message-ID counts only when a feedback loop in the new `OMW_FBL_TRUSTED_DOMAINS` signed it (DKIM; a documented default list). It is looked up only among emails on the return path or sending domain the report names (Message-IDs are chosen by clients on `/emails/raw`), records at most one complaint per email, suppresses nobody, and its `email.complained` has `data.to: []`.
+
+**Webhooks.** `email.received`'s `data.to` is the inbox that received the message; the message's `To` header moves to `data.header_to`.
+
+**DMARC and TLS reports.**
+- Each domain shows `report_addresses`: `dmarc@bounce.<domain>` for the DMARC `rua=` and `tls-rpt@bounce.<domain>` for a TLS-RPT record.
+- Reports arriving there (RFC 7489 and DMARCbis XML, RFC 8460 JSON; gzip, zip or plain) are parsed with size, zip-entry, nesting and row limits, stored for 180 days, and summarized by the new `GET /domains/{id}/reports` (full access): pass rates by source IP and by reporter, unknown senders using the domain, and TLS failures.
+
+**Inbound limits.**
+- Inbound nodes close a connection after 10 refused recipients, rate-limit recipient checks per client address, cache answers (1 minute; refusals 15 seconds), cap connections per address (`OMW_INBOUND_MAX_CONNS_PER_IP`, 20) and allow a minute per command before `MAIL`.
+- A recipient the control plane refuses or defers at `DATA` now reaches the sender (`550` or `451`).
+- The control plane processes at most `OMW_INBOUND_CONCURRENCY` (8) inbound messages at once, and an inbox accepts at most `OMW_INBOX_MAX_PER_HOUR` (1000) messages an hour; more are deferred.
+- `postmaster@` and `abuse@` are accepted on every domain the inbound nodes serve, and go to `OMW_POSTMASTER_INBOX` or are logged.
+- SMTP submission caps connections in total (`OMW_SUBMISSION_MAX_CONNS`, 200) and per address (`OMW_SUBMISSION_MAX_CONNS_PER_IP`, 20) over both ports, ends connections after 30 minutes, allows a minute per command before login, and refuses logins from an address after 10 failures in 15 minutes.
+
+**Storage.**
+- Deduplication of inbox messages uses the Message-ID and a hash of the content: a copy with a stolen Message-ID no longer hides the genuine message; differing copies are both kept and flagged `message_id_conflict`.
+- Message snippets are sealed like bodies. Plaintext snippets from earlier versions are cleared by the migration and derived again from the sealed body when listed.
+- The MIME parser stops splitting a multipart body at its part limit and compares delimiter lines as bytes (an 8 MB body of delimiters allocated 271 MB).
+
+Migration `0009_inbound_trust.sql`. `golang.org/x/net` becomes a direct dependency (`html`, `publicsuffix`).
+
 ## v0.5.1: parser hardening, current Go
 
 - The mail parser reads only the header of an embedded `message/*` part instead of parsing it again, and unfolds header lines in linear time with limits on header size and field count. Hostile inbound mail can no longer use excessive stack or CPU.

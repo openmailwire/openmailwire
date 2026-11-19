@@ -28,6 +28,8 @@ type domainResponse struct {
 	// verified.
 	ClaimExpiresAt *time.Time       `json:"claim_expires_at"`
 	Records        []domains.Record `json:"records"`
+	// Where to send DMARC and TLS-RPT aggregate reports.
+	ReportAddresses *reportAddresses `json:"report_addresses,omitempty"`
 }
 
 func (s *Server) spec(ctx context.Context, d store.Domain) domains.Spec {
@@ -71,6 +73,7 @@ func (s *Server) view(ctx context.Context, d store.Domain) domainResponse {
 	return domainResponse{
 		Object: "domain", ID: d.ID, Name: d.Name, Status: d.Status, CreatedAt: d.CreatedAt,
 		VerifiedAt: d.VerifiedAt, CheckedAt: d.CheckedAt, ClaimExpiresAt: d.ClaimExpiresAt, Records: recs,
+		ReportAddresses: s.reportAddresses(d),
 	}
 }
 

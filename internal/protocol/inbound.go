@@ -5,6 +5,9 @@ const (
 	InboundBounce    = "bounce"    // a signed VERP address: delivery status notifications (and complaints)
 	InboundComplaint = "complaint" // the feedback-loop address (OMW_FBL_ADDRESS): ARF complaints
 	InboundInbox     = "inbox"     // an inbox address
+	// Lane D (v0.6): aggregate reports and the RFC 5321 role addresses.
+	InboundReport     = "report"     // dmarc@ or tls-rpt@ a return-path domain: DMARC and TLS-RPT aggregate reports
+	InboundPostmaster = "postmaster" // postmaster@ or abuse@ a domain the inbound nodes serve
 )
 
 // InboundCheckRequest asks whether the control plane accepts mail for one
@@ -32,9 +35,11 @@ type InboundMessage struct {
 
 // InboundResult says what the control plane did for one recipient.
 type InboundResult struct {
-	Rcpt    string `json:"rcpt"`
-	Kind    string `json:"kind,omitempty"`
-	Outcome string `json:"outcome"` // stored, duplicate, bounced, complained, ignored or rejected
+	Rcpt string `json:"rcpt"`
+	Kind string `json:"kind,omitempty"`
+	// stored, duplicate, bounced, complained, ignored, logged, rejected, or
+	// deferred (the node answers 451 so the sender retries later).
+	Outcome string `json:"outcome"`
 	ID      string `json:"id,omitempty"`
 }
 

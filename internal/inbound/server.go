@@ -26,6 +26,7 @@ import (
 
 	"github.com/openmailwire/openmailwire/internal/protocol"
 	"github.com/openmailwire/openmailwire/internal/secret"
+	"github.com/openmailwire/openmailwire/internal/smtplimit"
 )
 
 // Config tunes the SMTP server. Zero values take the defaults noted.
@@ -47,6 +48,32 @@ type Config struct {
 	// defaults 15 seconds and 2 minutes.
 	CheckTimeout   time.Duration
 	DeliverTimeout time.Duration
+
+	// Abuse limits.
+	//
+	// MaxConnsPerIP caps concurrent connections from one address (an IPv6
+	// /64); default 20. IdleTimeout bounds the wait for each command until
+	// the client sends MAIL; default 1 minute.
+	MaxConnsPerIP int
+	IdleTimeout   time.Duration
+	// MaxUnknownRcpts closes a connection after this many refused
+	// recipients; default 10. A sender with real mail rarely has more than
+	// one or two bad addresses, and an address-guessing client is cut off
+	// early.
+	MaxUnknownRcpts int
+	// RcptChecksPerMinute and RcptCheckBurst limit the recipient checks one
+	// address (an IPv6 /64) may cause on the control plane; defaults 120
+	// and 60. Cached answers are free.
+	RcptChecksPerMinute int
+	RcptCheckBurst      int
+	// CacheTTL and NegativeCacheTTL keep recipient answers on the node, so
+	// repeated mail to one address does not ask the control plane each
+	// time; defaults 1 minute and 15 seconds. A negative answer is kept
+	// briefly, so a new inbox starts receiving almost at once. CacheSize
+	// bounds the entries; default 10000.
+	CacheTTL         time.Duration
+	NegativeCacheTTL time.Duration
+	CacheSize        int
 }
 
 func (c *Config) setDefaults() {
@@ -77,19 +104,47 @@ func (c *Config) setDefaults() {
 	if c.DeliverTimeout <= 0 {
 		c.DeliverTimeout = 2 * time.Minute
 	}
+	if c.MaxConnsPerIP <= 0 {
+		c.MaxConnsPerIP = 20
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = time.Minute
+	}
+	if c.MaxUnknownRcpts <= 0 {
+		c.MaxUnknownRcpts = 10
+	}
+	if c.RcptChecksPerMinute <= 0 {
+		c.RcptChecksPerMinute = 120
+	}
+	if c.RcptCheckBurst <= 0 {
+		c.RcptCheckBurst = 60
+	}
+	if c.CacheTTL <= 0 {
+		c.CacheTTL = time.Minute
+	}
+	if c.NegativeCacheTTL <= 0 {
+		c.NegativeCacheTTL = 15 * time.Second
+	}
+	if c.CacheSize <= 0 {
+		c.CacheSize = 10000
+	}
 }
 
 // Server is an inbound SMTP server.
 type Server struct {
-	cfg  Config
-	cp   *Client
-	log  *slog.Logger
-	smtp *smtp.Server
+	cfg    Config
+	cp     *Client
+	log    *slog.Logger
+	smtp   *smtp.Server
+	checks *smtplimit.Limiter // recipient checks per client address
+	cache  *rcptCache
 }
 
 func New(cfg Config, cp *Client, log *slog.Logger) *Server {
 	cfg.setDefaults()
-	s := &Server{cfg: cfg, cp: cp, log: log}
+	s := &Server{cfg: cfg, cp: cp, log: log,
+		checks: &smtplimit.Limiter{Rate: float64(cfg.RcptChecksPerMinute) / 60, Burst: float64(cfg.RcptCheckBurst)},
+		cache:  &rcptCache{max: cfg.CacheSize}}
 	srv := smtp.NewServer(s)
 	srv.Domain = cfg.Hostname
 	srv.TLSConfig = cfg.TLS
@@ -107,7 +162,10 @@ func New(cfg Config, cp *Client, log *slog.Logger) *Server {
 
 // Serve accepts connections on l until Close or Shutdown.
 func (s *Server) Serve(l net.Listener) error {
-	err := s.smtp.Serve(&limitListener{Listener: l, sem: make(chan struct{}, s.cfg.MaxConns), maxDur: s.cfg.MaxConnDuration, log: s.log})
+	err := s.smtp.Serve(smtplimit.NewListener(l, smtplimit.Config{
+		MaxConns: s.cfg.MaxConns, MaxPerIP: s.cfg.MaxConnsPerIP, MaxDuration: s.cfg.MaxConnDuration,
+		IdleBeforeActive: s.cfg.IdleTimeout, Log: s.log, What: "inbound",
+	}))
 	if errors.Is(err, smtp.ErrServerClosed) {
 		return nil
 	}
@@ -126,11 +184,12 @@ func (s *Server) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 type session struct {
-	s     *Server
-	conn  *smtp.Conn
-	from  string
-	rcpts []string
-	kinds map[string]string
+	s       *Server
+	conn    *smtp.Conn
+	from    string
+	rcpts   []string
+	kinds   map[string]string
+	unknown int // recipients refused on this connection
 }
 
 func (ss *session) Reset() {
@@ -142,6 +201,9 @@ func (ss *session) Logout() error { return nil }
 func (ss *session) Mail(from string, _ *smtp.MailOptions) error {
 	ss.Reset()
 	ss.from = from
+	if c := smtplimit.Of(ss.conn.Conn()); c != nil {
+		c.Activate() // a transaction: commands may now take the full ReadTimeout
+	}
 	return nil
 }
 
@@ -151,6 +213,8 @@ var (
 	errTempStore  = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "temporary failure storing the message; try again later"}
 	errRejected   = &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "message rejected"}
 	errLongLine   = &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "a line of the message is too long"}
+	errSlowDown   = &smtp.SMTPError{Code: 450, EnhancedCode: smtp.EnhancedCode{4, 7, 1}, Message: "too many recipient checks from your address; try again later"}
+	errBusy       = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 2, 1}, Message: "the mailbox is receiving too much mail; try again later"}
 )
 
 func domainOf(addr string) string {
@@ -165,16 +229,31 @@ func (ss *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	if ss.kinds[addr] != "" {
 		return nil // a repeated RCPT
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), ss.s.cfg.CheckTimeout)
-	defer cancel()
-	res, err := ss.s.cp.Check(ctx, addr)
-	if err != nil {
-		ss.s.log.Warn("inbound recipient check failed", "rcpt_domain", domainOf(addr), "err", err)
-		return errTempCheck
+	res, cached := ss.s.cache.get(addr)
+	if !cached {
+		// Each check costs the control plane a request and a query, so
+		// one address may not cause them faster than the limit.
+		if !ss.s.checks.Allow(smtplimit.KeyOf(ss.remoteIP())) {
+			ss.s.log.Warn("inbound recipient checks rate-limited", "remote_ip", ss.remoteIP())
+			return ss.refused(errSlowDown)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), ss.s.cfg.CheckTimeout)
+		defer cancel()
+		var err error
+		res, err = ss.s.cp.Check(ctx, addr)
+		if err != nil {
+			ss.s.log.Warn("inbound recipient check failed", "rcpt_domain", domainOf(addr), "err", err)
+			return errTempCheck
+		}
+		ttl := ss.s.cfg.CacheTTL
+		if !res.Accept {
+			ttl = ss.s.cfg.NegativeCacheTTL
+		}
+		ss.s.cache.put(addr, res, ttl)
 	}
 	if !res.Accept {
 		ss.s.log.Info("inbound recipient refused", "rcpt_domain", domainOf(addr), "remote_ip", ss.remoteIP())
-		return errNoSuchUser
+		return ss.refused(errNoSuchUser)
 	}
 	if ss.kinds == nil {
 		ss.kinds = map[string]string{}
@@ -182,6 +261,22 @@ func (ss *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	ss.kinds[addr] = res.Kind
 	ss.rcpts = append(ss.rcpts, addr)
 	return nil
+}
+
+// refused counts a refused recipient. Past MaxUnknownRcpts it sends the
+// refusal and a 421 itself and hangs up: the client is guessing addresses.
+func (ss *session) refused(e *smtp.SMTPError) error {
+	ss.unknown++
+	if ss.unknown < ss.s.cfg.MaxUnknownRcpts {
+		return e
+	}
+	ss.s.log.Warn("inbound connection closed: too many refused recipients", "remote_ip", ss.remoteIP(), "refused", ss.unknown)
+	c := ss.conn.Conn()
+	c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(c, "%d %d.%d.%d %s\r\n421 4.7.0 too many unknown recipients; closing the connection\r\n",
+		e.Code, e.EnhancedCode[0], e.EnhancedCode[1], e.EnhancedCode[2], e.Message)
+	ss.conn.Close()
+	return e
 }
 
 func (ss *session) remoteIP() string {
@@ -208,13 +303,13 @@ func (ss *session) Data(r io.Reader) error {
 	raw := append([]byte(ss.received(isTLS)), body...)
 	ctx, cancel := context.WithTimeout(context.Background(), ss.s.cfg.DeliverTimeout)
 	defer cancel()
-	_, err = ss.s.cp.Deliver(ctx, protocol.InboundMessage{
+	resp, err := ss.s.cp.Deliver(ctx, protocol.InboundMessage{
 		MailFrom: ss.from, Rcpts: ss.rcpts, Raw: raw, RemoteIP: ss.remoteIP(), HELO: ss.conn.Hostname(), TLS: isTLS,
 	})
 	var he *HTTPError
 	switch {
 	case err == nil:
-		return nil
+		return ss.outcome(resp)
 	case errors.As(err, &he) && he.Status == 413:
 		return smtp.ErrDataTooLarge
 	case errors.As(err, &he) && he.Status == 422:
@@ -223,6 +318,31 @@ func (ss *session) Data(r io.Reader) error {
 		ss.s.log.Warn("inbound delivery to the control plane failed", "err", err, "size", len(raw))
 		return errTempStore
 	}
+}
+
+// outcome turns the control plane's per-recipient results into the reply
+// to DATA. A recipient that must wait (an inbox over its rate) makes the
+// sender retry the whole message later; copies already stored are then
+// recognized as duplicates. When every recipient was refused (an inbox
+// deleted since the check was cached), the message is refused too.
+func (ss *session) outcome(resp protocol.InboundResponse) error {
+	rejected, deferred := 0, false
+	for _, r := range resp.Results {
+		switch r.Outcome {
+		case "rejected":
+			rejected++
+			ss.s.cache.drop(r.Rcpt)
+		case "deferred":
+			deferred = true
+		}
+	}
+	switch {
+	case deferred:
+		return errBusy
+	case rejected > 0 && rejected == len(resp.Results):
+		return errNoSuchUser
+	}
+	return nil
 }
 
 // received is the trace header this node adds (RFC 5321 section 4.4).
@@ -244,54 +364,52 @@ func (ss *session) received(isTLS bool) string {
 	return h + ";\r\n\t" + time.Now().UTC().Format(time.RFC1123Z) + "\r\n"
 }
 
-// limitListener caps concurrent connections and the lifetime of each.
-type limitListener struct {
-	net.Listener
-	sem    chan struct{}
-	maxDur time.Duration
-	log    *slog.Logger
+// rcptCache keeps the control plane's answers about recipients for a
+// short time. It is bounded: when full, expired entries go, and if that is
+// not enough, all of them.
+type rcptCache struct {
+	mu  sync.Mutex
+	max int
+	m   map[string]cachedRcpt
 }
 
-func (l *limitListener) Accept() (net.Conn, error) {
-	for {
-		c, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
+type cachedRcpt struct {
+	res   protocol.InboundCheckResponse
+	until time.Time
+}
+
+func (c *rcptCache) get(addr string) (protocol.InboundCheckResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[addr]
+	if !ok || time.Now().After(e.until) {
+		return protocol.InboundCheckResponse{}, false
+	}
+	return e.res, true
+}
+
+func (c *rcptCache) put(addr string, res protocol.InboundCheckResponse, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]cachedRcpt{}
+	}
+	if len(c.m) >= c.max {
+		now := time.Now()
+		for k, e := range c.m {
+			if now.After(e.until) {
+				delete(c.m, k)
+			}
 		}
-		select {
-		case l.sem <- struct{}{}:
-			bc := &boundedConn{Conn: c, deadline: time.Now().Add(l.maxDur), release: func() { <-l.sem }}
-			bc.Conn.SetDeadline(bc.deadline)
-			return bc, nil
-		default:
-			l.log.Warn("inbound connection refused: too many connections")
-			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			io.WriteString(c, "421 4.3.2 too many connections, try again later\r\n")
-			c.Close()
+		if len(c.m) >= c.max {
+			c.m = map[string]cachedRcpt{}
 		}
 	}
+	c.m[addr] = cachedRcpt{res: res, until: time.Now().Add(ttl)}
 }
 
-// boundedConn never lets a deadline move past the connection's end of life.
-type boundedConn struct {
-	net.Conn
-	deadline time.Time
-	once     sync.Once
-	release  func()
-}
-
-func (c *boundedConn) clamp(t time.Time) time.Time {
-	if t.IsZero() || t.After(c.deadline) {
-		return c.deadline
-	}
-	return t
-}
-
-func (c *boundedConn) SetDeadline(t time.Time) error      { return c.Conn.SetDeadline(c.clamp(t)) }
-func (c *boundedConn) SetReadDeadline(t time.Time) error  { return c.Conn.SetReadDeadline(c.clamp(t)) }
-func (c *boundedConn) SetWriteDeadline(t time.Time) error { return c.Conn.SetWriteDeadline(c.clamp(t)) }
-
-func (c *boundedConn) Close() error {
-	c.once.Do(c.release)
-	return c.Conn.Close()
+func (c *rcptCache) drop(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, addr)
 }

@@ -90,6 +90,11 @@ var publicRoutes = []route{
 	{"PATCH", "/project", full},
 	{"GET", "/u/{token}", public},
 	{"POST", "/u/{token}", public},
+
+	// v0.6 lane D: inbound trust and aggregate reports.
+	{"PATCH", "/inboxes/{id}", full},
+	{"POST", "/messages/{id}/release", full},
+	{"GET", "/domains/{id}/reports", full},
 }
 
 var httpMethods = []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"}

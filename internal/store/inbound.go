@@ -17,24 +17,43 @@ type Inbox struct {
 	ProjectID string
 	DomainID  string
 	Address   string
-	CreatedAt time.Time
+	// HoldUnauthenticated keeps mail whose sender is not authenticated
+	// from sending_access keys until a full-access key releases it.
+	HoldUnauthenticated bool
+	CreatedAt           time.Time
 }
 
-const inboxCols = `id::text, project_id::text, domain_id::text, address, created_at`
+const inboxCols = `id::text, project_id::text, domain_id::text, address, hold_unauthenticated, created_at`
 
 func scanInbox(row pgx.Row) (Inbox, error) {
 	var b Inbox
-	err := row.Scan(&b.ID, &b.ProjectID, &b.DomainID, &b.Address, &b.CreatedAt)
+	err := row.Scan(&b.ID, &b.ProjectID, &b.DomainID, &b.Address, &b.HoldUnauthenticated, &b.CreatedAt)
 	return b, err
 }
 
-func (s *Store) CreateInbox(ctx context.Context, projectID, domainID, address string) (Inbox, error) {
-	b, err := scanInbox(s.Pool.QueryRow(ctx, `INSERT INTO inboxes (project_id, domain_id, address)
-		VALUES ($1, $2, $3) RETURNING `+inboxCols, projectID, domainID, address))
+func (s *Store) CreateInbox(ctx context.Context, projectID, domainID, address string, holdUnauthenticated bool) (Inbox, error) {
+	b, err := scanInbox(s.Pool.QueryRow(ctx, `INSERT INTO inboxes (project_id, domain_id, address, hold_unauthenticated)
+		VALUES ($1, $2, $3, $4) RETURNING `+inboxCols, projectID, domainID, address, holdUnauthenticated))
 	if isUniqueViolation(err) {
 		return Inbox{}, ErrConflict
 	}
 	return b, err
+}
+
+// SetInboxHold changes an inbox's hold_unauthenticated setting.
+func (s *Store) SetInboxHold(ctx context.Context, projectID, id string, hold bool) (Inbox, error) {
+	b, err := scanInbox(s.Pool.QueryRow(ctx, `UPDATE inboxes SET hold_unauthenticated = $3
+		WHERE project_id = $1 AND id = $2 RETURNING `+inboxCols, projectID, id, hold))
+	return b, noRows(err)
+}
+
+// InboxDomainKnown reports whether any inbox is on domain: the inbound
+// node is then its MX, so postmaster@ and abuse@ there must be accepted.
+func (s *Store) InboxDomainKnown(ctx context.Context, domain string) (bool, error) {
+	var ok bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM inboxes i JOIN domains d ON d.id = i.domain_id
+		WHERE d.name = $1 AND d.status = 'verified')`, domain).Scan(&ok)
+	return ok, err
 }
 
 func (s *Store) ListInboxes(ctx context.Context, projectID string) ([]Inbox, error) {
@@ -96,11 +115,19 @@ func (s *Store) SentDelivery(ctx context.Context, deliveryID string) (SentDelive
 	return d, noRows(err)
 }
 
-// DeliveriesByMessageID returns every recipient of the sent email with
-// this Message-ID (without angle brackets).
-func (s *Store) DeliveriesByMessageID(ctx context.Context, messageID string) ([]SentDelivery, error) {
+// DeliveriesByMessageID returns the recipients of the sent email with this
+// Message-ID (without angle brackets), only among emails whose return path
+// is one of returnPaths or whose sending domain is one of fromDomains.
+// Message-IDs are chosen by clients on POST /emails/raw, so an unscoped
+// lookup could find another project's email.
+func (s *Store) DeliveriesByMessageID(ctx context.Context, messageID string, returnPaths, fromDomains []string) ([]SentDelivery, error) {
+	if len(returnPaths) == 0 && len(fromDomains) == 0 {
+		return nil, nil
+	}
 	rows, err := s.Pool.Query(ctx, `SELECT d.id::text, d.email_id::text, e.project_id::text, d.rcpt, d.status, e.return_path
-		FROM emails e JOIN deliveries d ON d.email_id = e.id WHERE e.message_id = $1 ORDER BY d.rcpt`, messageID)
+		FROM emails e JOIN deliveries d ON d.email_id = e.id LEFT JOIN domains dm ON dm.id = e.domain_id
+		WHERE e.message_id = $1 AND (e.return_path = ANY($2) OR dm.name = ANY($3))
+		ORDER BY e.created_at DESC, d.rcpt LIMIT 1000`, messageID, returnPaths, fromDomains)
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +224,20 @@ func (s *Store) RecordComplaint(ctx context.Context, c Complaint) (changed bool,
 		if exists {
 			return false, nil
 		}
+	} else {
+		// A report that does not say which recipient complained counts
+		// once per email, however often it is sent.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('complaint:' || $1, 0))`, c.EmailID); err != nil {
+			return false, err
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM events
+				WHERE email_id = $1 AND delivery_id IS NULL AND type = 'complained')`, c.EmailID).Scan(&exists); err != nil {
+			return false, err
+		}
+		if exists {
+			return false, nil
+		}
 	}
 	if c.Rcpt != "" {
 		if _, err := tx.Exec(ctx, `INSERT INTO suppressions (project_id, address, reason, detail)
@@ -226,47 +267,67 @@ type NewInboundMessage struct {
 	InReplyTo  string   // without angle brackets
 	References []string // without angle brackets, oldest first
 	Date       string
-	Snippet    string
+	Snippet    []byte // sealed
 	Size       int
 	RemoteIP   string
 	HELO       string
 	TLS        bool
 	Raw        []byte // sealed
+
+	Trust           string // authenticated, unauthenticated or failed
+	AuthResults     []byte // JSON
+	Held            bool
+	SuspiciousRules []string
+	// ContentHash identifies the content: a second copy with the same
+	// Message-ID and hash is a duplicate; with another hash it is kept and
+	// both are flagged (message_id_conflict).
+	ContentHash string
+	// EventData is the "received" event's data, which webhooks read.
+	EventData []byte
 }
 
 // InboundMessage is a stored message. Raw is sealed and nil once purged.
 type InboundMessage struct {
-	ID               string
-	InboxID          string
-	ProjectID        string
-	MailFrom         string
-	From             string
-	To, Cc           []string
-	ReplyTo          []string
-	Subject          string
-	MessageID        string
-	InReplyTo        string
-	References       []string
-	Date             string
-	ThreadID         string
-	InReplyToEmailID *string
-	Snippet          string
-	Size             int
-	TLS              bool
-	Raw              []byte
-	ReceivedAt       time.Time
-	PurgedAt         *time.Time
+	ID                string
+	InboxID           string
+	ProjectID         string
+	MailFrom          string
+	From              string
+	To, Cc            []string
+	ReplyTo           []string
+	Subject           string
+	MessageID         string
+	InReplyTo         string
+	References        []string
+	Date              string
+	ThreadID          string
+	InReplyToEmailID  *string
+	Snippet           []byte // sealed; nil once purged, or for messages stored before v0.6
+	Size              int
+	RemoteIP          string
+	TLS               bool
+	Raw               []byte
+	ReceivedAt        time.Time
+	PurgedAt          *time.Time
+	Trust             string
+	AuthResults       []byte
+	Held              bool
+	ReleasedAt        *time.Time
+	SuspiciousRules   []string
+	MessageIDConflict bool
 }
 
 const messageCols = `id::text, inbox_id::text, project_id::text, mail_from, from_addr, to_addrs, cc_addrs, reply_to,
-	subject, message_id, in_reply_to, refs, date_header, thread_id::text, in_reply_to_email_id::text, snippet, size, tls,
-	raw, received_at, purged_at`
+	subject, message_id, in_reply_to, refs, date_header, thread_id::text, in_reply_to_email_id::text, snippet_sealed, size,
+	remote_ip, tls, raw, received_at, purged_at, trust, authentication_results, held, released_at, suspicious_rules,
+	message_id_conflict`
 
 func scanMessage(row pgx.Row) (InboundMessage, error) {
 	var m InboundMessage
 	err := row.Scan(&m.ID, &m.InboxID, &m.ProjectID, &m.MailFrom, &m.From, &m.To, &m.Cc, &m.ReplyTo,
 		&m.Subject, &m.MessageID, &m.InReplyTo, &m.References, &m.Date, &m.ThreadID, &m.InReplyToEmailID,
-		&m.Snippet, &m.Size, &m.TLS, &m.Raw, &m.ReceivedAt, &m.PurgedAt)
+		&m.Snippet, &m.Size, &m.RemoteIP, &m.TLS, &m.Raw, &m.ReceivedAt, &m.PurgedAt, &m.Trust, &m.AuthResults, &m.Held,
+		&m.ReleasedAt, &m.SuspiciousRules, &m.MessageIDConflict)
 	return m, err
 }
 
@@ -380,25 +441,60 @@ func (s *Store) InsertInboundMessage(ctx context.Context, id string, m NewInboun
 		}
 	}
 
+	msgID := clean(m.MessageID, 998)
+	if msgID != "" {
+		// Serialize copies of one Message-ID, so the conflict check below
+		// sees every other copy.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1 || ' ' || $2, 0))`, m.InboxID, msgID); err != nil {
+			return out, false, err
+		}
+	}
+	trust := m.Trust
+	if trust == "" {
+		trust = "unauthenticated"
+	}
+	auth := m.AuthResults
+	if len(auth) == 0 {
+		auth = []byte("{}")
+	}
+	rules := m.SuspiciousRules
+	if rules == nil {
+		rules = []string{}
+	}
 	tag, err := tx.Exec(ctx, `INSERT INTO inbound_messages (id, inbox_id, project_id, mail_from, from_addr, to_addrs,
 			cc_addrs, reply_to, subject, message_id, in_reply_to, refs, date_header, thread_id, in_reply_to_email_id,
-			snippet, size, remote_ip, helo, tls, raw)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-		ON CONFLICT (inbox_id, message_id) WHERE message_id <> '' DO NOTHING`,
+			snippet_sealed, size, remote_ip, helo, tls, raw, trust, authentication_results, held, suspicious_rules, content_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
+			$24, $25, $26)
+		ON CONFLICT (inbox_id, message_id, content_hash) WHERE message_id <> '' DO NOTHING`,
 		id, m.InboxID, m.ProjectID, clean(m.MailFrom, 320), clean(m.From, 1000), cleanList(m.To), cleanList(m.Cc),
-		cleanList(m.ReplyTo), clean(m.Subject, 2000), clean(m.MessageID, 998), clean(m.InReplyTo, 998),
-		cleanList(m.References), clean(m.Date, 200), threadID, replyTo, clean(m.Snippet, 1000), m.Size,
-		clean(m.RemoteIP, 64), clean(m.HELO, 255), m.TLS, m.Raw)
+		cleanList(m.ReplyTo), clean(m.Subject, 2000), msgID, clean(m.InReplyTo, 998),
+		cleanList(m.References), clean(m.Date, 200), threadID, replyTo, m.Snippet, m.Size,
+		clean(m.RemoteIP, 64), clean(m.HELO, 255), m.TLS, m.Raw, trust, auth, m.Held, rules, m.ContentHash)
 	if err != nil {
 		return out, false, err
 	}
 	if tag.RowsAffected() == 0 {
 		tx.Rollback(ctx)
 		out, err = scanMessage(s.Pool.QueryRow(ctx, `SELECT `+messageCols+` FROM inbound_messages
-			WHERE inbox_id = $1 AND message_id = $2`, m.InboxID, clean(m.MessageID, 998)))
+			WHERE inbox_id = $1 AND message_id = $2 AND content_hash = $3`, m.InboxID, msgID, m.ContentHash))
 		return out, true, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO events (inbound_message_id, type) VALUES ($1, 'received')`, id); err != nil {
+	if msgID != "" {
+		// Another copy with this Message-ID but different content: one of
+		// them may be forged. Keep both and flag them.
+		if _, err := tx.Exec(ctx, `UPDATE inbound_messages SET message_id_conflict = true
+			WHERE inbox_id = $1 AND message_id = $2 AND NOT message_id_conflict
+				AND EXISTS (SELECT 1 FROM inbound_messages o WHERE o.inbox_id = $1 AND o.message_id = $2 AND o.id <> $3)`,
+			m.InboxID, msgID, id); err != nil {
+			return out, false, err
+		}
+	}
+	data := m.EventData
+	if len(data) == 0 {
+		data = []byte("{}")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO events (inbound_message_id, type, data) VALUES ($1, 'received', $2)`, id, data); err != nil {
 		return out, false, err
 	}
 	out, err = scanMessage(tx.QueryRow(ctx, `SELECT `+messageCols+` FROM inbound_messages WHERE id = $1`, id))
@@ -412,9 +508,14 @@ func (s *Store) InsertInboundMessage(ctx context.Context, id string, m NewInboun
 // limit, after the message before (exclusive) when it is set, and only
 // those of one thread when threadID is set. more says whether older
 // messages remain.
-func (s *Store) ListInboundMessages(ctx context.Context, projectID, inboxID, before, threadID string, limit int) (msgs []InboundMessage, more bool, err error) {
+//
+// Held messages are left out unless includeHeld is set.
+func (s *Store) ListInboundMessages(ctx context.Context, projectID, inboxID, before, threadID string, limit int, includeHeld bool) (msgs []InboundMessage, more bool, err error) {
 	q := `SELECT ` + messageCols + ` FROM inbound_messages WHERE project_id = $1 AND inbox_id = $2`
 	args := []any{projectID, inboxID}
+	if !includeHeld {
+		q += ` AND NOT held`
+	}
 	if threadID != "" {
 		args = append(args, threadID)
 		q += fmt.Sprintf(` AND thread_id = $%d`, len(args))
@@ -458,16 +559,60 @@ func (s *Store) GetInboundMessage(ctx context.Context, projectID, id string) (In
 }
 
 // RepliesToEmail returns the email's thread and the inbound messages that
-// answer it (In-Reply-To or References name it), newest first.
-func (s *Store) RepliesToEmail(ctx context.Context, projectID, emailID string, limit int) (threadID string, msgs []InboundMessage, err error) {
+// answer it (In-Reply-To or References name it), newest first. Held
+// messages are left out unless includeHeld is set.
+func (s *Store) RepliesToEmail(ctx context.Context, projectID, emailID string, limit int, includeHeld bool) (threadID string, msgs []InboundMessage, err error) {
 	err = s.Pool.QueryRow(ctx, `SELECT COALESCE(t.thread_id, e.id)::text FROM emails e
 		LEFT JOIN email_threads t ON t.email_id = e.id WHERE e.project_id = $1 AND e.id = $2`, projectID, emailID).Scan(&threadID)
 	if err != nil {
 		return "", nil, noRows(err)
 	}
 	msgs, _, err = s.queryMessages(ctx, `SELECT `+messageCols+` FROM inbound_messages
-		WHERE project_id = $1 AND in_reply_to_email_id = $2 ORDER BY received_at DESC, id DESC LIMIT $3`, limit, projectID, emailID, limit)
+		WHERE project_id = $1 AND in_reply_to_email_id = $2 AND (NOT held OR $4) ORDER BY received_at DESC, id DESC LIMIT $3`,
+		limit, projectID, emailID, limit, includeHeld)
 	return threadID, msgs, err
+}
+
+// ReleaseInboundMessage makes a held message visible to every key and
+// records a "released" event. changed is false when it was not held.
+func (s *Store) ReleaseInboundMessage(ctx context.Context, projectID, id, keyID string) (m InboundMessage, changed bool, err error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return m, false, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE inbound_messages SET held = false, released_at = now()
+		WHERE project_id = $1 AND id = $2 AND held`, projectID, id)
+	if err != nil {
+		return m, false, err
+	}
+	if tag.RowsAffected() > 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO events (inbound_message_id, type, data) VALUES ($1, 'released', $2)`,
+			id, EventData(map[string]any{"api_key_id": keyID})); err != nil {
+			return m, false, err
+		}
+	}
+	m, err = scanMessage(tx.QueryRow(ctx, `SELECT `+messageCols+` FROM inbound_messages WHERE project_id = $1 AND id = $2`, projectID, id))
+	if err != nil {
+		return m, false, noRows(err)
+	}
+	return m, tag.RowsAffected() > 0, tx.Commit(ctx)
+}
+
+// SetSnippet stores a sealed snippet derived for a message stored before
+// snippets were sealed.
+func (s *Store) SetSnippet(ctx context.Context, id string, sealed []byte) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE inbound_messages SET snippet_sealed = $2 WHERE id = $1 AND raw IS NOT NULL AND snippet_sealed IS NULL`, id, sealed)
+	return err
+}
+
+// RecentInboundCount counts an inbox's messages received in the last
+// window, stopping at limit.
+func (s *Store) RecentInboundCount(ctx context.Context, inboxID string, window time.Duration, limit int) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM (SELECT 1 FROM inbound_messages
+		WHERE inbox_id = $1 AND received_at > now() - make_interval(secs => $2) LIMIT $3) x`, inboxID, window.Seconds(), limit).Scan(&n)
+	return n, err
 }
 
 // LinkReply records that a sent email answers an inbound message and
@@ -484,9 +629,13 @@ func (s *Store) SweepInbound(ctx context.Context, retention time.Duration) error
 	if retention <= 0 {
 		return nil
 	}
-	if _, err := s.Pool.Exec(ctx, `UPDATE inbound_messages SET raw = NULL, snippet = '', purged_at = now()
+	if _, err := s.Pool.Exec(ctx, `UPDATE inbound_messages SET raw = NULL, snippet = '', snippet_sealed = NULL, purged_at = now()
 		WHERE raw IS NOT NULL AND received_at < now() - make_interval(secs => $1)`, retention.Seconds()); err != nil {
 		return fmt.Errorf("purge inbound messages: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM domain_reports WHERE received_at < now() - make_interval(secs => $1)`,
+		ReportRetention.Seconds()); err != nil {
+		return fmt.Errorf("purge domain reports: %w", err)
 	}
 	return nil
 }

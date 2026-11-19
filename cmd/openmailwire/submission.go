@@ -23,7 +23,7 @@ func runSubmission(ctx context.Context, log *slog.Logger) error {
 	}
 	srv, err := submission.New(submission.Config{
 		Hostname: cfg.Hostname, APIURL: cfg.APIURL, TLS: tlsCfg, MaxSize: cfg.MaxSize,
-		Log: log, Version: version,
+		MaxConns: cfg.MaxConns, MaxConnsPerIP: cfg.MaxConnsPerIP, Log: log, Version: version,
 	})
 	if err != nil {
 		return err

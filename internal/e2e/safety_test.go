@@ -1140,7 +1140,17 @@ func TestSafetyHeldInboxReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := e.waitMessages(inbox, 1)[0].(map[string]any)
-	agent, _ := keysNewKey(e, "agent", "sending_access", map[string]any{"require_approval": map[string]any{"always": true}})
+	// The test sender is not authenticated (no SPF/DKIM in the fake DNS),
+	// so the message is held from agent keys until a full-access key
+	// releases it; and a sending_access key reads only the inboxes its
+	// policy lists.
+	if code, b := e.call("POST", "/messages/"+m["id"].(string)+"/release", "", nil); code != 200 {
+		t.Fatalf("release: %d %v", code, b)
+	}
+	agent, _ := keysNewKey(e, "agent", "sending_access", map[string]any{
+		"require_approval": map[string]any{"always": true},
+		"inboxes":          []string{"help@desk.test"},
+	})
 	code, b := agent.call("POST", "/messages/"+m["id"].(string)+"/reply", "", map[string]any{"text": "Sure."})
 	if code != 200 || b["held"] != true || !slices.Equal(sfStrings(b["hold_reasons"]), []string{"always"}) || b["thread_id"] == nil {
 		t.Fatalf("held reply: %d %v", code, b)

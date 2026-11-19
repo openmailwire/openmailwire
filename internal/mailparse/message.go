@@ -2,9 +2,7 @@ package mailparse
 
 import (
 	"fmt"
-	"html"
 	"path"
-	"regexp"
 	"strings"
 	"unicode"
 )
@@ -13,6 +11,7 @@ import (
 type Message struct {
 	From       string // "Name <addr>", decoded
 	FromAddr   string // lowercase address
+	FromCount  int    // addresses in From; DMARC needs exactly one
 	To         []string
 	Cc         []string
 	ReplyTo    []string
@@ -42,13 +41,14 @@ func Parse(raw []byte) *Message {
 	head, _ := splitMessage(raw)
 	h := parseHeader(head)
 	m := &Message{
-		Subject: collapseSpace(decodeHeader(h.get("Subject"))),
+		Subject: CleanDisplay(decodeHeader(h.get("Subject"))),
 		Date:    collapseSpace(h.get("Date")),
 		Headers: map[string]string{},
 	}
-	if from := parseAddresses(h.get("From")); len(from) > 0 {
+	if from := parseAddresses(strings.Join(h.all("From"), ", ")); len(from) > 0 {
 		m.From = FormatAddress(from[0])
 		m.FromAddr = strings.ToLower(from[0].Address)
+		m.FromCount = len(from)
 	}
 	m.To = formatAddresses(parseAddresses(strings.Join(h.all("To"), ", ")))
 	m.Cc = formatAddresses(parseAddresses(strings.Join(h.all("Cc"), ", ")))
@@ -100,7 +100,7 @@ func Parse(raw []byte) *Message {
 // with a fresh depth and part budget each time.
 func embeddedSubject(body []byte) string {
 	head, _ := splitMessage(body)
-	return collapseSpace(decodeHeader(parseHeader(head).get("Subject")))
+	return CleanDisplay(decodeHeader(parseHeader(head).get("Subject")))
 }
 
 func joinText(have, add string) string {
@@ -110,45 +110,28 @@ func joinText(have, add string) string {
 	return have + "\n" + add
 }
 
+// sanitizeFilename makes a sender's attachment name safe to save and to
+// show: only the last path element is kept; control characters, quotes and
+// Unicode format characters (category Cf: bidirectional overrides that make
+// "invoice\u202Efdp.exe" read as "invoiceexe.pdf", zero-width characters)
+// are removed; leading dots, which hide a file on Unix, are dropped.
 func sanitizeFilename(name string, index int) string {
 	name = strings.ReplaceAll(name, `\`, "/")
 	name = path.Base(strings.TrimSpace(name))
 	name = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || r == '"' {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '"' || r == '\u2028' || r == '\u2029' {
 			return -1
 		}
 		return r
 	}, name)
-	if name == "" || name == "." || name == "/" || name == ".." {
+	name = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(name), "."))
+	if name == "" || name == "/" {
 		return fmt.Sprintf("attachment-%d", index+1)
 	}
 	if len(name) > 255 {
 		name = strings.ToValidUTF8(name[:255], "")
 	}
 	return name
-}
-
-var (
-	scriptRE = regexp.MustCompile(`(?is)<(script|style|head)\b.*?</(script|style|head)\s*>`)
-	breakRE  = regexp.MustCompile(`(?i)<\s*(br|/p|/div|/li|/tr|/h[1-6])\b[^>]*>`)
-	tagRE    = regexp.MustCompile(`(?s)<[^>]*>`)
-)
-
-// HTMLToText is a rough plain-text rendering of HTML, for snippets and for
-// agents when a message has no text part.
-func HTMLToText(h string) string {
-	h = scriptRE.ReplaceAllString(h, " ")
-	h = breakRE.ReplaceAllString(h, "\n")
-	h = tagRE.ReplaceAllString(h, " ")
-	h = html.UnescapeString(h)
-	lines := strings.Split(h, "\n")
-	out := lines[:0]
-	for _, l := range lines {
-		if l = collapseSpace(l); l != "" {
-			out = append(out, l)
-		}
-	}
-	return strings.Join(out, "\n")
 }
 
 // Snippet is the start of the message's new text: quoted lines (">") are

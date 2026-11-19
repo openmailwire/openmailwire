@@ -15,7 +15,7 @@ This guide is for language models that call the OpenMailWire HTTP API. The compl
 
 - Send `Authorization: Bearer omw_…` with every request. Only `/health`, `/openapi.json`, `/llms.txt` and the unsubscribe links (`/u/{token}`) are public.
 - A key belongs to one project and sees only that project's data.
-- `full_access` keys may call everything. `sending_access` keys may only: send (`POST /emails`, `/emails/batch`, `/emails/raw`); list, read and cancel the emails they sent; read domains; list inboxes, read messages and their attachments, and reply. Anything else answers `403 insufficient_permission`.
+- `full_access` keys may call everything. `sending_access` keys may only: send (`POST /emails`, `/emails/batch`, `/emails/raw`); list, read and cancel the emails they sent; read domains; `POST /emails/check` and their own held emails; and, for the inboxes their policy's `inboxes` patterns list, list them, read messages that are not held and their attachments, and reply. Anything else answers `403 insufficient_permission`.
 - A key may carry a policy that the server enforces: recipient caps per hour and per day, allowed recipient patterns, allowed sender patterns, and `require_approval` rules that hold emails for a person to approve. Work within it. Never look for another key or another address to get around a refusal, a hold or a pause.
 - Never print, log or forward the key. It belongs only in the `Authorization` header.
 
@@ -77,6 +77,7 @@ Domains:
 - `GET /domains/{id}/dkim`: its DKIM keys with their records, and authentication problems receivers reported.
 - `POST /domains/{id}/dkim/rotate`: rotate the DKIM key: the first call gives a new record to publish, the next call (once it is published) switches signing to it. The old record stays needed until its `retire_at`. Full access.
 - `POST /domains/{id}/dkim/ed25519`: `{"enabled": true}` adds an Ed25519 signature next to RSA, in the same two steps; `false` removes it. Full access.
+- `GET /domains/{id}/reports`: DMARC aggregate and TLS-RPT reports received at the domain's `report_addresses`: pass rates by source and reporter, unknown senders, TLS failures. `?days=30`. Full access.
 
 Webhooks (full access):
 - `POST /webhooks`: register `{"endpoint": "https://…", "events": [...], "asymmetric_signing": false}`. Returns `signing_secret` (`whsec_…`) once; with `asymmetric_signing`, also `public_key` (`whpk_…`, Ed25519). At most 10 per project (`409 webhook_limit_reached`).
@@ -99,11 +100,13 @@ Inboxes and messages:
 - `POST /inboxes`: create `{"address"}` on one of the project's domains. Full access.
 - `GET /inboxes`: list inboxes.
 - `GET /inboxes/{id}`: one inbox.
+- `PATCH /inboxes/{id}`: `{"hold_unauthenticated": bool}` (default true: mail whose sender is not authenticated is hidden from sending_access keys until released). Full access.
 - `DELETE /inboxes/{id}`: delete an inbox. Full access.
 - `GET /inboxes/{id}/messages`: list received messages, newest first: `?limit&before&thread_id`.
-- `GET /messages/{id}`: read one message: bodies, threading headers, attachment list.
+- `GET /messages/{id}`: read one message: bodies, threading headers, attachment list, `trust` (`authenticated`, `unauthenticated` or `failed`, from SPF, DKIM and DMARC) with `authentication_results`, and the flags `held`, `suspicious_instructions`, `reply_to_mismatch`, `message_id_conflict`.
 - `GET /messages/{id}/attachments/{index}`: download one attachment's bytes.
-- `POST /messages/{id}/reply`: reply `{"text", "html"}` from the inbox, threaded. Returns `{"id", "thread_id"}`: the sent email and its thread.
+- `POST /messages/{id}/reply`: reply `{"text", "html", "to"?}` from the inbox, threaded, to the first Reply-To (or From) unless `to` names others. Returns `{"id", "thread_id", "to", "warnings"?}`: the sent email and its thread.
+- `POST /messages/{id}/release`: show a held message to sending_access keys. Full access.
 - `GET /emails/{id}/replies`: received messages that answer one of your emails (what `wait_for_reply` polls).
 
 Meta (no key):
@@ -180,7 +183,7 @@ Register an https endpoint with `POST /webhooks`. Events:
 - `email.delivery_unknown`: outcome unknown and not retried (`retry_uncertain: false`).
 - `email.canceled`: canceled before its first attempt.
 - `email.complained`: the recipient marked it as spam. Never send to them again.
-- `email.received`: a message arrived in an inbox; `data.email_id` is the message id for `GET /messages/{id}`, `data.inbox` the address, `data.in_reply_to_email_id` the email it answers.
+- `email.received`: a message arrived in an inbox; `data.email_id` is the message id for `GET /messages/{id}`, `data.to` and `data.inbox` the inbox address (`data.header_to` is the message's To header), `data.in_reply_to_email_id` the email it answers, `data.trust` the sender verdict, `data.held` whether it is held.
 - `email.held`: held for approval; `data.approval.reasons` says why.
 - `email.approved` and `email.rejected`: an approver decided; `data.approval` names the key and its note.
 - `sending.paused`: a circuit breaker paused a key, domain or project; `data.pause` has the rate and the pause id to resume.
