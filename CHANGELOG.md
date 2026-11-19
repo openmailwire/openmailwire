@@ -7,7 +7,7 @@
 **Sender verdict on received mail.**
 - Every message to an inbox is checked: SPF for the envelope sender and the HELO name (with the client address the inbound node saw), every DKIM signature, and DMARC alignment with the `From` domain (relaxed or strict, organizational domains from the public-suffix list).
 - `trust` is `authenticated`, `unauthenticated` or `failed`; the details are stored as `authentication_results` (with an RFC 8601 `header`). They are returned by `GET /messages/{id}` and the message list, sent in `email.received` (`data.trust`, `data.authentication`, `data.held`) and shown by the MCP tools.
-- Inbox setting `hold_unauthenticated` (default on; `POST /inboxes`, new `PATCH /inboxes/{id}`): messages that are not `authenticated` are hidden from `sending_access` keys until a full-access key calls the new `POST /messages/{id}/release`. Messages received before the upgrade are not held.
+- Inbox setting `hold_unauthenticated` (default on; `POST /inboxes`, new `PATCH /inboxes/{id}`): messages that are not `authenticated` are hidden from `sending_access` keys until a full-access key calls the new `POST /messages/{id}/release`. Messages received before the upgrade are not held; they show `trust: "unauthenticated"` with empty `authentication_results`, since they were never checked.
 
 **Agents and received text.**
 - MCP inbox tools print every sender-written field (names, addresses, subject, snippet, body, attachment names) quoted, between two marker lines whose tag is random for each call; text shaped like a marker is removed. `read_message` is marked open-world and shows the verdict and warnings. `list_messages` and `wait_for_reply` snippets are framed too.

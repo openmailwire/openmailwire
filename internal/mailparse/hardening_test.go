@@ -158,3 +158,27 @@ func contains(l []string, s string) bool {
 	}
 	return false
 }
+
+// Parse keeps its promises on any input: attachment names are usable,
+// display values are one line without bidi controls.
+func FuzzParse(f *testing.F) {
+	f.Add([]byte("From: =?utf-8?q?A=0AB?= <a@b.test>\r\nContent-Type: multipart/mixed; boundary=a\r\n\r\n--a\r\nContent-Disposition: attachment; filename=\".x‮\"\r\n\r\nx\r\n--a--\r\n"))
+	f.Add([]byte("Content-Type: multipart/mixed; boundary=a\r\n\r\n--a\n--a\n--a--\n"))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > 64<<10 {
+			return
+		}
+		m := Parse(raw)
+		_ = m.Snippet(200)
+		for _, a := range m.Attachments {
+			if a.Filename == "" || strings.HasPrefix(a.Filename, ".") || strings.ContainsAny(a.Filename, "\r\n/‮") {
+				t.Fatalf("bad filename %q", a.Filename)
+			}
+		}
+		for _, v := range append([]string{m.From, m.Subject}, m.To...) {
+			if strings.ContainsAny(v, "\r\n  ‮⁦") {
+				t.Fatalf("display value %q", v)
+			}
+		}
+	})
+}
