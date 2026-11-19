@@ -171,7 +171,7 @@ Network failures are returned as the underlying `net/http` error, wrapped. The S
 
 ## Verifying webhooks
 
-`VerifyWebhook(secret, r.Header, body, tolerance)` returns nil if the request is genuine and fresh. `ParseWebhook` does the same and decodes the body into a `*WebhookEvent`. A `tolerance` of 0 means 5 minutes.
+`VerifyWebhook(secret, r.Header, body, tolerance)` returns nil if the request is genuine and fresh. `ParseWebhook` does the same and decodes the body into a `*WebhookEvent`. A `tolerance` of 0 means 5 minutes. `secret` is the webhook's `whsec_…` signing secret, or, for a webhook created with `asymmetric_signing`, its `whpk_…` public key from `Webhooks.Get` (Ed25519 `v1a` signatures). During a secret rotation requests carry both signatures, so either secret verifies.
 
 - Accepts both header families: `svix-*` (as Resend sends them) and `webhook-*` ([Standard Webhooks](https://www.standardwebhooks.com)).
 - Accepts any one of several space-separated `v1,` signatures.

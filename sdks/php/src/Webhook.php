@@ -12,13 +12,20 @@ final class Webhook
     public const DEFAULT_TOLERANCE = 300;
 
     /**
-     * Checks that a webhook request was signed with $secret ("whsec_…") and is
-     * fresh, and returns its decoded JSON body.
+     * Checks that a webhook request was signed by OpenMailWire and is fresh,
+     * and returns its decoded JSON body.
+     *
+     * $secret is either the webhook's signing secret ("whsec_…"), checked
+     * against the "v1" (HMAC-SHA256) signatures, or its Ed25519 public key
+     * ("whpk_…", from webhooks->get()), checked against the "v1a" signatures
+     * of webhooks created with asymmetric signing. Ed25519 needs the sodium
+     * extension, bundled with PHP since 7.2.
      *
      * - Accepts both header families: svix-id/svix-timestamp/svix-signature and
      *   webhook-id/webhook-timestamp/webhook-signature, in any case.
-     * - Accepts any of several space-separated "v1,<base64>" signatures.
-     * - Compares signatures in constant time (hash_equals).
+     * - Accepts any of several space-separated signatures, so it keeps working
+     *   while a secret is rotated.
+     * - Compares HMAC signatures in constant time (hash_equals).
      * - Refuses timestamps more than $tolerance seconds (default 300) from now.
      *
      * $headers may be getallheaders(), a PSR-7 getHeaders() array (lists of
@@ -59,18 +66,40 @@ final class Webhook
             throw new WebhookVerificationException('webhook timestamp is in the future');
         }
 
-        $encoded = str_starts_with($secret, 'whsec_') ? substr($secret, strlen('whsec_')) : $secret;
-        $key = base64_decode($encoded, true);
-        if ($key === false || $key === '') {
-            throw new WebhookVerificationException('the signing secret is not a valid whsec_… value');
-        }
-
-        $expected = base64_encode(hash_hmac('sha256', $id . '.' . $ts . '.' . $rawBody, $key, true));
+        $signed = $id . '.' . $ts . '.' . $rawBody;
         $ok = false;
-        foreach (explode(' ', $sigs) as $part) {
-            $pieces = explode(',', $part, 2);
-            if (count($pieces) === 2 && $pieces[0] === 'v1' && hash_equals($expected, $pieces[1])) {
-                $ok = true;
+        if (str_starts_with($secret, 'whpk_')) {
+            $publicKey = base64_decode(substr($secret, strlen('whpk_')), true);
+            if ($publicKey === false || strlen($publicKey) !== 32) {
+                throw new WebhookVerificationException('the public key is not a valid whpk_… value');
+            }
+            if (!function_exists('sodium_crypto_sign_verify_detached')) {
+                throw new WebhookVerificationException('verifying a whpk_… public key needs the sodium extension');
+            }
+            foreach (explode(' ', $sigs) as $part) {
+                $pieces = explode(',', $part, 2);
+                if (count($pieces) !== 2 || $pieces[0] !== 'v1a') {
+                    continue;
+                }
+                $signature = base64_decode($pieces[1], true);
+                if ($signature !== false && strlen($signature) === 64
+                    && sodium_crypto_sign_verify_detached($signature, $signed, $publicKey)) {
+                    $ok = true;
+                    break;
+                }
+            }
+        } else {
+            $encoded = str_starts_with($secret, 'whsec_') ? substr($secret, strlen('whsec_')) : $secret;
+            $key = base64_decode($encoded, true);
+            if ($key === false || $key === '') {
+                throw new WebhookVerificationException('the signing secret is not a valid whsec_… value');
+            }
+            $expected = base64_encode(hash_hmac('sha256', $signed, $key, true));
+            foreach (explode(' ', $sigs) as $part) {
+                $pieces = explode(',', $part, 2);
+                if (count($pieces) === 2 && $pieces[0] === 'v1' && hash_equals($expected, $pieces[1])) {
+                    $ok = true;
+                }
             }
         }
         if (!$ok) {

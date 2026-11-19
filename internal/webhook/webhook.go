@@ -3,30 +3,18 @@
 // Requests are signed the way Resend signs them (Svix headers) and also with
 // the Standard Webhooks headers; both use the same HMAC-SHA256 scheme, so an
 // existing Resend webhook handler verifies OpenMailWire requests unchanged.
+// A webhook may also sign with Ed25519 (Standard Webhooks "v1a"), so a
+// receiver can verify with a public key instead of a shared secret.
 package webhook
 
 import (
-	"bytes"
-	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"log/slog"
-	"net"
-	"net/http"
+	"net/netip"
 	"net/url"
-	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
-	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/store"
 )
 
@@ -97,30 +85,6 @@ func ExternalType(internal string) string {
 		return SendingPaused
 	}
 	return ""
-}
-
-// NewSecret returns a signing secret in the "whsec_<base64>" form.
-func NewSecret() string {
-	b := make([]byte, 24)
-	rand.Read(b)
-	return "whsec_" + base64.StdEncoding.EncodeToString(b)
-}
-
-func secretKey(whsec string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(strings.TrimPrefix(whsec, "whsec_"))
-}
-
-// Sign returns the "v1,<base64>" signature of body for message id and unix
-// timestamp ts.
-func Sign(whsec, id string, ts int64, body []byte) (string, error) {
-	key, err := secretKey(whsec)
-	if err != nil {
-		return "", err
-	}
-	m := hmac.New(sha256.New, key)
-	fmt.Fprintf(m, "%s.%d.", id, ts)
-	m.Write(body)
-	return "v1," + base64.StdEncoding.EncodeToString(m.Sum(nil)), nil
 }
 
 type payload struct {
@@ -278,6 +242,13 @@ var Schedule = []time.Duration{5 * time.Second, 5 * time.Minute, 30 * time.Minut
 
 // ValidateEndpoint checks a webhook URL before it is stored.
 func ValidateEndpoint(raw string, allowHTTP bool) error {
+	return ValidateEndpointFor(raw, allowHTTP, true)
+}
+
+// ValidateEndpointFor is ValidateEndpoint that also refuses an IP literal
+// that is not a public address, unless allowPrivate is set. Host names are
+// checked when they are dialed (NewHTTPClient), after DNS.
+func ValidateEndpointFor(raw string, allowHTTP, allowPrivate bool) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return errors.New("endpoint must be an absolute URL")
@@ -294,160 +265,10 @@ func ValidateEndpoint(raw string, allowHTTP bool) error {
 	default:
 		return errors.New("endpoint must use https")
 	}
+	if !allowPrivate {
+		if a, err := netip.ParseAddr(strings.Trim(u.Hostname(), "[]")); err == nil && !Public(a) {
+			return errors.New("endpoint must be a public address; loopback, private and reserved addresses are refused")
+		}
+	}
 	return nil
-}
-
-var errBlocked = errors.New("webhook endpoint resolves to a private or local address")
-
-// NewHTTPClient returns a client that refuses to connect to loopback,
-// private, link-local and other internal addresses unless allowPrivate is
-// set. The check runs on the address actually dialed, after DNS, so a
-// hostname that resolves to an internal IP is refused too.
-func NewHTTPClient(allowPrivate bool) *http.Client {
-	dialer := &net.Dialer{
-		Timeout: 10 * time.Second,
-		Control: func(network, address string, _ syscall.RawConn) error {
-			if allowPrivate {
-				return nil
-			}
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			if ip := net.ParseIP(host); ip == nil || internal(ip) {
-				return errBlocked
-			}
-			return nil
-		},
-	}
-	return &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			Proxy:               nil,
-			DialContext:         dialer.DialContext,
-			TLSHandshakeTimeout: 10 * time.Second,
-			MaxIdleConnsPerHost: 4,
-		},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-}
-
-var cgnat = &net.IPNet{IP: net.IP{100, 64, 0, 0}, Mask: net.CIDRMask(10, 32)}
-
-func internal(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || cgnat.Contains(ip)
-}
-
-// Dispatcher fans events out to webhook deliveries and sends them.
-type Dispatcher struct {
-	Store  *store.Store
-	Sealer *secret.Sealer
-	HTTP   *http.Client
-	Log    *slog.Logger
-	// UserAgent is sent with every request.
-	UserAgent string
-}
-
-// Run works until ctx is cancelled, checking for new events every tick.
-func (d *Dispatcher) Run(ctx context.Context, tick time.Duration) {
-	t := time.NewTicker(tick)
-	defer t.Stop()
-	for {
-		d.Step(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
-}
-
-// Step fans out new events and sends the deliveries that are due.
-func (d *Dispatcher) Step(ctx context.Context) {
-	for {
-		n, err := d.Store.FanoutWebhooks(ctx, 500, Build)
-		if err != nil {
-			if ctx.Err() == nil {
-				d.Log.Error("webhook fanout", "err", err)
-			}
-			break
-		}
-		if n == 0 {
-			break
-		}
-	}
-	due, err := d.Store.ClaimWebhookDeliveries(ctx, 50, 2*time.Minute)
-	if err != nil {
-		if ctx.Err() == nil {
-			d.Log.Error("webhook claim", "err", err)
-		}
-		return
-	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10)
-	for _, w := range due {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(w store.DueWebhook) {
-			defer func() { <-sem; wg.Done() }()
-			d.send(ctx, w)
-		}(w)
-	}
-	wg.Wait()
-}
-
-func (d *Dispatcher) send(ctx context.Context, w store.DueWebhook) {
-	status, err := d.post(ctx, w)
-	ok := err == nil && status >= 200 && status < 300
-	errText := ""
-	if err != nil {
-		errText = err.Error()
-	} else if !ok {
-		errText = "endpoint answered " + strconv.Itoa(status)
-	}
-	var next *time.Time
-	if !ok && w.Attempts <= len(Schedule) {
-		t := time.Now().Add(Schedule[w.Attempts-1])
-		next = &t
-	}
-	if err := d.Store.FinishWebhookDelivery(context.WithoutCancel(ctx), w.ID, ok, status, errText, next); err != nil {
-		d.Log.Error("webhook finish", "delivery", w.ID, "err", err)
-	}
-	if !ok {
-		d.Log.Warn("webhook attempt failed", "delivery", w.ID, "type", w.Type, "attempt", w.Attempts, "err", errText)
-	}
-}
-
-func (d *Dispatcher) post(ctx context.Context, w store.DueWebhook) (int, error) {
-	whsec, err := d.Sealer.Open(w.Secret)
-	if err != nil {
-		return 0, fmt.Errorf("unseal secret: %w", err)
-	}
-	id := "msg_" + strings.ReplaceAll(w.ID, "-", "")
-	ts := time.Now().Unix()
-	sig, err := Sign(string(whsec), id, ts, w.Payload)
-	if err != nil {
-		return 0, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.Endpoint, bytes.NewReader(w.Payload))
-	if err != nil {
-		return 0, err
-	}
-	tsStr := strconv.FormatInt(ts, 10)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", d.UserAgent)
-	req.Header.Set("svix-id", id)
-	req.Header.Set("svix-timestamp", tsStr)
-	req.Header.Set("svix-signature", sig)
-	req.Header.Set("webhook-id", id)
-	req.Header.Set("webhook-timestamp", tsStr)
-	req.Header.Set("webhook-signature", sig)
-	resp, err := d.HTTP.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	resp.Body.Close()
-	return resp.StatusCode, nil
 }

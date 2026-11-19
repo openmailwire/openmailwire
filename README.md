@@ -169,8 +169,9 @@ More detail: [docs/architecture.md](docs/architecture.md).
   - inboxes on your domains, with messages threaded to the emails they answer, attachments, and replies that go through the normal send path;
   - bounce processing: delivery status notifications (RFC 3464) to the signed VERP address mark a delivery `bounced`, even after `delivered`;
   - complaint processing: feedback-loop reports (ARF, RFC 5965) become `email.complained` and suppress the address.
-- Signed webhooks, verifiable by handlers written for Resend. They are retried for about a day and blocked from internal networks.
-- Message bodies and DKIM keys are encrypted at rest (AES-256-GCM). Bodies are purged after the retention window.
+- Signed webhooks, verifiable by handlers written for Resend, and optionally with Ed25519 (Standard Webhooks `v1a`) against a published public key. Secrets rotate with an overlap in which both signatures are sent. Webhooks are retried for about a day, fairly across projects and endpoints, with a circuit breaker per endpoint, and blocked from internal networks.
+- `GET /insights`: acceptance, deferral and bounce rates and time to acceptance, per mailbox provider and per sending IP, over 24 hours, 7 days and 30 days.
+- Message bodies, DKIM keys and webhook secrets are encrypted at rest (AES-256-GCM). Keys rotate online (`OMW_SECRET_KEYS`, `openmailwire rotate-secrets`), and the control plane refuses to start with a key that doesn't match the data. Bodies are purged after the retention window.
 - A web dashboard at `/dashboard/`: emails with per-recipient timelines, domains and their DNS records, webhooks, API keys and inboxes. No build step and no third-party requests.
 - `GET /openapi.json` (OpenAPI 3.1) and `GET /llms.txt` (a guide for models), served without a key.
 - One static binary, `openmailwire`, plays every role: `serve`, `worker`, `submission` or `inbound`.
@@ -510,9 +511,10 @@ A domain name is unique within a project, and among verified domains. Any projec
 
 | Method | Path | |
 |---|---|---|
-| `POST` | `/webhooks` | `{"endpoint": "https://…", "events": ["email.bounced", …]}`. Leave out `events` (or pass `[]`) to get every type. Returns `signing_secret` (`whsec_…`) once. |
+| `POST` | `/webhooks` | `{"endpoint": "https://…", "events": ["email.bounced", …], "asymmetric_signing": false}`. Leave out `events` (or pass `[]`) to get every type. Returns `signing_secret` (`whsec_…`) once; with `asymmetric_signing`, also `public_key` (`whpk_…`). A project has at most 10 webhooks (`OMW_WEBHOOKS_PER_PROJECT`); one more answers `409 webhook_limit_reached`. |
 | `GET` | `/webhooks` | Lists webhooks. |
-| `GET` | `/webhooks/{id}` | One webhook with its 20 most recent deliveries. |
+| `GET` | `/webhooks/{id}` | One webhook with its 20 most recent deliveries, its `public_key`, and its circuit breaker (`consecutive_failures`, `paused_until`). |
+| `POST` | `/webhooks/{id}/rotate-secret` | `{"overlap_seconds": 86400}` (default one day, at most 7 days, 0 for none). Returns the new `signing_secret` once (and a new `public_key`). Until `previous_secret_expires_at`, every request carries signatures by both secrets. |
 | `DELETE` | `/webhooks/{id}` | |
 
 Event types:
@@ -540,7 +542,38 @@ Every event about a sent email is about **one recipient**, and `data.to` holds o
 
 Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's Svix headers (`svix-id`, `svix-timestamp`, `svix-signature`) and once in the [Standard Webhooks](https://www.standardwebhooks.com) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`). A handler written for Resend webhooks verifies them unchanged.
 
-Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed. Endpoints must use `https` and resolve to public addresses (checked when connecting). That way a webhook cannot be used to reach the control plane's internal network.
+- **Ed25519.** A webhook created with `"asymmetric_signing": true` also signs every request with Ed25519, as Standard Webhooks' `v1a,<base64>`, in the same headers. Receivers verify with the `public_key` from `GET /webhooks/{id}` and hold no shared secret. The SDKs' verifiers take either the `whsec_…` secret or the `whpk_…` public key.
+- **Rotation.** `POST /webhooks/{id}/rotate-secret` makes a new secret (and Ed25519 key). During the overlap the header lists both signatures (`v1,<new> v1,<old>`, plus the two `v1a` ones), so a receiver can switch to the new secret at any moment in it. Verifiers accept a request when any listed signature matches.
+
+Delivery:
+
+- Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed.
+- An endpoint must start answering within 10 s and finish within 15 s; answer `2xx` first, then process the event. Connections are reused, and closed after 30 s idle.
+- Endpoints are served fairly. At most 4 requests run per endpoint and 8 per project at once, and a slot is refilled as soon as its request ends, so a slow endpoint never delays another project's.
+- **Circuit breaker**: after 5 failures in a row an endpoint gets no requests for 30 s, doubling with each further failure up to 10 minutes; then one request at a time until one succeeds. Paused deliveries keep their retries.
+- `recent_deliveries[].last_error` says what went wrong in general terms (`timed out: …`, `could not connect: …`, `endpoint answered 500`). The details, which can name internal addresses, go only to the control plane's log.
+- Endpoints must use `https` and resolve to public addresses. Only global unicast is dialed: every range in IANA's special-purpose registries is refused, as are NAT64 addresses that embed a non-public IPv4 address and every 6to4 and Teredo address. The check runs on the address actually dialed, after DNS, so a webhook cannot reach the control plane's internal network.
+
+### Insights
+
+`GET /insights` (full access) reports how receivers treat your mail, from the attempts of the project's emails:
+
+```json
+{"object": "insights", "window_basis": "sent_at", "provider_grouping": "mx_host_suffix",
+ "emails_considered": 1840, "truncated": false,
+ "windows": [{"window": "24h",
+   "total": {"attempts": 412, "accepted": 398, "deferred": 11, "bounced": 3, "unknown": 0,
+             "acceptance_rate": 0.966, "deferral_rate": 0.027, "bounce_rate": 0.007,
+             "time_to_acceptance_p50_seconds": 2.1, "time_to_acceptance_p95_seconds": 64.8},
+   "by_provider": [{"provider": "google", "attempts": 210, …}, {"provider": "microsoft", …}],
+   "by_sending_ip": [{"sending_ip": "203.0.113.7", "attempts": 300, …}]},
+  {"window": "7d", …}, {"window": "30d", …}]}
+```
+
+- Windows (`24h`, `7d`, `30d`) count emails by when they were sent. Rates are per attempt: accepted, deferred or bounced, out of all attempts.
+- Time to acceptance runs from when an email was queued (or scheduled for) to the receiver's acceptance.
+- Providers are recognised by the MX host each attempt talked to (`google`, `microsoft`, `yahoo`, `apple`, `zoho`, `proton`, `fastmail` and more; else `other`).
+- At most the newest 100,000 emails of the last 30 days are read; `truncated` says when the longer windows cover fewer.
 
 ### Agent safety
 
@@ -744,7 +777,7 @@ Delivering mail yourself is mostly about IP reputation and DNS hygiene, not code
 1. Port 25 must be open outbound. Many clouds block it by default.
 2. Each worker needs a static IPv4, matching reverse DNS (PTR), and a clean blocklist history.
 3. Publish one SPF include listing your workers' IPs and set `OMW_SPF_INCLUDE`.
-4. Put TLS in front of the control plane, back up PostgreSQL, and back up `OMW_SECRET_KEY`.
+4. Put TLS in front of the control plane, back up PostgreSQL, and back up `OMW_SECRET_KEY` (or `OMW_SECRET_KEYS`) apart from it. See [rotating keys](docs/production.md#rotating-secrets).
 5. Ramp volume up slowly and watch Google Postmaster Tools.
 
 ## Configuration
@@ -754,7 +787,8 @@ Control plane (`openmailwire serve`):
 | Variable | Default | |
 |---|---|---|
 | `DATABASE_URL` | none | PostgreSQL connection string. |
-| `OMW_SECRET_KEY` | none | 32 bytes, base64 (`openmailwire keygen`). Encrypts DKIM keys and queued messages. |
+| `OMW_SECRET_KEY` | none | 32 bytes, base64 (`openmailwire keygen`). Encrypts DKIM keys, webhook secrets and queued messages. The control plane refuses to start if it doesn't open the data in the database. |
+| `OMW_SECRET_KEYS` | none | Several keys, comma-separated, for rotation: the first encrypts new values, the others only decrypt old ones. Replaces `OMW_SECRET_KEY`, which, if also set, must be one of them. See [rotating keys](docs/production.md#rotating-secrets). |
 | `OMW_LISTEN` | `127.0.0.1:8080` | Set `:8080` (or a specific address) to accept connections from other machines, e.g. behind a reverse proxy on another host. |
 | `OMW_RATE_LIMIT` | `20` | Requests per second each API key may make on average; `0` turns the limit off. Counted per control plane. |
 | `OMW_RATE_LIMIT_BURST` | twice the rate | Requests a key may make at once. |
@@ -777,6 +811,7 @@ Control plane (`openmailwire serve`):
 | `OMW_ALLOW_UNVERIFIED` | `false` | Development only. |
 | `OMW_WEBHOOK_ALLOW_HTTP` | `false` | Development only: accept `http://` webhook endpoints. |
 | `OMW_WEBHOOK_ALLOW_PRIVATE` | `false` | Development only: allow webhook endpoints on localhost or private networks. |
+| `OMW_WEBHOOKS_PER_PROJECT` | `10` | Most webhooks a project may have. |
 
 Worker (`openmailwire worker`):
 
@@ -832,6 +867,8 @@ A **relay worker** is an ordinary worker with `OMW_RELAY_HOST` set. It needs its
 Relay workers take only deliveries that already had `OMW_RELAY_AFTER_ATTEMPTS` attempts, or whose domain is paused by throttling. While one is live (a heartbeat in the last 2 minutes), direct workers leave those deliveries to it. Without one, nothing changes.
 
 Worker admin: `openmailwire workers list` (with each worker's kind, `direct` or `relay`), `openmailwire workers drain <name>` (stop new jobs, finish current ones), `openmailwire workers resume <name>`.
+
+Key rotation (it reads `DATABASE_URL` and `OMW_SECRET_KEYS`): `openmailwire rotate-secrets [--batch N] [--pause 50ms]` re-encrypts every stored secret with the first key, online, in small transactions. It says when the old keys can be removed. See [docs/production.md](docs/production.md#rotating-secrets).
 
 API key admin (it reads `DATABASE_URL`):
 

@@ -32,15 +32,48 @@ async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array
   return new Uint8Array(await subtle.sign("HMAC", k, data));
 }
 
+function base64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Verifies an Ed25519 signature, with Web Crypto where it has Ed25519, else node:crypto. */
+async function ed25519Verify(publicKey: Uint8Array, data: Uint8Array, signature: Uint8Array): Promise<boolean> {
+  if (publicKey.length !== 32 || signature.length !== 64) return false;
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle) {
+    try {
+      const k = await subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
+      return await subtle.verify({ name: "Ed25519" }, k, signature, data);
+    } catch {
+      // This runtime's Web Crypto has no Ed25519: use node:crypto below.
+    }
+  }
+  try {
+    const nodeCrypto = await import("node:crypto");
+    const key = nodeCrypto.createPublicKey({
+      key: { kty: "OKP", crv: "Ed25519", x: base64Url(publicKey) },
+      format: "jwk",
+    });
+    return nodeCrypto.verify(null, data, key, signature);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Checks that a webhook request was signed by OpenMailWire with `secret`
- * (`whsec_…`) and is fresh, and returns its parsed JSON body.
+ * Checks that a webhook request was signed by OpenMailWire and is fresh, and
+ * returns its parsed JSON body.
+ *
+ * `secret` is either the webhook's signing secret (`whsec_…`), checked against
+ * the `v1` (HMAC-SHA256) signatures, or its Ed25519 public key (`whpk_…`, from
+ * `webhooks.get`), checked against the `v1a` signatures of webhooks created
+ * with `asymmetric_signing`.
  *
  * - Accepts both header families: `svix-id`/`svix-timestamp`/`svix-signature`
  *   and `webhook-id`/`webhook-timestamp`/`webhook-signature`.
- * - Accepts any of several space-separated `v1,<base64>` signatures, so it keeps
- *   working while a secret is rotated.
- * - Compares signatures in constant time.
+ * - Accepts any of several space-separated signatures, so it keeps working
+ *   while a secret is rotated.
+ * - Compares HMAC signatures in constant time.
  * - Refuses timestamps more than `toleranceSeconds` (default 300) away from now.
  *
  * Pass the body exactly as received (a string or bytes), before any JSON
@@ -74,26 +107,49 @@ export async function verifyWebhook(
   if (now - timestamp > toleranceSeconds) throw new WebhookVerificationError("webhook timestamp is too old");
   if (timestamp - now > toleranceSeconds) throw new WebhookVerificationError("webhook timestamp is in the future");
 
-  let key: Uint8Array;
-  try {
-    key = base64ToBytes(secret.startsWith("whsec_") ? secret.slice("whsec_".length) : secret);
-  } catch {
-    throw new WebhookVerificationError("the signing secret is not a valid whsec_… value");
-  }
-  if (key.length === 0) throw new WebhookVerificationError("the signing secret is empty");
-
   const body = toBytes(rawBody);
   const prefix = utf8(`${id}.${ts}.`);
   const signed = new Uint8Array(prefix.length + body.length);
   signed.set(prefix, 0);
   signed.set(body, prefix.length);
-  const expected = bytesToBase64(await hmacSha256(key, signed));
 
   let ok = false;
-  for (const part of sigs.split(" ")) {
-    const comma = part.indexOf(",");
-    if (comma < 0 || part.slice(0, comma) !== "v1") continue;
-    if (timingSafeEqual(part.slice(comma + 1), expected)) ok = true;
+  if (secret.startsWith("whpk_")) {
+    let publicKey: Uint8Array;
+    try {
+      publicKey = base64ToBytes(secret.slice("whpk_".length));
+    } catch {
+      throw new WebhookVerificationError("the public key is not a valid whpk_… value");
+    }
+    if (publicKey.length !== 32) throw new WebhookVerificationError("the public key is not a valid whpk_… value");
+    for (const part of sigs.split(" ")) {
+      const comma = part.indexOf(",");
+      if (comma < 0 || part.slice(0, comma) !== "v1a") continue;
+      let sig: Uint8Array;
+      try {
+        sig = base64ToBytes(part.slice(comma + 1));
+      } catch {
+        continue;
+      }
+      if (await ed25519Verify(publicKey, signed, sig)) {
+        ok = true;
+        break;
+      }
+    }
+  } else {
+    let key: Uint8Array;
+    try {
+      key = base64ToBytes(secret.startsWith("whsec_") ? secret.slice("whsec_".length) : secret);
+    } catch {
+      throw new WebhookVerificationError("the signing secret is not a valid whsec_… value");
+    }
+    if (key.length === 0) throw new WebhookVerificationError("the signing secret is empty");
+    const expected = bytesToBase64(await hmacSha256(key, signed));
+    for (const part of sigs.split(" ")) {
+      const comma = part.indexOf(",");
+      if (comma < 0 || part.slice(0, comma) !== "v1") continue;
+      if (timingSafeEqual(part.slice(comma + 1), expected)) ok = true;
+    }
   }
   if (!ok) throw new WebhookVerificationError("no webhook signature matches");
 

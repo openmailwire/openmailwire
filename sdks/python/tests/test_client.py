@@ -300,6 +300,26 @@ class ClientTest(unittest.TestCase):
             client.domains.list()
         self.assertEqual((cm.exception.status_code, cm.exception.name, cm.exception.message), (502, "http_error", "Bad Gateway"))
 
+    def test_redirects_are_refused(self):
+        # R4#10: the key must never follow a redirect to another address.
+        other = MockServer(lambda r: (200, {"object": "list", "data": []}, {}))
+        self.addCleanup(other.close)
+        client = self.serve(lambda r: (307, "", {"Location": other.url + "/domains"}))
+        with self.assertRaises(OpenMailWireError) as cm:
+            client.domains.list()
+        self.assertEqual((cm.exception.status_code, cm.exception.name), (307, "redirect_refused"))
+        self.assertIn(other.url, cm.exception.message)
+        self.assertEqual(other.requests, [])
+        self.assertEqual(self.mock.requests[0].headers["Authorization"], "Bearer " + KEY)
+
+        # An opener that does follow redirects still never forwards the key.
+        import urllib.request
+
+        following = OpenMailWire(api_key=KEY, base_url=self.mock.url, opener=urllib.request.build_opener())
+        following.domains.list()
+        self.assertEqual(len(other.requests), 1)
+        self.assertIsNone(other.requests[0].headers.get("Authorization"))
+
     def test_connection_error(self):
         srv = MockServer(lambda r: None)
         url = srv.url

@@ -26,7 +26,7 @@ services:
       retries: 30
 
   mailpit:
-    image: axllent/mailpit:latest
+    image: axllent/mailpit:v1.33.1
     ports:
       - "127.0.0.1:8025:8025"
 
@@ -36,6 +36,8 @@ services:
     environment:
       DATABASE_URL: postgres://openmailwire:openmailwire@postgres:5432/openmailwire?sslmode=disable
       OMW_SECRET_KEY: ${OMW_SECRET_KEY:-}
+      # To rotate: OMW_SECRET_KEYS=new,old, then `openmailwire rotate-secrets`.
+      OMW_SECRET_KEYS: ${OMW_SECRET_KEYS:-}
       OMW_LISTEN: ":8080"
     ports:
       - "127.0.0.1:8080:8080"

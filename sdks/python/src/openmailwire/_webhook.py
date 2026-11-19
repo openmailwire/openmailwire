@@ -7,6 +7,7 @@ import re
 import time
 from typing import Any, Dict, Mapping, Optional, Union
 
+from . import _ed25519
 from ._errors import WebhookVerificationError
 
 _TIMESTAMP = re.compile(r"^\d{1,15}$")
@@ -35,13 +36,19 @@ def verify_webhook(
     raw_body: Union[bytes, str],
     tolerance: float = 300,
 ) -> Dict[str, Any]:
-    """Check that a webhook request was signed by OpenMailWire with ``secret``
-    (``whsec_…``) and is fresh, and return its parsed JSON body.
+    """Check that a webhook request was signed by OpenMailWire and is fresh,
+    and return its parsed JSON body.
+
+    ``secret`` is either the webhook's signing secret (``whsec_…``), checked
+    against the ``v1`` (HMAC-SHA256) signatures, or its Ed25519 public key
+    (``whpk_…``, from ``webhooks.get``), checked against the ``v1a``
+    signatures of webhooks created with ``asymmetric_signing``.
 
     - Accepts both header families: ``svix-id``/``svix-timestamp``/``svix-signature``
       and ``webhook-id``/``webhook-timestamp``/``webhook-signature``, in any case.
-    - Accepts any of several space-separated ``v1,<base64>`` signatures.
-    - Compares signatures in constant time.
+    - Accepts any of several space-separated signatures, so it keeps working
+      while a secret is rotated.
+    - Compares HMAC signatures in constant time.
     - Refuses timestamps more than ``tolerance`` seconds (default 300) from now.
 
     Pass the body exactly as received, before any JSON parsing.
@@ -70,23 +77,41 @@ def verify_webhook(
     if timestamp - now > tolerance:
         raise WebhookVerificationError("webhook timestamp is in the future")
 
-    encoded = secret[len("whsec_"):] if secret.startswith("whsec_") else secret
-    try:
-        key = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError):
-        raise WebhookVerificationError("the signing secret is not a valid whsec_… value") from None
-    if not key:
-        raise WebhookVerificationError("the signing secret is empty")
-
     body = raw_body.encode("utf-8") if isinstance(raw_body, str) else bytes(raw_body)
-    mac = hmac.new(key, f"{msg_id}.{ts}.".encode("utf-8") + body, hashlib.sha256)
-    expected = base64.b64encode(mac.digest())
+    signed = f"{msg_id}.{ts}.".encode("utf-8") + body
 
     ok = False
-    for part in sigs.split(" "):
-        version, sep, sig = part.partition(",")
-        if sep and version == "v1" and hmac.compare_digest(sig.encode("utf-8"), expected):
-            ok = True
+    if secret.startswith("whpk_"):
+        try:
+            public_key = base64.b64decode(secret[len("whpk_"):], validate=True)
+        except (binascii.Error, ValueError):
+            raise WebhookVerificationError("the public key is not a valid whpk_… value") from None
+        if len(public_key) != 32:
+            raise WebhookVerificationError("the public key is not a valid whpk_… value")
+        for part in sigs.split(" "):
+            version, sep, sig = part.partition(",")
+            if not sep or version != "v1a":
+                continue
+            try:
+                raw_sig = base64.b64decode(sig, validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            if _ed25519.verify(public_key, signed, raw_sig):
+                ok = True
+                break
+    else:
+        encoded = secret[len("whsec_"):] if secret.startswith("whsec_") else secret
+        try:
+            key = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise WebhookVerificationError("the signing secret is not a valid whsec_… value") from None
+        if not key:
+            raise WebhookVerificationError("the signing secret is empty")
+        expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest())
+        for part in sigs.split(" "):
+            version, sep, sig = part.partition(",")
+            if sep and version == "v1" and hmac.compare_digest(sig.encode("utf-8"), expected):
+                ok = True
     if not ok:
         raise WebhookVerificationError("no webhook signature matches")
 

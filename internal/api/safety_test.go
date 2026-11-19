@@ -81,8 +81,8 @@ func TestIPLimiter(t *testing.T) {
 		"[2001:db8:1:2:3:4:5:6]:443": "2001:db8:1:2::/64",
 		"[2001:db8:1:2:ffff::1]:443": "2001:db8:1:2::/64",
 	} {
-		if got := unsubKey(netip.MustParseAddrPort(addr).Addr()); got != want {
-			t.Errorf("unsubKey(%s) = %s, want %s", addr, got, want)
+		if got := unsubBucketKey(netip.MustParseAddrPort(addr).Addr()); got != want {
+			t.Errorf("unsubBucketKey(%s) = %s, want %s", addr, got, want)
 		}
 	}
 }

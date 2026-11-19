@@ -76,10 +76,12 @@ Domains:
 - `DELETE /domains/{id}`: remove it. Full access.
 
 Webhooks (full access):
-- `POST /webhooks`: register `{"endpoint": "https://…", "events": [...]}`. Returns `signing_secret` (`whsec_…`) once.
+- `POST /webhooks`: register `{"endpoint": "https://…", "events": [...], "asymmetric_signing": false}`. Returns `signing_secret` (`whsec_…`) once; with `asymmetric_signing`, also `public_key` (`whpk_…`, Ed25519). At most 10 per project (`409 webhook_limit_reached`).
 - `GET /webhooks`: list webhooks.
-- `GET /webhooks/{id}`: one webhook with its 20 most recent deliveries.
+- `GET /webhooks/{id}`: one webhook with its 20 most recent deliveries, `public_key` and circuit breaker (`consecutive_failures`, `paused_until`).
+- `POST /webhooks/{id}/rotate-secret`: `{"overlap_seconds": 86400}`. Returns the new `signing_secret` once; both secrets sign until the overlap ends.
 - `DELETE /webhooks/{id}`: stop sending to it.
+- `GET /insights`: acceptance, deferral and bounce rates and time to acceptance per mailbox provider and sending IP, for 24h, 7d and 30d.
 
 API keys (full access):
 - `POST /api-keys`: create `{"name", "permission", "policy", "allowed_ips"?, "expires_at"?}`. Returns `token` (`omw_…`) once.
@@ -188,7 +190,9 @@ Verify every request before trusting it. Each carries `svix-id`, `svix-timestamp
 3. Compare it in constant time with the value after `v1,` in the signature header (it may list several, space-separated).
 4. Reject timestamps more than 5 minutes from now, and drop repeated ids.
 
-A Resend webhook handler, or any Svix or Standard Webhooks library, does this unchanged. Answer 2xx quickly; anything else is retried for about a day.
+A Resend webhook handler, or any Svix or Standard Webhooks library, does this unchanged. A webhook created with `asymmetric_signing` also carries `v1a,<base64>` Ed25519 signatures over the same string; verify them with its `public_key` (`whpk_…`). During a secret rotation the header lists signatures by both secrets: accept the request when any one matches.
+
+Answer 2xx within 10 seconds, then do the work; anything else is retried for about a day. After 5 failures in a row the endpoint is paused for a while (`paused_until` in `GET /webhooks/{id}`).
 
 ## MCP
 

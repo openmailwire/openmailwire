@@ -3,7 +3,6 @@ package config
 
 import (
 	"crypto/x509"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -18,7 +17,7 @@ import (
 type Control struct {
 	DatabaseURL       string
 	Listen            string
-	SecretKey         []byte
+	SecretKey         []byte // seals new values: the first of SecretKeys
 	ReturnPathLabel   string
 	SPFInclude        string
 	BounceMX          string
@@ -47,6 +46,9 @@ type Control struct {
 	// reach this control plane, e.g. https://mail.example.com. Broadcast
 	// mail needs it for its one-click unsubscribe links (lane B).
 	PublicURL string
+	// Platform (secrets.go).
+	SecretKeys         [][]byte // open sealed values: OMW_SECRET_KEYS, or OMW_SECRET_KEY
+	WebhooksPerProject int      // OMW_WEBHOOKS_PER_PROJECT
 }
 
 // DatabaseURL returns DATABASE_URL or an error when it is unset.
@@ -72,12 +74,8 @@ func LoadControl() (Control, error) {
 	if c.DatabaseURL, err = DatabaseURL(); err != nil {
 		return c, err
 	}
-	raw := os.Getenv("OMW_SECRET_KEY")
-	if raw == "" {
-		return c, errors.New("OMW_SECRET_KEY is not set; generate one with `openmailwire keygen`")
-	}
-	if c.SecretKey, err = base64.StdEncoding.DecodeString(raw); err != nil || len(c.SecretKey) != 32 {
-		return c, errors.New("OMW_SECRET_KEY must be 32 bytes, base64 encoded; generate one with `openmailwire keygen`")
+	if err := c.loadPlatform(); err != nil { // OMW_SECRET_KEYS and webhook limits (secrets.go)
+		return c, err
 	}
 	if c.AllowUnverified, err = envBool("OMW_ALLOW_UNVERIFIED", false); err != nil {
 		return c, err

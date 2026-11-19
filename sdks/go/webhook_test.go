@@ -152,3 +152,65 @@ func TestVerifyWebhookBadInput(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Ed25519 ("v1a"). The request vector is pinned on the server side by
+// internal/webhook TestSDKVector (seed 00 01 … 1f); every SDK checks it.
+const (
+	v1aPublicKey = "whpk_A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+	v1aID        = "msg_2Lh9KQHvQbLvjGF3s3hQqZ1u"
+	v1aTS        = "1700000000"
+	v1aBody      = `{"type":"email.delivered","data":{"email_id":"e1"}}`
+	v1aSig       = "v1a,De0zbXw3fa+WDUWMYmuFVJsBTTtbEkQJi1dS49Vm48H2mguOCtQ8embnNXP20I+H5cLV4SkJSc/+h7BGhrm2Dw=="
+)
+
+func v1aHeader(sig string) http.Header {
+	h := http.Header{}
+	h.Set("webhook-id", v1aID)
+	h.Set("webhook-timestamp", v1aTS)
+	h.Set("webhook-signature", sig)
+	return h
+}
+
+func TestVerifyWebhookV1a(t *testing.T) {
+	ev, err := ParseWebhook(v1aPublicKey, v1aHeader(v1aSig), []byte(v1aBody), forever)
+	if err != nil || ev.Data.EmailID != "e1" {
+		t.Fatalf("v1a vector: %v %+v", err, ev)
+	}
+	// Next to v1 signatures and during a rotation (two v1a signatures).
+	other := "v1a," + base64.StdEncoding.EncodeToString(make([]byte, 64))
+	if err := VerifyWebhook(v1aPublicKey, v1aHeader("v1,AAAA "+other+" "+v1aSig), []byte(v1aBody), forever); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		secret, sig, body string
+		want              error
+	}{
+		"changed body":       {v1aPublicKey, v1aSig, `{"type":"email.bounced"}`, ErrWebhookSignature},
+		"HMAC secret":        {testSecret, v1aSig, v1aBody, ErrWebhookSignature},
+		"labelled v1":        {v1aPublicKey, "v1," + v1aSig[4:], v1aBody, ErrWebhookSignature},
+		"short public key":   {"whpk_AAAA", v1aSig, v1aBody, ErrWebhookSecret},
+		"invalid public key": {"whpk_***", v1aSig, v1aBody, ErrWebhookSecret},
+	} {
+		if err := VerifyWebhook(tc.secret, v1aHeader(tc.sig), []byte(tc.body), forever); !errors.Is(err, tc.want) {
+			t.Errorf("%s: got %v, want %v", name, err, tc.want)
+		}
+	}
+	if err := VerifyWebhook(v1aPublicKey, v1aHeader(v1aSig), []byte(v1aBody), 0); !errors.Is(err, ErrWebhookTimestamp) {
+		t.Fatalf("old vector within the default tolerance: %v", err)
+	}
+}
+
+// A timestamp in the year 292277026596 overflowed the age arithmetic and
+// passed the 5-minute tolerance.
+func TestVerifyWebhookFarFutureTimestamp(t *testing.T) {
+	for _, ts := range []string{"9223372036854775807", "999999999999999", "1000000000000000"} {
+		unix, _ := strconv.ParseInt(ts, 10, 64)
+		h := http.Header{}
+		h.Set("webhook-id", "msg_1")
+		h.Set("webhook-timestamp", ts)
+		h.Set("webhook-signature", sign(testSecret, "msg_1", unix, testBody))
+		if err := VerifyWebhook(testSecret, h, testBody, 0); !errors.Is(err, ErrWebhookTimestamp) {
+			t.Errorf("timestamp %s: %v", ts, err)
+		}
+	}
+}

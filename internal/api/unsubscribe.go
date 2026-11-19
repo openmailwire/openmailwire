@@ -120,7 +120,7 @@ func writeUnsubPage(w http.ResponseWriter, status int, title, text string, form 
 // unsubAllowed applies the per-IP limit, answering 429 when it is used up.
 func (s *Server) unsubAllowed(w http.ResponseWriter, r *http.Request) bool {
 	s.safety.init()
-	wait := s.safety.unsub.take(unsubKey(s.clientIP(r)), time.Now())
+	wait := s.safety.unsub.take(unsubBucketKey(s.clientIP(r)), time.Now())
 	if wait <= 0 {
 		return true
 	}
@@ -176,7 +176,7 @@ func (s *Server) unsubscribeNow(w http.ResponseWriter, r *http.Request) {
 // IP as clientIP (hardening.go) resolves it, behind trusted proxies too.
 // IPv6 clients are counted per /64, since one host usually has the whole
 // prefix.
-func unsubKey(ip netip.Addr) string {
+func unsubBucketKey(ip netip.Addr) string {
 	if !ip.IsValid() {
 		return "unknown"
 	}

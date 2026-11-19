@@ -338,7 +338,23 @@ export class OpenMailWire {
     let res: Response;
     let text: string;
     try {
-      res = await this.#fetch(url, { method, headers, body, signal: AbortSignal.timeout(this.#timeoutMs) });
+      // Redirects are not followed, so the API key is never sent to another address.
+      res = await this.#fetch(url, {
+        method,
+        headers,
+        body,
+        redirect: "manual",
+        signal: AbortSignal.timeout(this.#timeoutMs),
+      });
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        const location = res.headers.get("location");
+        throw new OpenMailWireError(
+          res.status,
+          "redirect_refused",
+          `${method} ${this.baseUrl}${path} answered ${res.status}, a redirect to ${location ?? "another address"}. ` +
+            "Redirects are not followed, so the API key never goes elsewhere: set baseUrl to the address the API answers at.",
+        );
+      }
       if (!res.ok) throw await toError(res);
       if (opts.binary) return new Uint8Array(await res.arrayBuffer()) as T;
       text = await res.text();

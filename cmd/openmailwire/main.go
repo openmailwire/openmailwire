@@ -48,6 +48,7 @@ Usage:
   openmailwire inbound                        run an inbound SMTP node (inboxes, bounces, complaints)
   openmailwire migrate                        apply database migrations
   openmailwire keygen                         print a new OMW_SECRET_KEY
+  openmailwire rotate-secrets                 reseal stored secrets with the first key of OMW_SECRET_KEYS (online)
   openmailwire project create <name>          create a project and its first API key
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
                        [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
@@ -93,6 +94,8 @@ func main() {
 		}
 	case "keygen":
 		fmt.Println(secret.NewKey())
+	case "rotate-secrets":
+		err = rotateSecrets(ctx, args)
 	case "project":
 		err = projectCmd(ctx, args)
 	case "apikey":
@@ -132,7 +135,7 @@ func serve(ctx context.Context, log *slog.Logger) error {
 	if err := st.Migrate(ctx); err != nil {
 		return err
 	}
-	sealer, err := secret.NewSealer(cfg.SecretKey)
+	sealer, macRoot, err := openSecrets(ctx, st, cfg.SecretKeys, log) // checks the keys against the data (secrets.go)
 	if err != nil {
 		return err
 	}
@@ -140,7 +143,7 @@ func serve(ctx context.Context, log *slog.Logger) error {
 		log.Warn("OMW_ALLOW_UNVERIFIED is on: unverified domains can send. Never use this in production.")
 	}
 	srv := &api.Server{
-		Store: st, Sealer: sealer, MACKey: secret.Derive(cfg.SecretKey, "openmailwire/verp"),
+		Store: st, Sealer: sealer, MACKey: secret.Derive(macRoot, "openmailwire/verp"),
 		Resolver: domains.NewResolver(cfg.DNSServer), Cfg: cfg, Log: log, Version: version,
 	}
 	httpSrv := newHTTPServer(cfg.Listen, srv.Handler())

@@ -2,6 +2,10 @@ module github.com/openmailwire/openmailwire
 
 go 1.25.0
 
+// Releases and CI build with the newest Go 1.27 patch release; the go
+// directive stays at 1.25.0 so older local toolchains still build.
+toolchain go1.27.4
+
 require (
 	github.com/emersion/go-msgauth v0.7.0
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6

@@ -3,6 +3,14 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # Weekly, so a newly published vulnerability shows up without a push.
+    - cron: "17 4 * * 1"
+
+# Every action is pinned by commit SHA (the version is in the comment); a
+# job asks for more than read access only when it needs it.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -22,15 +30,19 @@ jobs:
           --health-timeout 5s
           --health-retries 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The newest stable Go, not go.mod's minimum: release binaries must
-          # carry current standard-library security fixes.
-          go-version: stable
+          persist-credentials: false
+      # The newest Go 1.27 patch release, never the patch named in go.mod:
+      # the standard library's security fixes ship in patch releases.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: "1.27.x"
           check-latest: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - run: node --test internal/dashboard/tests/*.test.mjs
@@ -38,3 +50,18 @@ jobs:
         env:
           OMW_TEST_DATABASE_URL: postgres://openmailwire:openmailwire@localhost:5432/openmailwire_test?sslmode=disable
       - run: docker build -t openmailwire:ci .
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+      # Fails when the code reaches a known vulnerability, in a dependency or
+      # in the standard library of the Go that builds the release.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

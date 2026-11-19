@@ -65,6 +65,33 @@ Server-enforced rules for agents, on every path that sends (`POST /emails`, batc
 
 **Configuration.** `OMW_PUBLIC_URL`. **Migration** `0007_agent_safety.sql`, which also backfills the project contacts from past deliveries. `golang.org/x/net` (already in the module graph) becomes a direct dependency, for the public suffix list.
 
+### Platform, webhooks and supply chain (v0.6, lane E)
+
+**Fixed**
+- **Webhook events were lost under concurrent sends (audit R1#1, R4#1).** Fan-out followed a cursor over event ids, which are taken at insert, not at commit, so an event committed after a higher id had been fanned out never got its webhook (up to 1,973 of 2,400 `email.sent` in the audit). Each event now carries a `fanned_out` flag. Fan-out claims events with `FOR UPDATE SKIP LOCKED` through a partial index, and sees an event only once its transaction has committed. Events not yet fanned out at upgrade are still delivered; older ones are marked done.
+- **One project's slow endpoints delayed every other project's webhooks (R4#4; 75 s in the audit).** Claims now pick webhooks, oldest due first, and give each a bounded share: at most 4 requests per endpoint and 8 per project in flight. A slot is refilled as soon as its request ends instead of after a whole batch. An endpoint must answer within 10 s (time to first byte; 15 s in all). A project has at most 10 webhooks (`OMW_WEBHOOKS_PER_PROJECT`; one more answers `409 webhook_limit_reached`).
+- **Circuit breaker per endpoint:** after 5 failures in a row, no requests for 30 s, doubling up to 10 minutes, then one probe at a time. Paused deliveries keep their retries. `GET /webhooks/{id}` shows `consecutive_failures` and `paused_until`.
+- **Webhook connections never closed (R4#6).** Idle connections now close after 30 s, with caps on idle connections overall and per host and on connections per host.
+- **The webhook address guard missed NAT64 and 6to4 (R4#7).** Only global unicast addresses are dialed now, minus every range in the IANA special-purpose registries. NAT64 addresses are judged by the IPv4 address they carry; local-use NAT64, 6to4 and Teredo are refused. An IP literal that is not public is refused when the webhook is created.
+- **`last_error` revealed internal addresses (R4#8)** such as `dial tcp [::1]:5432`. Projects now see a generic cause (`timed out: …`, `could not connect: …`); a name that doesn't resolve and one that resolves to a refused address read the same. Details go to the log.
+- **Releases were built with Go 1.25.0 (R4#2, R4#3)**, which govulncheck found reaching 45 standard-library vulnerabilities. CI and releases now build with the newest Go 1.27 patch release (`check-latest`), `go.mod` names `toolchain go1.27.4` (the `go` directive stays 1.25.0), and `govulncheck` runs on every push and weekly. The image builds on `golang:1.27-alpine` and runs on `alpine:3.24`.
+- **Workflow hardening (R4#11):** every action is pinned by commit SHA; every workflow defaults to `contents: read` and each release job asks only for what it needs; release binaries are built outside the checkout (`vcs.modified=false`, checked); release archives, `checksums.txt` and the image get signed build provenance (`actions/attest-build-provenance`, verifiable with `gh attestation verify`), and the attestation bundle is published with each release.
+- **The Python SDK sent the API key on redirects (R4#10).** It now refuses redirects (`redirect_refused`) and marks the key unredirectable even with a caller's own opener. The Node and Go SDKs now refuse redirects too (Go forwarded the key on same-host redirects, including to `http://`); PHP never followed them and now names the error the same way.
+- **The Go SDK accepted a timestamp of 9223372036854775807**, which overflowed the age check. Timestamps are limited to 15 digits, as in the other SDKs.
+- **Start-up key check:** the control plane refuses to start when `OMW_SECRET_KEY` doesn't open the data in the database, with a message that says which key is missing.
+
+**Added**
+- **Secret rotation.** `OMW_SECRET_KEYS=new,old` holds several keys: the first seals new values, all of them open old ones. Sealed values now record the id of their key. `openmailwire rotate-secrets` re-encrypts every stored secret online, in small transactions, and reports when the old keys can be removed. `OMW_SECRET_KEY` keeps working. Bounce (VERP) addresses keep verifying across rotations.
+- **Webhook secret rotation:** `POST /webhooks/{id}/rotate-secret` `{"overlap_seconds"}` (default one day, at most 7 days). During the overlap every request is signed with both secrets.
+- **Ed25519 webhook signatures** (Standard Webhooks `v1a`): `"asymmetric_signing": true` on `POST /webhooks`; the public key (`whpk_…`) is in `GET /webhooks/{id}`. The four SDK verifiers accept a `whpk_…` key (Python in pure Python, PHP through sodium).
+- **`GET /insights`** (full access): acceptance, deferral and bounce rates and p50/p95 time to acceptance, per mailbox provider (from the MX host) and per sending IP, over 24 hours, 7 days and 30 days. Bounded to the newest 100,000 emails of 30 days, through indexes.
+
+**Upgrade notes**
+- Migration `0010_platform.sql` adds `events.fanned_out` without rewriting the table, and builds small indexes on `events`, `webhooks` and `webhook_deliveries`. `webhook_cursor` is no longer used.
+- The first start of v0.6 registers the key it is given, after checking that it opens the existing data. Keep using the same `OMW_SECRET_KEY`.
+- Projects with more than 10 webhooks keep them, but cannot add more unless `OMW_WEBHOOKS_PER_PROJECT` is raised.
+- Webhook endpoints that take longer than 10 s to start answering now time out.
+
 ## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
 ### SMTP submission and raw messages (v0.5)

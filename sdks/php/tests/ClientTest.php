@@ -335,6 +335,23 @@ final class ClientTest extends TestCase
         }
     }
 
+    public function testRedirectsAreRefused(): void
+    {
+        // R4#10: the Python SDK forwarded Authorization on redirects; this one
+        // never follows a redirect at all.
+        self::$mock->enqueue(['status' => 307, 'headers' => ['Location' => self::$mock->url . '/elsewhere'], 'text' => '']);
+        try {
+            $this->client->domains->list();
+            $this->fail('no exception');
+        } catch (OpenMailWireException $e) {
+            $this->assertSame(307, $e->statusCode);
+            $this->assertSame('redirect_refused', $e->name);
+            $this->assertStringContainsString('/elsewhere', $e->getMessage());
+        }
+        $this->assertCount(1, self::$mock->requests());
+        $this->assertSame('/domains', self::$mock->last()['path']);
+    }
+
     public function testConnectionError(): void
     {
         $client = new Client(self::KEY, 'http://127.0.0.1:' . MockServer::freePort(), 5.0);
