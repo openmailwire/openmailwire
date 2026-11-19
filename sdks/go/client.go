@@ -50,6 +50,13 @@ type Config struct {
 	// PollInterval is how often WaitForDelivery and WaitForReply ask the
 	// server. Default 1 s.
 	PollInterval time.Duration
+	// MaxRetries is how many times a request answered 429 or 503 is sent
+	// again, each after its Retry-After (1 s without one), with the same
+	// body and idempotency key. Default 0: never retry.
+	MaxRetries int
+	// MaxRetryWait is the longest Retry-After to wait for; a longer one is
+	// returned at once. Default 60 s.
+	MaxRetryWait time.Duration
 }
 
 // Client talks to one OpenMailWire control plane. It is safe for concurrent
@@ -65,9 +72,17 @@ type Client struct {
 	Inboxes  *InboxesService
 	Messages *MessagesService
 
+	Suppressions *SuppressionsService
+	Pauses       *PausesService
+	Project      *ProjectService
+	AuditLog     *AuditLogService
+	Insights     *InsightsService
+
 	apiKey       string
 	http         *http.Client
 	pollInterval time.Duration
+	maxRetries   int
+	maxRetryWait time.Duration
 }
 
 // New returns a Client. It fails only when no API key is configured.
@@ -91,6 +106,8 @@ func New(cfg Config) (*Client, error) {
 		apiKey:       key,
 		http:         cfg.HTTPClient,
 		pollInterval: cfg.PollInterval,
+		maxRetries:   cfg.MaxRetries,
+		maxRetryWait: cfg.MaxRetryWait,
 	}
 	if c.http == nil {
 		c.http = &http.Client{Timeout: 30 * time.Second}
@@ -102,32 +119,91 @@ func New(cfg Config) (*Client, error) {
 	if c.pollInterval <= 0 {
 		c.pollInterval = time.Second
 	}
+	if c.maxRetries < 0 {
+		c.maxRetries = 0
+	}
+	if c.maxRetryWait <= 0 {
+		c.maxRetryWait = time.Minute
+	}
 	c.Emails = &EmailsService{c}
 	c.Domains = &DomainsService{c}
 	c.Webhooks = &WebhooksService{c}
 	c.APIKeys = &APIKeysService{c}
 	c.Inboxes = &InboxesService{c}
 	c.Messages = &MessagesService{c}
+	c.Suppressions = &SuppressionsService{c}
+	c.Pauses = &PausesService{c}
+	c.Project = &ProjectService{c}
+	c.AuditLog = &AuditLogService{c}
+	c.Insights = &InsightsService{c}
 	return c, nil
 }
 
 // Error is an error answered by the API, in its {statusCode, name, message}
-// shape. Use errors.As to inspect it:
+// shape. Use errors.As to inspect it, or IsError:
 //
 //	var apiErr *openmailwire.Error
-//	if errors.As(err, &apiErr) && apiErr.Name == "domain_not_verified" { … }
+//	if errors.As(err, &apiErr) && apiErr.Name == openmailwire.ErrorNameDomainNotVerified { … }
 type Error struct {
 	StatusCode int
-	// Name is the machine-readable error name, e.g. "validation_error".
+	// Name is the machine-readable error name, e.g. "validation_error"; the
+	// ErrorName constants list them.
 	Name    string
 	Message string
-	// RetryAfter is the Retry-After header of a 429 answer, or 0.
+	// RetryAfter is the Retry-After header, or 0. It is set on 429 answers
+	// (rate_limit_exceeded, recipient_rate_limited) and on 503 server_busy.
 	RetryAfter time.Duration
+
+	hasRetryAfter bool // the answer had a usable Retry-After header
 }
 
 func (e *Error) Error() string {
 	return fmt.Sprintf("openmailwire: %d %s: %s", e.StatusCode, e.Name, e.Message)
 }
+
+// Retryable reports whether the answer was 429 or 503: the request was
+// refused before any work, so it may be sent again (with the same
+// idempotency key) after RetryAfter.
+func (e *Error) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode == http.StatusServiceUnavailable
+}
+
+// IsError reports whether err is (or wraps) an *Error with this name, e.g.
+// IsError(err, ErrorNameSendingPaused).
+func IsError(err error, name string) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Name == name
+}
+
+// Error names the API answers with (Error.Name). Newer servers may add names.
+const (
+	ErrorNameMissingAPIKey           = "missing_api_key"
+	ErrorNameInvalidAPIKey           = "invalid_api_key"
+	ErrorNameAPIKeyExpired           = "api_key_expired"         // 401: the key's expires_at has passed
+	ErrorNameIPNotAllowed            = "ip_not_allowed"          // 403: not from one of the key's allowed_ips
+	ErrorNameInsufficientPermission  = "insufficient_permission" // 403: needs full access (or can_approve)
+	ErrorNameDomainNotFound          = "domain_not_found"
+	ErrorNameDomainNotVerified       = "domain_not_verified"
+	ErrorNameSenderNotAllowed        = "sender_not_allowed"
+	ErrorNameRecipientNotAllowed     = "recipient_not_allowed"
+	ErrorNameSendingPaused           = "sending_paused"           // 403: a circuit breaker paused the key, domain or project
+	ErrorNameCannotApproveOwnEmail   = "cannot_approve_own_email" // 403: no key decides on its own email
+	ErrorNameNotFound                = "not_found"
+	ErrorNameIdempotencyConflict     = "idempotency_conflict"
+	ErrorNameCannotCancel            = "cannot_cancel"
+	ErrorNameNotHeld                 = "not_held" // 409: approve or reject on an email that is not held
+	ErrorNameDomainExists            = "domain_exists"
+	ErrorNameDomainVerifiedElsewhere = "domain_verified_elsewhere" // 409: another project verified it first
+	ErrorNameDKIMRecordNotFound      = "dkim_record_not_found"     // 409: publish the new key's record first
+	ErrorNameWebhookLimitReached     = "webhook_limit_reached"     // 409: the project has its maximum of webhooks
+	ErrorNamePayloadTooLarge         = "payload_too_large"
+	ErrorNameValidationError         = "validation_error"
+	ErrorNameRateLimitExceeded       = "rate_limit_exceeded"    // 429, with RetryAfter
+	ErrorNameRecipientRateLimited    = "recipient_rate_limited" // 429, with RetryAfter: max_per_recipient_per_day
+	ErrorNameInternalError           = "internal_error"
+	ErrorNameServerBusy              = "server_busy"      // 503, with RetryAfter
+	ErrorNameRedirectRefused         = "redirect_refused" // not from the API: a 3xx answer, never followed
+)
 
 // RequestOption changes one request.
 type RequestOption func(*requestOptions)
@@ -148,24 +224,28 @@ func Ptr[T any](v T) *T { return &v }
 
 func seg(s string) string { return url.PathEscape(s) }
 
-func parseRetryAfter(v string) time.Duration {
+// parseRetryAfter reads a Retry-After header in seconds or as an HTTP date,
+// and reports whether it was usable.
+func parseRetryAfter(v string) (time.Duration, bool) {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return 0
+		return 0, false
 	}
 	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-		return time.Duration(n) * time.Second
+		return time.Duration(n) * time.Second, true
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		if d := time.Until(t); d > 0 {
-			return d.Round(time.Second)
+			return d.Round(time.Second), true
 		}
+		return 0, true
 	}
-	return 0
+	return 0, false
 }
 
 func apiError(resp *http.Response, data []byte) error {
-	e := &Error{StatusCode: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	retryAfter, has := parseRetryAfter(resp.Header.Get("Retry-After"))
+	e := &Error{StatusCode: resp.StatusCode, RetryAfter: retryAfter, hasRetryAfter: has}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		to := resp.Header.Get("Location")
 		if to == "" {
@@ -196,19 +276,45 @@ func apiError(resp *http.Response, data []byte) error {
 }
 
 // do sends a request and decodes the JSON answer into out. out may be nil,
-// or a *[]byte to receive the raw body.
+// or a *[]byte to receive the raw body. A 429 or 503 answer is retried after
+// its Retry-After as Config.MaxRetries allows.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, out any, opts []RequestOption) error {
 	var o requestOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
-	var rdr io.Reader
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("openmailwire: encoding request: %w", err)
 		}
-		rdr = bytes.NewReader(b)
+		payload = b
+	}
+	for attempt := 0; ; attempt++ {
+		err := c.send(ctx, method, path, query, body != nil, payload, out, o)
+		var apiErr *Error
+		if err == nil || attempt >= c.maxRetries || !errors.As(err, &apiErr) || !apiErr.Retryable() {
+			return err
+		}
+		wait := apiErr.RetryAfter
+		if !apiErr.hasRetryAfter {
+			wait = time.Second
+		}
+		if wait > c.maxRetryWait {
+			return err
+		}
+		if serr := sleep(ctx, wait); serr != nil {
+			return err
+		}
+	}
+}
+
+// send makes one attempt of a request.
+func (c *Client) send(ctx context.Context, method, path string, query url.Values, hasBody bool, payload []byte, out any, o requestOptions) error {
+	var rdr io.Reader
+	if hasBody {
+		rdr = bytes.NewReader(payload)
 	}
 	u := c.BaseURL + path
 	if len(query) > 0 {
@@ -220,12 +326,15 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("User-Agent", "openmailwire-go/"+Version)
-	if _, raw := out.(*[]byte); raw {
+	switch out.(type) {
+	case *[]byte:
 		req.Header.Set("Accept", "*/*")
-	} else {
+	case *string:
+		req.Header.Set("Accept", "text/csv, text/plain, */*")
+	default:
 		req.Header.Set("Accept", "application/json")
 	}
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if o.idempotencyKey != "" {
@@ -249,6 +358,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return nil
 	case *[]byte:
 		*v = data
+		return nil
+	case *string:
+		*v = string(data)
 		return nil
 	}
 	if len(data) == 0 {
