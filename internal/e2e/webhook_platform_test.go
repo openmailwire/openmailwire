@@ -26,14 +26,25 @@ import (
 // whDrain fans out every committed event.
 func (e *env) whDrain() {
 	e.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		n, err := e.st.FanoutWebhooks(e.ctx, 500, webhook.Build)
 		if err != nil {
 			e.t.Fatal(err)
 		}
-		if n == 0 {
+		if n > 0 {
+			continue
+		}
+		// SKIP LOCKED passes over rows that a cancelled fan-out still
+		// holds until Postgres has torn its connection down. Wait for
+		// those too: an event left unfanned past the deadline still
+		// counts as lost.
+		var left int
+		e.st.Pool.QueryRow(e.ctx, `SELECT count(*) FROM events WHERE NOT fanned_out`).Scan(&left)
+		if left == 0 || time.Now().After(deadline) {
 			return
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

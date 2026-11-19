@@ -92,6 +92,48 @@ Server-enforced rules for agents, on every path that sends (`POST /emails`, batc
 - Projects with more than 10 webhooks keep them, but cannot add more unless `OMW_WEBHOOKS_PER_PROJECT` is raised.
 - Webhook endpoints that take longer than 10 s to start answering now time out.
 
+### Delivery and deliverability
+
+**Throttling per mailbox provider and sending IP.**
+- Recipient domains are grouped by the provider their MX hosts belong to (Google, Microsoft, Yahoo, Apple, Zoho, Proton, Fastmail, Yandex, Mail.ru, GMX, Comcast, Mimecast, Proofpoint, Barracuda), learned from each attempt. A domain of no known provider is its own group. The rules ship in `internal/policy/providers.json`; `OMW_PROVIDER_RULES` points at your own.
+- Limits and backoff apply per group and sending IP: a throttled IP pauses for that provider while other IPs go on. `OMW_DOMAIN_CONCURRENCY` still caps each recipient domain across all workers.
+- Only connection- or IP-level replies count as "slow down": a 421, or `4.7.0`, `4.7.28`, `4.7.650` at the greeting, EHLO or MAIL FROM. Mailbox replies (`4.2.x`), `4.5.3` and authentication codes (`4.7.26`–`4.7.32` but `4.7.28`) never do, and the reply text is no longer matched. A limit halves only after two different recipients got such a reply within 15 minutes.
+- Authentication problems are recorded per project and sending domain: an `auth_problem` event, and `auth_issues` in `GET /domains/{id}/dkim`.
+- Events `throttled` and `throttle_relaxed` carry `scope` and `source_ip` instead of `rcpt_domain`.
+
+**Automatic IP warm-up** (`OMW_WARMUP`, default on): a new sending IP gets a daily cap per provider (50, 100, 200… for 12 days by default). Overflow waits for the next day or goes to a live relay worker. `openmailwire workers list` shows the remaining capacity; `openmailwire workers warm <name> [--restart]` marks an IP warm or starts over. IPs that sent before this version count as warm.
+
+**Retries.** The first retry comes 5 to 15 minutes after the first attempt (was 1 minute), then 30 minutes, 1, 2 and 4 hours. Greylisting is recognised: retried after 5 to 15 minutes, and not counted toward `OMW_RELAY_AFTER_ATTEMPTS`.
+
+**DKIM.**
+- `From`, `To`, `Subject`, `Date`, `Message-ID`, `Reply-To` and `Cc` are oversigned.
+- Optional Ed25519 signature next to RSA (RFC 8463): `POST /domains/{id}/dkim/ed25519`.
+- Key rotation with two selectors and an overlap: `POST /domains/{id}/dkim/rotate` creates a key, and switches to it once its record is published; the previous record stays listed for 8 days. `GET /domains/{id}/dkim` lists the keys. The domain view shows `DKIM_NEXT`, `DKIM_PREVIOUS` and `DKIM_ED25519` records.
+
+**Workers.**
+- Connection reuse: one connection per MX host carries several messages, with `RSET` in between (at most 50 per connection, idle for at most 20 seconds).
+- A self-check at start: `OMW_EHLO` is an FQDN, its A record is `OMW_PUBLIC_IP`, the IP's PTR names it, and port 25 is open (`OMW_SELF_CHECK_SMTP`). The worker refuses to start on failure unless `OMW_SKIP_SELF_CHECK=true`; the result is sent with the heartbeat and shown by `workers list`.
+- Worker tokens have a role: `openmailwire workers add <name> --role delivery|inbound|relay` (default `delivery`). Inbound endpoints refuse delivery and relay tokens and the reverse (`403 wrong_worker_role`); a delivery token cannot lease as a relay. Tokens created before keep working everywhere.
+- Opportunistic TLS accepts TLS 1.0 and 1.1 (any encryption beats plaintext); MTA-STS and DANE still require TLS 1.2.
+- Messages with 8-bit data go only to servers that announce `8BITMIME` (sent with `BODY=8BITMIME`), and those with non-ASCII addresses or header fields only to servers that announce `SMTPUTF8`. Otherwise the attempt is deferred with `4.6.3`, since converting would break the DKIM signature.
+- With `OMW_DNSSEC_RESOLVER`, MX and address lookups go through the validating resolver, and DANE applies only behind a secure MX answer. Authenticated TLSA records that are all unusable still require TLS.
+- MTA-STS policies are fetched again before they expire.
+
+**Fixed** (v0.5.0 audit):
+- A cancel or an expiry that committed while a lease was choosing deliveries was overwritten, and the canceled mail was sent. The lease now checks the status again on the locked rows.
+- One project's per-mailbox deferral (Gmail's `450 4.2.1 … receiving mail at a rate`) or authentication code halved gmail.com's limit and paused it for every project.
+- Scheduled mail kept the `Date` and DKIM signature of its request, up to 30 days old. It is dated and signed again when leased; nothing else in the message changes.
+- A long reply with multi-byte characters was cut inside a character; the report then failed with a 500 forever and the mail was sent again. Text is cut on character boundaries and made valid UTF-8, without NUL bytes, on the worker and the control plane.
+- The body of a large message and its final reply shared one 5-minute deadline. Each block now has 3 minutes, and the final reply 10 (RFC 5321 section 4.5.3.2).
+- A job could run past its lease, which the control plane then gave to another attempt. Jobs end before the lease, with a margin for the report, and are not started when the lease is nearly over.
+- A message the control plane could not decrypt stayed leased and could end `unknown`. It is released at once, with an `unseal_failed` event, and retried 5 minutes later.
+- A report and the sweep could deadlock (opposite lock order). Both now lock the delivery, then the attempt.
+- A 421 reply to EHLO lost its code, because the HELO fallback ran on the closed connection. HELO is used only after `500`/`502`, and every reply records its SMTP step (`stage` in reports and events).
+- A lease read the whole due backlog of domains at their limit (about 0.5 µs a row, inside the global lock). It now reads a fixed head of the queue, then domain by domain (new index `deliveries_domain_due`).
+- The worker API refused unknown fields, so a newer worker's reports were lost. They are ignored now; workers keep reports refused with 401, 403, or for unknown fields by an older control plane, and alert. A report for another worker's attempt answers `409 attempt_of_another_worker` (was 403).
+
+**Upgrading.** Upgrade the control plane before the workers. Migration `0008_deliverability.sql` resets `receiver_state` (now keyed by scope and sending IP). See [docs/production.md](docs/production.md#10-upgrading-to-v06).
+
 ## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
 ### SMTP submission and raw messages (v0.5)

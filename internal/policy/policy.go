@@ -3,35 +3,52 @@
 package policy
 
 import (
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/openmailwire/openmailwire/internal/protocol"
 )
 
-// Backoff is the wait before attempt n+1, indexed by n-1. The last entry
-// repeats until the message expires.
+// The first retry comes 5 to 15 minutes after the first attempt (a random
+// point in that window, so retries of a burst spread out), which is also long
+// enough for greylisting. Later retries follow Backoff.
+const (
+	FirstRetry       = 5 * time.Minute
+	FirstRetrySpread = 10 * time.Minute
+)
+
+// Backoff is the wait before attempt n+1, indexed by n-1, for n >= 2. The
+// last entry repeats until the message expires.
 var Backoff = []time.Duration{
-	time.Minute,
-	5 * time.Minute,
-	15 * time.Minute,
+	FirstRetry, // attempt 1: FirstRetry plus up to FirstRetrySpread
 	30 * time.Minute,
 	time.Hour,
 	2 * time.Hour,
 	4 * time.Hour,
 }
 
-// Delay returns how long to wait after the given number of attempts.
-func Delay(attempts int) time.Duration {
+// Delay returns how long to wait after the given number of attempts. jitter
+// (0 to 1) places the first retry within its window; later retries do not
+// use it.
+func Delay(attempts int, jitter float64) time.Duration {
 	i := attempts - 1
-	if i < 0 {
-		i = 0
+	if i < 1 {
+		return firstRetry(jitter)
 	}
 	if i >= len(Backoff) {
 		i = len(Backoff) - 1
 	}
 	return Backoff[i]
+}
+
+func firstRetry(jitter float64) time.Duration {
+	if jitter < 0 || jitter != jitter {
+		jitter = 0
+	}
+	if jitter > 1 {
+		jitter = 1
+	}
+	return FirstRetry + time.Duration(jitter*float64(FirstRetrySpread))
 }
 
 type Input struct {
@@ -42,6 +59,13 @@ type Input struct {
 	RetryUncertain bool
 	SMTPCode       int
 	EnhancedCode   string
+	// Greylisted: the receiver greylisted this attempt. The retry then comes
+	// 5 to 15 minutes later whatever the attempt count, because greylisting
+	// lets the next try through.
+	Greylisted bool
+	// Jitter (0 to 1) places a retry within its window; callers pass a
+	// random number.
+	Jitter float64
 }
 
 type Decision struct {
@@ -68,7 +92,11 @@ func Decide(in Input) Decision {
 			return Decision{Status: "unknown", NextAttempt: in.Now, Event: "unknown"}
 		}
 	}
-	next := in.Now.Add(Delay(in.Attempts))
+	delay := Delay(in.Attempts, in.Jitter)
+	if in.Greylisted {
+		delay = firstRetry(in.Jitter)
+	}
+	next := in.Now.Add(delay)
 	if !next.Before(in.ExpiresAt) {
 		return Decision{Status: "expired", NextAttempt: in.Now, Event: "expired"}
 	}
@@ -94,27 +122,6 @@ func IsRecipientFailure(enhanced string) bool {
 		return true
 	}
 	return false
-}
-
-var throttleText = regexp.MustCompile(`(?i)\brate|too many`)
-
-// IsThrottle reports whether a deferral says the receiver wants us to slow
-// down: a 421, one of the enhanced codes receivers use for rate limits
-// (4.7.0, 4.7.28 at Gmail, 4.7.650 at Outlook, 4.3.2), or a reply that talks
-// about rates or "too many". Only replies from the receiver count (code
-// 4xx); a worker's own failures (connect errors, TLS policy) never do.
-func IsThrottle(outcome string, code int, enhanced, response string) bool {
-	if outcome != protocol.OutcomeDeferred || code < 400 || code > 499 {
-		return false
-	}
-	if code == 421 {
-		return true
-	}
-	switch strings.TrimSpace(enhanced) {
-	case "4.7.0", "4.7.28", "4.7.650", "4.3.2":
-		return true
-	}
-	return throttleText.MatchString(response)
 }
 
 // ThrottleBackoff is how long direct workers leave a domain alone after its

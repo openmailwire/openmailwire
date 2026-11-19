@@ -170,8 +170,10 @@ type TXTResolver interface {
 // STSFetcher discovers, fetches and caches MTA-STS policies.
 //
 // A domain's TXT record is consulted at most once a minute. A policy is
-// fetched when the record names an id that is not cached, and kept until its
-// max_age passes, also when the record disappears or the next fetch fails.
+// fetched when the record names an id that is not cached, and again in the
+// last quarter of its max_age (at most a day before it expires). It is kept
+// until its max_age passes, also when the record disappears or the next
+// fetch fails.
 type STSFetcher struct {
 	Resolver TXTResolver
 	// HTTP fetches the policies. It is used without following redirects.
@@ -256,9 +258,17 @@ func (f *STSFetcher) Policy(ctx context.Context, domain string) (*STSPolicy, err
 		e.txtID, e.checked = id, now
 	}
 	cached := e.valid(now)
-	if e.txtID == "" || (cached != nil && cached.ID == e.txtID) {
+	if e.txtID == "" {
 		return cached, nil
 	}
+	if cached != nil && cached.ID == e.txtID && now.Before(e.expires.Add(-refreshBefore(cached.MaxAge))) {
+		return cached, nil
+	}
+	// A new id, no policy, or a policy near its end: fetch. A cached policy
+	// is refreshed before it expires (RFC 8461 section 5.1), so a domain
+	// that keeps its policy never drops out of enforcement, even for a
+	// moment; when the refresh fails, the cached policy stays until it
+	// expires.
 	if e.failID == e.txtID && now.Before(e.failUntil) {
 		return cached, nil
 	}
@@ -270,6 +280,12 @@ func (f *STSFetcher) Policy(ctx context.Context, domain string) (*STSPolicy, err
 	p.ID = e.txtID
 	e.policy, e.expires = p, now.Add(p.MaxAge)
 	return p, nil
+}
+
+// refreshBefore is how long before its expiry a cached policy is fetched
+// again: a quarter of its max_age, at most a day.
+func refreshBefore(maxAge time.Duration) time.Duration {
+	return min(maxAge/4, 24*time.Hour)
 }
 
 func (f *STSFetcher) lookupID(ctx context.Context, domain string) (string, error) {

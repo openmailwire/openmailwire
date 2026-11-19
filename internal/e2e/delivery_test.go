@@ -22,14 +22,15 @@ import (
 	"github.com/openmailwire/openmailwire/internal/worker"
 )
 
-// newDeliveryEnv is newEnv plus a clean receiver_state, which newEnv's
-// TRUNCATE does not reach (it references neither projects nor workers).
-// The table is emptied again when the test ends, so no other test meets a
-// domain in backoff.
+// newDeliveryEnv is newEnv plus a clean receiver_state and the other
+// delivery tables newEnv's TRUNCATE does not reach (they reference neither
+// projects nor workers). They are emptied again when the test ends, so no
+// other test meets a scope in backoff or a learned provider.
 func newDeliveryEnv(t *testing.T, tweak func(*config.Control)) *env {
 	e := newEnv(t, tweak)
 	reset := func() {
-		if _, err := e.st.Pool.Exec(context.Background(), `TRUNCATE receiver_state`); err != nil {
+		if _, err := e.st.Pool.Exec(context.Background(),
+			`TRUNCATE receiver_state, rcpt_domain_providers, sending_ips, warmup_usage, lease_cursor`); err != nil {
 			t.Error(err)
 		}
 	}
@@ -84,11 +85,12 @@ func (e *env) retryNow(emailID string) {
 	}
 }
 
-// endBackoff ends a recipient domain's throttling backoff now.
+// endBackoff ends a scope's throttling backoff now (a recipient domain of
+// no known provider is its own scope).
 func (e *env) endBackoff(domain string) {
 	e.t.Helper()
 	if _, err := e.st.Pool.Exec(e.ctx, `UPDATE receiver_state SET backoff_until = now() - interval '1 second'
-		WHERE rcpt_domain = $1`, domain); err != nil {
+		WHERE scope = $1`, domain); err != nil {
 		e.t.Fatal(err)
 	}
 }
@@ -125,7 +127,7 @@ func (e *env) backoffLeft(domain string) time.Duration {
 	e.t.Helper()
 	var secs float64
 	if err := e.st.Pool.QueryRow(e.ctx, `SELECT EXTRACT(EPOCH FROM backoff_until - now())::float8
-		FROM receiver_state WHERE rcpt_domain = $1`, domain).Scan(&secs); err != nil {
+		FROM receiver_state WHERE scope = $1`, domain).Scan(&secs); err != nil {
 		e.t.Fatal(err)
 	}
 	return time.Duration(secs * float64(time.Second))
@@ -138,24 +140,27 @@ func near(t *testing.T, what string, got, want time.Duration) {
 	}
 }
 
-// TestThrottling: a receiver that says "slow down" halves its domain's
-// limit and starts a backoff that direct workers respect; deliveries raise
-// the limit again.
+// TestThrottling: a receiver that says "slow down" to two recipients halves
+// the limit of its scope (here the domain itself: its MX belongs to no known
+// provider) for the sending IP and starts a backoff that direct workers
+// with that IP respect; deliveries raise the limit again.
 func TestThrottling(t *testing.T) {
 	e := newDeliveryEnv(t, func(c *config.Control) { c.DomainConcurrency = 4 })
 	e.addVerifiedDomain("acme.test")
 	e.smtp.ReplyToDomain("throttle.test", "421 4.7.28 too many messages from your IP, slow down")
 	stop := e.startWorker()
 
-	// First throttle: limit 4 -> 2, backoff 1 minute.
-	id := e.send("a@throttle.test")
+	// First throttle, from two recipients: limit 4 -> 2, backoff 1 minute.
+	id := e.send("a@throttle.test", "b@throttle.test")
 	e.waitDelivery(id, "a@throttle.test", 1, "deferred")
+	e.waitDelivery(id, "b@throttle.test", 1, "deferred")
 	rs := e.receiver("throttle.test")
-	if rs.Limit != 2 || rs.Throttles != 1 {
+	if rs.Limit != 2 || rs.Throttles != 1 || rs.SourceIP != "203.0.113.7" {
 		t.Fatalf("after one throttle: %+v", rs)
 	}
 	near(t, "first backoff", e.backoffLeft("throttle.test"), time.Minute)
-	if ev := e.event(id, "throttled"); ev["rcpt_domain"] != "throttle.test" || ev["limit"] != 2.0 || ev["previous_limit"] != 4.0 {
+	if ev := e.event(id, "throttled"); ev["scope"] != "throttle.test" || ev["limit"] != 2.0 || ev["previous_limit"] != 4.0 ||
+		ev["source_ip"] != "203.0.113.7" {
 		t.Fatalf("throttled event: %v", ev)
 	}
 	if _, v := e.call("GET", "/emails/"+id, "", nil); v["last_event"] != "deferred" {
@@ -174,7 +179,8 @@ func TestThrottling(t *testing.T) {
 	e.waitStatus(other, "b@other.test", "delivered")
 
 	// The lease honours a lowered limit even within one request.
-	if _, err := e.st.Pool.Exec(e.ctx, `INSERT INTO receiver_state (rcpt_domain, "limit") VALUES ('narrow.test', 1)`); err != nil {
+	if _, err := e.st.Pool.Exec(e.ctx, `INSERT INTO receiver_state (scope, source_ip, "limit")
+		SELECT 'narrow.test', ip, 1 FROM workers WHERE id = $1`, e.workerID); err != nil {
 		t.Fatal(err)
 	}
 	narrow := e.send("n1@narrow.test", "n2@narrow.test", "n3@narrow.test")
@@ -214,6 +220,7 @@ func TestThrottling(t *testing.T) {
 	e.endBackoff("throttle.test")
 	e.startWorker()
 	e.waitDelivery(id, "a@throttle.test", 2, "deferred")
+	e.waitDelivery(id, "b@throttle.test", 2, "deferred")
 	rs = e.receiver("throttle.test")
 	if rs.Limit != 1 || rs.Throttles != 2 {
 		t.Fatalf("after two throttles: %+v", rs)
@@ -226,8 +233,9 @@ func TestThrottling(t *testing.T) {
 	e.endBackoff("throttle.test")
 	e.retryNow(id)
 	e.waitStatus(id, "a@throttle.test", "delivered")
+	e.waitStatus(id, "b@throttle.test", "delivered")
 	rs = e.receiver("throttle.test")
-	if rs.Limit != 2 || rs.Throttles != 0 {
+	if rs.Limit != 3 || rs.Throttles != 0 {
 		t.Fatalf("after recovery: %+v", rs)
 	}
 	if ev := e.event(id, "throttle_relaxed"); ev["limit"] != 2.0 || ev["previous_limit"] != 1.0 {
@@ -358,22 +366,26 @@ func TestRelayFallback(t *testing.T) {
 	}
 
 	// A throttled domain goes to the relay at once, without waiting for two
-	// attempts; the relay's delivery does not raise the direct limit.
-	id2 := e.send("y@busy.test")
-	e.waitDelivery(id2, "y@busy.test", 1, "deferred")
+	// attempts; the relay's deliveries do not raise the direct limit.
+	id2 := e.send("y1@busy.test", "y2@busy.test")
+	e.waitDelivery(id2, "y1@busy.test", 1, "deferred")
+	e.waitDelivery(id2, "y2@busy.test", 1, "deferred")
 	if rs := e.receiver("busy.test"); rs.Limit != 2 || rs.BackoffUntil == nil {
 		t.Fatalf("busy.test after a throttle: %+v", rs)
 	}
 	e.retryNow(id2)
-	v = e.waitStatus(id2, "y@busy.test", "delivered")
-	if w := attemptWorkers(v); len(w) != 2 || w[1] != "relay1" {
-		t.Fatalf("attempt workers %v, want w1, relay1", w)
+	for _, rcpt := range []string{"y1@busy.test", "y2@busy.test"} {
+		e.waitStatus(id2, rcpt, "delivered")
+	}
+	_, v = e.call("GET", "/emails/"+id2, "", nil)
+	if w := attemptWorkers(v); len(w) != 4 || w[2] != "relay1" || w[3] != "relay1" {
+		t.Fatalf("attempt workers %v, want w1, w1, relay1, relay1", w)
 	}
 	if rs := e.receiver("busy.test"); rs.Limit != 2 {
 		t.Fatalf("a relay delivery changed the direct limit: %+v", rs)
 	}
-	if n := e.smtp.RcptCount("busy.test"); n != 1 {
-		t.Fatalf("the throttling receiver saw %d attempts during its backoff", n)
+	if n := e.smtp.RcptCount("busy.test"); n != 2 {
+		t.Fatalf("the throttling receiver saw %d attempts, want only the two first ones", n)
 	}
 	verifyDKIM(t, smarthost.Messages()[1].Data, dkimTXT)
 

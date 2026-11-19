@@ -29,6 +29,8 @@ import (
 	"github.com/openmailwire/openmailwire/internal/domains"
 	"github.com/openmailwire/openmailwire/internal/inbound"
 	"github.com/openmailwire/openmailwire/internal/mcpserver"
+	"github.com/openmailwire/openmailwire/internal/policy"
+	"github.com/openmailwire/openmailwire/internal/protocol"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/smtptest"
 	"github.com/openmailwire/openmailwire/internal/store"
@@ -54,10 +56,13 @@ Usage:
                        [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
                                               create an API key, e.g. one per agent, with its limits
   openmailwire apikey list <project-id>       list a project's live API keys
-  openmailwire workers add <name>             register a worker and print its token
-  openmailwire workers list
+  openmailwire workers add <name> [--role delivery|inbound|relay]
+                                              register a worker (default role: delivery) and print its token
+  openmailwire workers list                   workers, their self-check and their IPs' warm-up
   openmailwire workers drain <name>           stop giving the worker new jobs
   openmailwire workers resume <name>
+  openmailwire workers warm <name> [--restart]
+                                              treat the worker's IP as warm (no warm-up caps), or start over
   openmailwire domains force-verify <domain> [project-id]
                                               mark a domain verified without DNS (development only)
   openmailwire mcp                            MCP server on stdio for AI agents (needs OMW_API_URL, OMW_API_KEY)
@@ -242,7 +247,7 @@ func runWorker(ctx context.Context, log *slog.Logger) error {
 		kind = "relay"
 	}
 	log.Info("worker starting", "control", cfg.ControlURL, "kind", kind, "ehlo", cfg.EHLO, "public_ip", cfg.PublicIP,
-		"concurrency", cfg.Concurrency, "dane", cfg.DNSSECResolver != "", "version", version)
+		"concurrency", cfg.Concurrency, "dane", cfg.DNSSECResolver != "", "self_check", !cfg.SkipSelfCheck, "version", version)
 	return worker.NewRunner(cfg, log, version).Run(ctx)
 }
 
@@ -485,46 +490,156 @@ func newAPIKey(ctx context.Context, st *store.Store, projectID, name string) (st
 	return token, nil
 }
 
+const workersUsage = `usage:
+  openmailwire workers add <name> [--role delivery|inbound|relay]
+  openmailwire workers list
+  openmailwire workers drain <name> | resume <name>
+  openmailwire workers warm <name> [--restart]
+
+Roles: delivery workers send from their own IP, relay workers through a
+smarthost (OMW_RELAY_HOST), inbound nodes receive mail. A token works only for
+its role.`
+
 func workersCmd(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: openmailwire workers add|list|drain|resume …")
+		return errors.New(workersUsage)
 	}
 	return withStore(ctx, func(st *store.Store) error {
 		switch {
-		case args[0] == "add" && len(args) == 2:
+		case args[0] == "add":
+			fs := flag.NewFlagSet("workers add", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			role := fs.String("role", protocol.RoleDelivery, "")
+			pos, err := parseInterspersed(fs, args[1:])
+			if err != nil || len(pos) != 1 {
+				return errors.New(workersUsage)
+			}
+			if !protocol.ValidRole(*role) {
+				return fmt.Errorf("--role must be delivery, inbound or relay, not %q", *role)
+			}
 			token, hash := secret.NewToken("omwk_")
-			if _, err := st.CreateWorker(ctx, args[1], hash); err != nil {
+			if _, err := st.CreateWorkerWithRole(ctx, pos[0], *role, hash); err != nil {
 				if errors.Is(err, store.ErrConflict) {
-					return fmt.Errorf("a worker named %q already exists", args[1])
+					return fmt.Errorf("a worker named %q already exists", pos[0])
 				}
 				return err
 			}
-			fmt.Printf("worker   %s\ntoken    %s\n\nSet it as OMW_WORKER_TOKEN on that worker. It is shown once.\n", args[1], token)
+			what := "worker"
+			if *role == protocol.RoleInbound {
+				what = "inbound node"
+			}
+			fmt.Printf("worker   %s\nrole     %s\ntoken    %s\n\nSet it as OMW_WORKER_TOKEN on that %s. It is shown once.\n",
+				pos[0], *role, token, what)
 		case args[0] == "list":
-			ws, err := st.ListWorkers(ctx)
-			if err != nil {
-				return err
-			}
-			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tKIND\tIP\tEHLO\tCAPACITY\tDRAINING\tLAST SEEN\tVERSION")
-			for _, w := range ws {
-				seen := "never"
-				if w.LastSeenAt != nil {
-					seen = time.Since(*w.LastSeenAt).Round(time.Second).String() + " ago"
-				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%v\t%s\t%s\n", w.Name, w.Kind, w.IP, w.EHLO, w.Capacity, w.Draining, seen, w.Version)
-			}
-			return tw.Flush()
+			return workersList(ctx, st)
 		case (args[0] == "drain" || args[0] == "resume") && len(args) == 2:
 			if err := st.SetDraining(ctx, args[1], args[0] == "drain"); err != nil {
 				return err
 			}
 			fmt.Printf("worker %s: draining=%v\n", args[1], args[0] == "drain")
+		case args[0] == "warm" && (len(args) == 2 || len(args) == 3 && args[2] == "--restart"):
+			ws, err := st.ListWorkers(ctx)
+			if err != nil {
+				return err
+			}
+			for _, w := range ws {
+				if w.Name != args[1] {
+					continue
+				}
+				if w.IP == "" {
+					return fmt.Errorf("worker %s has not announced its IP yet; start it with OMW_PUBLIC_IP set", w.Name)
+				}
+				restart := len(args) == 3
+				if err := st.SetIPWarm(ctx, w.IP, !restart); err != nil {
+					return err
+				}
+				if restart {
+					fmt.Printf("%s (%s) starts its warm-up again at day 1\n", w.IP, w.Name)
+				} else {
+					fmt.Printf("%s (%s) is warm: no warm-up caps apply to it\n", w.IP, w.Name)
+				}
+				return nil
+			}
+			return fmt.Errorf("no worker named %q", args[1])
 		default:
-			return errors.New("usage: openmailwire workers add <name> | list | drain <name> | resume <name>")
+			return errors.New(workersUsage)
 		}
 		return nil
 	})
+}
+
+// workersList prints every worker with its role, self-check and the
+// warm-up of its IP (remaining capacity per provider today).
+func workersList(ctx context.Context, st *store.Store) error {
+	rules, err := policy.LoadRules(os.Getenv("OMW_PROVIDER_RULES"))
+	if err != nil {
+		return err
+	}
+	warmup := os.Getenv("OMW_WARMUP") != "false"
+	ws, err := st.ListWorkers(ctx)
+	if err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tROLE\tKIND\tIP\tEHLO\tCAPACITY\tDRAINING\tLAST SEEN\tVERSION\tSELF-CHECK\tWARM-UP")
+	for _, w := range ws {
+		seen := "never"
+		if w.LastSeenAt != nil {
+			seen = time.Since(*w.LastSeenAt).Round(time.Second).String() + " ago"
+		}
+		warm := "-"
+		switch {
+		case w.Role == protocol.RoleInbound, w.Kind == protocol.KindRelay, w.IP == "":
+		case !warmup:
+			warm = "off"
+		default:
+			s, err := st.IPWarmup(ctx, rules, w.IP)
+			if err != nil {
+				return err
+			}
+			warm = warmupSummary(s)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%v\t%s\t%s\t%s\t%s\n", w.Name, w.Role, w.Kind, w.IP, w.EHLO, w.Capacity, w.Draining,
+			seen, w.Version, selfCheckSummary(w.SelfCheck), warm)
+	}
+	return tw.Flush()
+}
+
+func selfCheckSummary(raw []byte) string {
+	if len(raw) == 0 {
+		return "-"
+	}
+	var c protocol.SelfCheck
+	if json.Unmarshal(raw, &c) != nil {
+		return "?"
+	}
+	if c.Skipped != "" {
+		return "skipped"
+	}
+	if c.OK {
+		return "ok"
+	}
+	var failed []string
+	for _, i := range c.Checks {
+		if !i.OK {
+			failed = append(failed, i.Name)
+		}
+	}
+	return "FAILED: " + strings.Join(failed, ", ")
+}
+
+func warmupSummary(s store.WarmupStatus) string {
+	switch {
+	case !s.Started:
+		return "starts with its first lease"
+	case s.Warm:
+		return "warm"
+	}
+	parts := []string{fmt.Sprintf("day %d", s.Day)}
+	for _, p := range s.Left {
+		parts = append(parts, fmt.Sprintf("%s %d/%d left", p.Provider, max(0, p.Cap-p.Used), p.Cap))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // runMCP serves the MCP tools on stdin/stdout, acting through a control

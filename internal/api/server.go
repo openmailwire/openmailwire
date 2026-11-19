@@ -75,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /internal/worker/heartbeat", s.withWorker(s.heartbeat))
 	mux.Handle("POST /internal/worker/lease", s.withWorker(s.lease))
 	mux.Handle("POST /internal/worker/report", s.withWorker(s.report))
+	s.dkimRoutes(mux) // lane C: DKIM rotation and Ed25519 (dkim.go)
 
 	var root http.Handler
 	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))
@@ -221,6 +222,9 @@ func (s *Server) withWorker(next http.HandlerFunc) http.Handler {
 		}
 		if err != nil {
 			s.internal(w, "worker lookup", err)
+			return
+		}
+		if !workerRoleAllowed(w, r, wk) { // lane C: token roles (workers.go)
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), workerKey, wk)))

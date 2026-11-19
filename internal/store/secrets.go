@@ -22,8 +22,8 @@ func (c SealedColumn) String() string { return c.Table + "." + c.Column }
 // SealedColumns lists every column that holds sealed values: the start-up
 // key check samples them, and `openmailwire rotate-secrets` reseals them.
 //
-// TODO(merge): v0.6 lanes that add sealed columns (lane C's second DKIM
-// selector key, lane D's sealed inbound snippet, …) add them here.
+// A table that adds a sealed column must be added here, or rotation
+// would leave values sealed with a retired key.
 var SealedColumns = []SealedColumn{
 	{"domains", "id", "dkim_private"},
 	{"webhooks", "id", "secret"},
@@ -33,6 +33,7 @@ var SealedColumns = []SealedColumn{
 	{"secret_values", "name", "value"},
 	{"emails", "id", "raw"},
 	{"inbound_messages", "id", "raw"},
+	{"dkim_keys", "id", "private_key"}, // extra and rotated DKIM keys (0008)
 }
 
 // macRootName names the secret_values row holding the root of the keys

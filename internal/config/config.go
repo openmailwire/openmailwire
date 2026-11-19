@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/openmailwire/openmailwire/internal/policy"
 )
 
 // Control configures the control plane (openmailwire serve).
@@ -34,6 +36,13 @@ type Control struct {
 	// are set (development only).
 	WebhookAllowHTTP    bool
 	WebhookAllowPrivate bool
+
+	// Deliverability (lane C). ProviderRules group recipient domains by
+	// mailbox provider for limits and warm-up (OMW_PROVIDER_RULES, or the
+	// built-in rules); Warmup caps what new sending IPs send per provider
+	// and day (OMW_WARMUP).
+	ProviderRules *policy.Rules
+	Warmup        bool
 
 	// Inbound mail.
 	InboundMX        string        // host that receives mail for inboxes; shown as an optional MX record
@@ -113,6 +122,12 @@ func LoadControl() (Control, error) {
 	if c.PublicURL, err = PublicURL(os.Getenv("OMW_PUBLIC_URL")); err != nil { // lane B
 		return c, err
 	}
+	if c.ProviderRules, err = policy.LoadRules(os.Getenv("OMW_PROVIDER_RULES")); err != nil {
+		return c, err
+	}
+	if c.Warmup, err = envBool("OMW_WARMUP", true); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -186,8 +201,15 @@ type Worker struct {
 	JobTimeout   time.Duration
 
 	// DNSSECResolver (host:port) is a validating resolver the worker trusts.
-	// When set, the worker honours DANE TLSA records (RFC 7672).
+	// When set, the worker honours DANE TLSA records (RFC 7672) and looks up
+	// MX and address records through it.
 	DNSSECResolver string
+
+	// SkipSelfCheck skips the start-up checks (EHLO name, its A record,
+	// reverse DNS, port 25). Development only. SelfCheckSMTP is the host:port
+	// the port 25 check connects to; empty means Gmail's MX.
+	SkipSelfCheck bool
+	SelfCheckSMTP string
 
 	// A relay worker hands every message to this smarthost instead of the
 	// recipients' mail servers. Setting RelayHost makes the worker a relay.
@@ -238,6 +260,15 @@ func LoadWorker() (Worker, error) {
 	}
 	if w.JobTimeout, err = envDuration("OMW_JOB_TIMEOUT", 10*time.Minute); err != nil {
 		return w, err
+	}
+	if w.SkipSelfCheck, err = envBool("OMW_SKIP_SELF_CHECK", false); err != nil {
+		return w, err
+	}
+	w.SelfCheckSMTP = os.Getenv("OMW_SELF_CHECK_SMTP")
+	if w.SelfCheckSMTP != "" {
+		if _, _, err := net.SplitHostPort(w.SelfCheckSMTP); err != nil {
+			return w, errors.New("OMW_SELF_CHECK_SMTP must be host:port, e.g. mx.example.net:25")
+		}
 	}
 	w.DNSSECResolver = os.Getenv("OMW_DNSSEC_RESOLVER")
 	if w.DNSSECResolver != "" {

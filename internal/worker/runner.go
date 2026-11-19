@@ -38,6 +38,11 @@ type Runner struct {
 	log     *slog.Logger
 	version string
 	outbox  string
+
+	// checker runs the start-up self-check of a direct worker; check is its
+	// result, sent with every heartbeat.
+	checker *SelfChecker
+	check   *protocol.SelfCheck
 }
 
 func NewRunner(cfg config.Worker, log *slog.Logger, version string) *Runner {
@@ -69,10 +74,49 @@ func NewRunner(cfg config.Worker, log *slog.Logger, version string) *Runner {
 	}
 	if cfg.DNSSECResolver != "" {
 		d.DANE = &DANEResolver{Server: cfg.DNSSECResolver}
+		// MX and address records come from the validating resolver too, so
+		// DANE is applied only behind a DNSSEC-secure MX answer.
+		d.Resolver = &DNSSECResolver{DANEResolver{Server: cfg.DNSSECResolver}}
 	}
 	d.setDefaults()
 	r.d = d
+	r.checker = &SelfChecker{EHLO: cfg.EHLO, PublicIP: cfg.PublicIP, SourceIP: cfg.SourceIP, Resolver: net.DefaultResolver,
+		SMTP: cfg.SelfCheckSMTP}
 	return r
+}
+
+// selfCheck runs the start-up checks of a direct worker and returns an
+// error when one failed: a worker without reverse DNS or port 25 only
+// collects deferrals and bounces and hurts its IP's reputation.
+func (r *Runner) selfCheck(ctx context.Context) error {
+	switch {
+	case r.cfg.Relay():
+		r.check = &protocol.SelfCheck{OK: true, Skipped: "relay worker: it sends through its smarthost", CheckedAt: time.Now().UTC()}
+		return nil
+	case r.cfg.SMTPOverride != "":
+		r.check = &protocol.SelfCheck{OK: true, Skipped: "OMW_SMTP_OVERRIDE is set (development)", CheckedAt: time.Now().UTC()}
+		return nil
+	case r.cfg.SkipSelfCheck || r.checker == nil:
+		r.check = &protocol.SelfCheck{OK: true, Skipped: "OMW_SKIP_SELF_CHECK is set (development)", CheckedAt: time.Now().UTC()}
+		r.log.Warn("self-check skipped: OMW_SKIP_SELF_CHECK is set. Never do this in production.")
+		return nil
+	}
+	c := r.checker.Run(ctx)
+	r.check = &c
+	var failed []string
+	for _, item := range c.Checks {
+		if item.OK {
+			r.log.Info("self-check passed", "check", item.Name)
+			continue
+		}
+		r.log.Error("self-check failed", "check", item.Name, "detail", item.Detail)
+		failed = append(failed, item.Name+": "+item.Detail)
+	}
+	if !c.OK {
+		return fmt.Errorf("self-check failed, so the worker does not start:\n  %s\nFix these, or set OMW_SKIP_SELF_CHECK=true for development",
+			strings.Join(failed, "\n  "))
+	}
+	return nil
 }
 
 // Run leases and delivers until ctx is cancelled, then finishes the
@@ -80,6 +124,9 @@ func NewRunner(cfg config.Worker, log *slog.Logger, version string) *Runner {
 func (r *Runner) Run(ctx context.Context) error {
 	if err := os.MkdirAll(r.outbox, 0o700); err != nil {
 		return fmt.Errorf("state dir: %w", err)
+	}
+	if err := r.selfCheck(ctx); err != nil {
+		return err
 	}
 	if r.cfg.SMTPOverride != "" {
 		r.log.Warn("every message goes to the SMTP override, not to real recipients", "override", r.cfg.SMTPOverride)
@@ -97,6 +144,9 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	sem := make(chan struct{}, r.cfg.Concurrency)
 	var wg sync.WaitGroup
+	if c, ok := r.d.(interface{ Close() }); ok {
+		defer c.Close() // after the deliveries in flight
+	}
 	defer wg.Wait()
 	for {
 		if ctx.Err() != nil {
@@ -131,13 +181,46 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
+// jobDeadline is when a delivery must be over: OMW_JOB_TIMEOUT from now,
+// but never later than the lease's expiry minus a margin (a tenth of what is
+// left, between 5 seconds and a minute) to send the report. Past the lease
+// the control plane hands the delivery to another attempt, and the message
+// would go out twice.
+func (r *Runner) jobDeadline(j protocol.Job, now time.Time) time.Time {
+	dl := now.Add(r.cfg.JobTimeout)
+	if !j.LeaseExpiresAt.IsZero() {
+		left := j.LeaseExpiresAt.Sub(now)
+		margin := min(max(left/10, 5*time.Second), time.Minute)
+		if lease := j.LeaseExpiresAt.Add(-margin); lease.Before(dl) {
+			dl = lease
+		}
+	}
+	return dl
+}
+
+// minJobTime: a job with less time than this before its deadline is not
+// attempted.
+const minJobTime = 5 * time.Second
+
 func (r *Runner) handle(ctx context.Context, j protocol.Job) {
 	// A shutdown signal does not abort a delivery mid-conversation; the job
-	// timeout (shorter than the lease) bounds it instead.
-	jctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.cfg.JobTimeout)
-	defer cancel()
+	// deadline (inside the lease) bounds it instead.
 	start := time.Now()
-	res := r.d.Deliver(jctx, j)
+	dl := r.jobDeadline(j, start)
+	jctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), dl)
+	defer cancel()
+	var res Result
+	if dl.Sub(start) < minJobTime {
+		// The lease is (nearly) over already, e.g. the clocks of this worker
+		// and the control plane disagree. Sending now could duplicate the
+		// message, so the attempt is given back without contacting anyone.
+		r.log.Warn("lease expires before the delivery could run; not attempted (check the clocks of the worker and the control plane)",
+			"attempt", j.AttemptID, "lease_expires_at", j.LeaseExpiresAt)
+		res = Result{Outcome: protocol.OutcomeDeferred, Enhanced: "4.4.7",
+			Response: "not attempted: the lease expired before the worker could start the delivery"}
+	} else {
+		res = r.d.Deliver(jctx, j)
+	}
 	attrs := []any{"attempt", j.AttemptID, "rcpt_domain", j.RcptDomain, "outcome", res.Outcome,
 		"code", res.Code, "enhanced", res.Enhanced, "mx", res.MXHost, "tls", res.TLS,
 		"ms", time.Since(start).Milliseconds()}
@@ -147,7 +230,8 @@ func (r *Runner) handle(ctx context.Context, j protocol.Job) {
 	r.log.Info("attempt", attrs...)
 	r.submit(context.WithoutCancel(ctx), protocol.Report{
 		AttemptID: j.AttemptID, Outcome: res.Outcome, SMTPCode: res.Code, EnhancedCode: res.Enhanced,
-		Response: res.Response, MXHost: res.MXHost, SourceIP: r.cfg.PublicIP, TLS: res.TLS, TLSPolicy: res.TLSPolicy,
+		Response: protocol.CleanText(res.Response, 1000), MXHost: res.MXHost, SourceIP: r.cfg.PublicIP, TLS: res.TLS,
+		TLSPolicy: res.TLSPolicy, Stage: res.Stage,
 	})
 }
 
@@ -176,6 +260,16 @@ func (r *Runner) send(ctx context.Context, path string, rep protocol.Report) {
 	switch {
 	case err == nil:
 		os.Remove(path)
+	case errors.As(err, &he) && he.Auth():
+		// A revoked token or a wrong role is fixed by the operator; the
+		// outcome must survive until then.
+		r.log.Error("the control plane refuses this worker's token; the report stays in the outbox until it accepts it",
+			"attempt", rep.AttemptID, "status", he.Status, "err", err)
+	case errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity && strings.Contains(he.Body, "unknown field"):
+		// A control plane older than this worker (before v0.6) refuses
+		// fields it does not know. Keep the report until it is upgraded.
+		r.log.Error("the control plane is older than this worker and refuses its report; upgrade the control plane first. The report stays in the outbox",
+			"attempt", rep.AttemptID, "err", err)
 	case errors.As(err, &he) && he.Permanent():
 		r.log.Error("report rejected; dropping it", "attempt", rep.AttemptID, "err", err)
 		os.Remove(path)
@@ -227,6 +321,7 @@ func (r *Runner) beat(ctx context.Context) {
 	var resp protocol.HeartbeatResponse
 	err := r.client.Post(bctx, "/internal/worker/heartbeat", protocol.HeartbeatRequest{
 		PublicIP: r.cfg.PublicIP, EHLO: r.cfg.EHLO, Capacity: r.cfg.Concurrency, Version: r.version, Kind: r.kind,
+		SelfCheck: r.check,
 	}, &resp)
 	if err != nil && ctx.Err() == nil {
 		r.log.Warn("heartbeat failed", "err", err)
@@ -290,10 +385,14 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("control plane answered %d: %s", e.Status, e.Body)
 }
 
-// Permanent reports whether retrying the same request cannot succeed.
+// Permanent reports whether retrying the same request cannot succeed. An
+// authentication refusal (401, 403) is not: the operator can fix the token.
 func (e *HTTPError) Permanent() bool {
-	return e.Status >= 400 && e.Status < 500 && e.Status != 408 && e.Status != 429
+	return e.Status >= 400 && e.Status < 500 && e.Status != 408 && e.Status != 429 && !e.Auth()
 }
+
+// Auth reports whether the control plane refused the worker's token.
+func (e *HTTPError) Auth() bool { return e.Status == 401 || e.Status == 403 }
 
 func (c *Client) Post(ctx context.Context, path string, in, out any) error {
 	body, err := json.Marshal(in)

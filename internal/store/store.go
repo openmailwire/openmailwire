@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"time"
@@ -129,12 +130,10 @@ func nullInt(n int) any {
 	return n
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
+// truncate cuts s to at most n bytes on a character boundary, after making
+// it valid UTF-8 without NUL bytes (protocol.CleanText), so PostgreSQL can
+// store it.
+func truncate(s string, n int) string { return protocol.CleanText(s, n) }
 
 // ---- projects and API keys ----
 
@@ -156,19 +155,34 @@ type Worker struct {
 	Draining   bool       `json:"draining"`
 	LastSeenAt *time.Time `json:"last_seen_at"`
 	Kind       string     `json:"kind"` // "direct" or "relay", as last announced by the worker
+	// Role is what the token may do (protocol.Role*): "any" for tokens
+	// created before roles existed.
+	Role      string          `json:"role"`
+	SelfCheck json.RawMessage `json:"self_check,omitempty"` // protocol.SelfCheck from the last heartbeat
 }
 
-const workerCols = `id::text, name, ip, ehlo, capacity, version, draining, last_seen_at, kind`
+const workerCols = `id::text, name, ip, ehlo, capacity, version, draining, last_seen_at, kind, role, self_check`
 
 func scanWorker(row pgx.Row) (Worker, error) {
 	var w Worker
-	err := row.Scan(&w.ID, &w.Name, &w.IP, &w.EHLO, &w.Capacity, &w.Version, &w.Draining, &w.LastSeenAt, &w.Kind)
+	err := row.Scan(&w.ID, &w.Name, &w.IP, &w.EHLO, &w.Capacity, &w.Version, &w.Draining, &w.LastSeenAt, &w.Kind,
+		&w.Role, &w.SelfCheck)
 	return w, err
 }
 
+// CreateWorker registers a worker whose token may do anything a worker
+// token can (role "any"). New tokens should have a role:
+// CreateWorkerWithRole.
 func (s *Store) CreateWorker(ctx context.Context, name string, hash []byte) (string, error) {
+	return s.CreateWorkerWithRole(ctx, name, protocol.RoleAny, hash)
+}
+
+// CreateWorkerWithRole registers a worker whose token has one role
+// (protocol.RoleDelivery, RoleInbound or RoleRelay).
+func (s *Store) CreateWorkerWithRole(ctx context.Context, name, role string, hash []byte) (string, error) {
 	var id string
-	err := s.Pool.QueryRow(ctx, `INSERT INTO workers (name, token_hash) VALUES ($1, $2) RETURNING id::text`, name, hash).Scan(&id)
+	err := s.Pool.QueryRow(ctx, `INSERT INTO workers (name, token_hash, role) VALUES ($1, $2, $3) RETURNING id::text`,
+		name, hash, role).Scan(&id)
 	if isUniqueViolation(err) {
 		return "", ErrConflict
 	}
@@ -210,9 +224,14 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string, hb protocol.Hear
 	if kind == "" {
 		kind = protocol.KindDirect
 	}
+	var check []byte
+	if hb.SelfCheck != nil {
+		check, _ = json.Marshal(hb.SelfCheck)
+	}
 	err = s.Pool.QueryRow(ctx, `UPDATE workers SET ip = $2, ehlo = $3, capacity = $4, version = $5, kind = $6,
-			last_seen_at = now()
-		WHERE id = $1 RETURNING draining`, workerID, hb.PublicIP, hb.EHLO, hb.Capacity, hb.Version, kind).Scan(&draining)
+			self_check = COALESCE($7, self_check), last_seen_at = now()
+		WHERE id = $1 RETURNING draining`, workerID, truncate(hb.PublicIP, 64), truncate(hb.EHLO, 255), hb.Capacity,
+		truncate(hb.Version, 64), kind, check).Scan(&draining)
 	return draining, noRows(err)
 }
 
@@ -713,6 +732,8 @@ type LeasedJob struct {
 	protocol.Job
 	SealedRaw  []byte
 	ReturnPath string
+	DomainID   string // the sending domain, "" when it was deleted
+	Scheduled  bool   // sent with scheduled_at: dated and signed again when leased
 }
 
 // Lease hands up to max due deliveries to a direct worker. Each gets a
@@ -737,27 +758,45 @@ func (s *Store) Report(ctx context.Context, workerID string, r protocol.Report) 
 
 // ReportOptions carries the control plane settings a report needs.
 type ReportOptions struct {
-	DomainConcurrency int // OMW_DOMAIN_CONCURRENCY: the most a domain's limit can grow back to
+	DomainConcurrency int           // OMW_DOMAIN_CONCURRENCY: the most a limit can grow back to, for scopes the rules give no concurrency
+	Rules             *policy.Rules // provider rules; nil means the built-in ones
 }
 
 // ReportAttempt is Report with explicit options. Besides moving the
 // delivery on, a report from a direct worker teaches the control plane about
-// the receiver: a throttling deferral halves the domain's limit and starts a
-// backoff; a delivery raises the limit again (see throttle and relax in delivery.go).
+// the receiver: which mailbox provider the recipient domain's MX belongs to;
+// a throttling deferral (policy.IsThrottle) halves the limit for that
+// provider and sending IP and starts a backoff, once two recipients saw it;
+// a delivery raises the limit again (see throttle and relax in delivery.go).
+// Authentication problems (policy.IsAuthProblem) are recorded for the
+// project's sending domain instead.
+//
+// Locks are taken in the same order as everywhere else: the delivery, then
+// the attempt.
 func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.Report, o ReportOptions) (string, error) {
+	if o.Rules == nil {
+		o.Rules = policy.DefaultRules()
+	}
+	if o.DomainConcurrency < 1 {
+		o.DomainConcurrency = DefaultDomainConcurrency
+	}
+	r.EnhancedCode = truncate(r.EnhancedCode, 16)
+	r.Response = truncate(r.Response, 1000)
+	r.MXHost = truncate(r.MXHost, 255)
+	r.SourceIP = truncate(r.SourceIP, 64)
+	r.TLS = truncate(r.TLS, 16)
+	r.TLSPolicy = truncate(r.TLSPolicy, 300)
+	r.Stage = truncate(r.Stage, 16)
+
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var deliveryID, attemptWorker, workerKind string
-	var reportedAt *time.Time
-	var startedAt time.Time
-	err = tx.QueryRow(ctx, `SELECT a.delivery_id::text, COALESCE(a.worker_id::text, ''), a.reported_at, a.started_at,
-			COALESCE(w.kind, 'direct')
-		FROM attempts a LEFT JOIN workers w ON w.id = a.worker_id WHERE a.id = $1 FOR UPDATE OF a`, r.AttemptID).
-		Scan(&deliveryID, &attemptWorker, &reportedAt, &startedAt, &workerKind)
+	var deliveryID, attemptWorker string
+	err = tx.QueryRow(ctx, `SELECT delivery_id::text, COALESCE(worker_id::text, '') FROM attempts WHERE id = $1`, r.AttemptID).
+		Scan(&deliveryID, &attemptWorker)
 	if err != nil {
 		return "", noRows(err)
 	}
@@ -765,17 +804,27 @@ func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.R
 		return "", ErrForbidden
 	}
 
-	var status, emailID, rcpt, rcptDomain, projectID string
+	var status, emailID, rcpt, rcptDomain, projectID, fromAddr string
 	var leaseAttempt *string
 	var attempts int
 	var expiresAt time.Time
 	var retryUncertain bool
-	err = tx.QueryRow(ctx, `SELECT d.status, d.email_id::text, d.rcpt, d.rcpt_domain, e.project_id::text,
+	err = tx.QueryRow(ctx, `SELECT d.status, d.email_id::text, d.rcpt, d.rcpt_domain, e.project_id::text, e.from_addr,
 			d.lease_attempt::text, d.attempts, e.expires_at, e.retry_uncertain
 		FROM deliveries d JOIN emails e ON e.id = d.email_id WHERE d.id = $1 FOR UPDATE OF d`, deliveryID).
-		Scan(&status, &emailID, &rcpt, &rcptDomain, &projectID, &leaseAttempt, &attempts, &expiresAt, &retryUncertain)
+		Scan(&status, &emailID, &rcpt, &rcptDomain, &projectID, &fromAddr, &leaseAttempt, &attempts, &expiresAt, &retryUncertain)
 	if err != nil {
 		return "", err
+	}
+
+	var reportedAt *time.Time
+	var startedAt time.Time
+	var workerKind, workerIP string
+	err = tx.QueryRow(ctx, `SELECT a.reported_at, a.started_at, COALESCE(w.kind, 'direct'), COALESCE(w.ip, '')
+		FROM attempts a LEFT JOIN workers w ON w.id = a.worker_id WHERE a.id = $1 FOR UPDATE OF a`, r.AttemptID).
+		Scan(&reportedAt, &startedAt, &workerKind, &workerIP)
+	if err != nil {
+		return "", noRows(err)
 	}
 	if reportedAt != nil {
 		return status, nil
@@ -783,8 +832,8 @@ func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.R
 
 	if _, err := tx.Exec(ctx, `UPDATE attempts SET reported_at = now(), finished_at = COALESCE(finished_at, now()),
 			outcome = $2, smtp_code = $3, enhanced_code = $4, response = $5, mx_host = $6, source_ip = $7, tls = $8
-		WHERE id = $1`, r.AttemptID, r.Outcome, nullInt(r.SMTPCode), truncate(r.EnhancedCode, 16),
-		truncate(r.Response, 1000), truncate(r.MXHost, 255), truncate(r.SourceIP, 64), truncate(r.TLS, 16)); err != nil {
+		WHERE id = $1`, r.AttemptID, r.Outcome, nullInt(r.SMTPCode), r.EnhancedCode,
+		r.Response, r.MXHost, r.SourceIP, r.TLS); err != nil {
 		return "", err
 	}
 
@@ -793,19 +842,22 @@ func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.R
 		"response": truncate(r.Response, 300), "mx_host": r.MXHost,
 	}
 	if r.TLSPolicy != "" {
-		ev["tls_policy"] = truncate(r.TLSPolicy, 300)
+		ev["tls_policy"] = r.TLSPolicy
 	}
-	eventData, _ := json.Marshal(ev)
+	if r.Stage != "" {
+		ev["stage"] = r.Stage
+	}
 
 	if leaseAttempt == nil || *leaseAttempt != r.AttemptID {
 		if r.Outcome == protocol.OutcomeDelivered && status != "delivered" {
 			if _, err := tx.Exec(ctx, `UPDATE deliveries SET status = 'delivered', lease_worker = NULL, lease_attempt = NULL,
 					lease_expires_at = NULL, last_code = $2, last_response = $3, updated_at = now() WHERE id = $1`,
-				deliveryID, nullInt(r.SMTPCode), truncate(r.Response, 1000)); err != nil {
+				deliveryID, nullInt(r.SMTPCode), r.Response); err != nil {
 				return "", err
 			}
 			status = "delivered"
 		}
+		eventData, _ := json.Marshal(ev)
 		if _, err := tx.Exec(ctx, `INSERT INTO events (email_id, delivery_id, type, data) VALUES ($1, $2, $3, $4)`,
 			emailID, deliveryID, "late_report_"+r.Outcome, eventData); err != nil {
 			return "", err
@@ -813,13 +865,24 @@ func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.R
 		return status, tx.Commit(ctx)
 	}
 
+	greylisted := policy.IsGreylist(r.Outcome, r.SMTPCode, r.Response)
+	if greylisted {
+		ev["greylisted"] = true
+	}
+	eventData, _ := json.Marshal(ev)
 	dec := policy.Decide(policy.Input{
 		Outcome: r.Outcome, Attempts: attempts, Now: time.Now(), ExpiresAt: expiresAt,
 		RetryUncertain: retryUncertain, SMTPCode: r.SMTPCode, EnhancedCode: r.EnhancedCode,
+		Greylisted: greylisted, Jitter: rand.Float64(),
 	})
+	grey := 0
+	if greylisted {
+		grey = 1
+	}
 	if _, err := tx.Exec(ctx, `UPDATE deliveries SET status = $2, next_attempt_at = $3, lease_worker = NULL,
-			lease_attempt = NULL, lease_expires_at = NULL, last_code = $4, last_response = $5, updated_at = now()
-		WHERE id = $1`, deliveryID, dec.Status, dec.NextAttempt, nullInt(r.SMTPCode), truncate(r.Response, 1000)); err != nil {
+			lease_attempt = NULL, lease_expires_at = NULL, last_code = $4, last_response = $5,
+			greylists = greylists + $6, updated_at = now()
+		WHERE id = $1`, deliveryID, dec.Status, dec.NextAttempt, nullInt(r.SMTPCode), r.Response, grey); err != nil {
 		return "", err
 	}
 	if dec.Suppress {
@@ -832,12 +895,19 @@ func (s *Store) ReportAttempt(ctx context.Context, workerID string, r protocol.R
 	// What the attempt teaches about the receiver is recorded just before
 	// the attempt's own event, so the timeline still ends with the outcome.
 	if workerKind == protocol.KindDirect {
-		at := attemptRef{emailID: emailID, deliveryID: deliveryID, domain: rcptDomain, startedAt: startedAt}
+		scope, err := learnProvider(ctx, tx, o.Rules, rcptDomain, r.MXHost)
+		if err != nil {
+			return "", fmt.Errorf("provider: %w", err)
+		}
+		at := attemptRef{emailID: emailID, deliveryID: deliveryID, rcpt: rcpt, scope: scope, ip: workerIP, startedAt: startedAt}
+		ceiling := o.Rules.Concurrency(scope, o.DomainConcurrency)
 		switch {
-		case policy.IsThrottle(r.Outcome, r.SMTPCode, r.EnhancedCode, r.Response):
-			err = throttle(ctx, tx, at, o.DomainConcurrency)
+		case policy.IsAuthProblem(r.EnhancedCode) && r.Outcome != protocol.OutcomeDelivered && r.SMTPCode >= 400:
+			err = recordAuthIssue(ctx, tx, at, projectID, fromAddr, r.EnhancedCode, r.Response)
+		case policy.IsThrottle(r.Outcome, r.SMTPCode, r.EnhancedCode, r.Stage):
+			err = throttle(ctx, tx, at, ceiling)
 		case r.Outcome == protocol.OutcomeDelivered:
-			err = relax(ctx, tx, at, o.DomainConcurrency)
+			err = relax(ctx, tx, at, ceiling)
 		}
 		if err != nil {
 			return "", fmt.Errorf("receiver state: %w", err)
@@ -872,6 +942,19 @@ func (s *Store) Sweep(ctx context.Context, retention time.Duration) error {
 		                  AND d.status IN ('queued', 'sending', 'deferred', 'held'))`, retention.Seconds()); err != nil { // lane B: keep held mail until decided
 		return fmt.Errorf("purge: %w", err)
 	}
+	// Throttling state of a scope that has been quiet for a day is
+	// forgotten; warm-up counts are needed for today only; DKIM keys past
+	// their overlap are no longer published.
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM receiver_state
+		WHERE updated_at < now() - interval '1 day' AND (backoff_until IS NULL OR backoff_until < now())`); err != nil {
+		return fmt.Errorf("purge receiver state: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM warmup_usage WHERE day < (now() AT TIME ZONE 'UTC')::date - 2`); err != nil {
+		return fmt.Errorf("purge warm-up usage: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM dkim_keys WHERE state = 'retiring' AND retire_at < now()`); err != nil {
+		return fmt.Errorf("purge retired dkim keys: %w", err)
+	}
 	// Finished webhook deliveries hold addresses and subjects; keep them only
 	// as long as message bodies.
 	if _, err := s.Pool.Exec(ctx, `DELETE FROM webhook_deliveries
@@ -884,6 +967,9 @@ func (s *Store) Sweep(ctx context.Context, retention time.Duration) error {
 // reclaimLeases handles workers that never reported. The receiver may or
 // may not have the message, so the attempt is recorded as unknown and the
 // message's retry_uncertain setting decides whether it is sent again.
+//
+// Like ReportAttempt it locks deliveries first, then attempts; a delivery
+// whose report is being stored right now is locked, so it is skipped.
 func (s *Store) reclaimLeases(ctx context.Context) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -894,6 +980,7 @@ func (s *Store) reclaimLeases(ctx context.Context) error {
 			e.expires_at, e.retry_uncertain
 		FROM deliveries d JOIN emails e ON e.id = d.email_id
 		WHERE d.status = 'sending' AND d.lease_expires_at < now()
+		ORDER BY d.id
 		FOR UPDATE OF d SKIP LOCKED`)
 	if err != nil {
 		return err
@@ -924,7 +1011,7 @@ func (s *Store) reclaimLeases(ctx context.Context) error {
 	for _, l := range all {
 		dec := policy.Decide(policy.Input{
 			Outcome: protocol.OutcomeUnknown, Attempts: l.attempts, Now: time.Now(),
-			ExpiresAt: l.expires, RetryUncertain: l.retry,
+			ExpiresAt: l.expires, RetryUncertain: l.retry, Jitter: rand.Float64(),
 		})
 		if _, err := tx.Exec(ctx, `UPDATE deliveries SET status = $2, next_attempt_at = $3, lease_worker = NULL,
 				lease_attempt = NULL, lease_expires_at = NULL,

@@ -1,0 +1,20 @@
+{
+  "comment": "Mailbox providers, recognised by their MX host names. Limits and warm-up apply per provider and sending IP. Copy this file, edit it and point OMW_PROVIDER_RULES at it to change them.",
+  "default_warmup": [50, 100, 200, 400, 800, 1500, 3000, 6000, 12000, 25000, 50000, 100000],
+  "providers": [
+    {"name": "google", "mx_suffixes": ["google.com", "googlemail.com"], "concurrency": 20, "warmup": "default"},
+    {"name": "microsoft", "mx_suffixes": ["protection.outlook.com", "hotmail.com", "outlook.com"], "concurrency": 10, "warmup": "default"},
+    {"name": "yahoo", "mx_suffixes": ["yahoodns.net", "yahoo.com", "aol.com"], "concurrency": 5, "warmup": "default"},
+    {"name": "apple", "mx_suffixes": ["icloud.com", "me.com", "mac.com"], "concurrency": 10, "warmup": "default"},
+    {"name": "zoho", "mx_suffixes": ["zoho.com", "zoho.eu", "zoho.in", "zohomail.com"], "concurrency": 10},
+    {"name": "proton", "mx_suffixes": ["protonmail.ch"], "concurrency": 10},
+    {"name": "fastmail", "mx_suffixes": ["messagingengine.com"], "concurrency": 10},
+    {"name": "yandex", "mx_suffixes": ["yandex.net", "yandex.ru"], "concurrency": 10},
+    {"name": "mailru", "mx_suffixes": ["mail.ru"], "concurrency": 10},
+    {"name": "gmx", "mx_suffixes": ["gmx.net", "gmx.com", "web.de"], "concurrency": 10},
+    {"name": "comcast", "mx_suffixes": ["comcast.net"], "concurrency": 5},
+    {"name": "mimecast", "mx_suffixes": ["mimecast.com"], "concurrency": 10},
+    {"name": "proofpoint", "mx_suffixes": ["pphosted.com", "ppe-hosted.com"], "concurrency": 10},
+    {"name": "barracuda", "mx_suffixes": ["barracudanetworks.com"], "concurrency": 10}
+  ]
+}

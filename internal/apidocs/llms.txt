@@ -74,6 +74,9 @@ Domains:
 - `GET /domains/{id}`: one domain, with the result of each record's last check.
 - `POST /domains/{id}/verify`: check its DNS now. Full access.
 - `DELETE /domains/{id}`: remove it. Full access.
+- `GET /domains/{id}/dkim`: its DKIM keys with their records, and authentication problems receivers reported.
+- `POST /domains/{id}/dkim/rotate`: rotate the DKIM key: the first call gives a new record to publish, the next call (once it is published) switches signing to it. The old record stays needed until its `retire_at`. Full access.
+- `POST /domains/{id}/dkim/ed25519`: `{"enabled": true}` adds an Ed25519 signature next to RSA, in the same two steps; `false` removes it. Full access.
 
 Webhooks (full access):
 - `POST /webhooks`: register `{"endpoint": "https://…", "events": [...], "asymmetric_signing": false}`. Returns `signing_secret` (`whsec_…`) once; with `asymmetric_signing`, also `public_key` (`whpk_…`, Ed25519). At most 10 per project (`409 webhook_limit_reached`).
@@ -144,6 +147,7 @@ Every error is `{"statusCode": 422, "name": "validation_error", "message": "…"
 - `cannot_cancel` (409): every recipient was already attempted or finished. `GET /emails/{id}` shows what happened.
 - `domain_exists` (409): this project already has the domain; find it with `GET /domains`.
 - `domain_verified_elsewhere` (409): another project verified this domain first. Only one project can have it verified.
+- `dkim_record_not_found` (409): the new DKIM key's TXT record is not in DNS yet. Publish the record the message names, wait, and call again; do not loop.
 - `payload_too_large` (413): the body is over 20 MB. Attachments: at most 10 MB decoded and 20 files.
 - `validation_error` (422): fix the field the message names. Never retry unchanged.
 - `rate_limit_exceeded` (429): the key's hourly or daily cap, or too many requests per second. Wait `Retry-After` seconds, then retry with the same `Idempotency-Key`. If the wait is long, tell the user.
