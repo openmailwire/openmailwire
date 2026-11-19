@@ -413,7 +413,9 @@ func (s *Server) replyToMessage(root func() http.Handler) http.HandlerFunc {
 		defer resp.Body.Close()
 		out, _ := io.ReadAll(resp.Body)
 		var sent struct {
-			ID string `json:"id"`
+			ID          string   `json:"id"`
+			Held        bool     `json:"held"`         // lane B: held for approval
+			HoldReasons []string `json:"hold_reasons"` // lane B
 		}
 		if resp.StatusCode/100 != 2 || json.Unmarshal(out, &sent) != nil || sent.ID == "" {
 			// Send refusals (domain, policy, limits) reach the caller as they are.
@@ -433,7 +435,11 @@ func (s *Server) replyToMessage(root func() http.Handler) http.HandlerFunc {
 		if v := resp.Header.Get("Idempotent-Replayed"); v != "" {
 			w.Header().Set("Idempotent-Replayed", v)
 		}
-		writeJSON(w, resp.StatusCode, map[string]string{"id": sent.ID, "thread_id": m.ThreadID})
+		out2 := map[string]any{"id": sent.ID, "thread_id": m.ThreadID}
+		if sent.Held { // lane B: say the reply waits for approval
+			out2["held"], out2["hold_reasons"] = true, sent.HoldReasons
+		}
+		writeJSON(w, resp.StatusCode, out2)
 	}
 }
 

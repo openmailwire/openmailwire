@@ -12,9 +12,11 @@ var mcpTools = []string{
 	"send_email", "get_email", "list_emails", "cancel_email",
 	"list_domains", "add_domain", "verify_domain",
 	"list_inboxes", "list_messages", "read_message", "reply_to_message", "wait_for_reply",
+	"check_email", "list_held", "approve_email", "reject_email", "list_suppressions", "add_suppression", "list_pauses",
 }
 
-var deliveryStatuses = []string{"queued", "sending", "deferred", "delivered", "bounced", "suppressed", "expired", "unknown", "canceled"}
+var deliveryStatuses = []string{"queued", "sending", "deferred", "delivered", "bounced", "suppressed", "expired", "unknown", "canceled",
+	"held", "rejected"}
 
 func TestLLMsTxt(t *testing.T) {
 	text := string(llmsTxt)

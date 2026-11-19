@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -40,6 +41,11 @@ type Control struct {
 	FBLAddress       string        // where feedback loops (ARF complaints) are sent
 	InboundRetention time.Duration // inbound message bodies are purged this long after arrival
 	InboundMaxSize   int64         // largest inbound message, in bytes
+
+	// PublicURL (OMW_PUBLIC_URL) is where people and mailbox providers
+	// reach this control plane, e.g. https://mail.example.com. Broadcast
+	// mail needs it for its one-click unsubscribe links (lane B).
+	PublicURL string
 }
 
 // DatabaseURL returns DATABASE_URL or an error when it is unset.
@@ -102,7 +108,25 @@ func LoadControl() (Control, error) {
 	if c.InboundMaxSize, err = envSize("OMW_INBOUND_MAX_SIZE", DefaultInboundMaxSize); err != nil {
 		return c, err
 	}
+	if c.PublicURL, err = PublicURL(os.Getenv("OMW_PUBLIC_URL")); err != nil { // lane B
+		return c, err
+	}
 	return c, nil
+}
+
+// PublicURL checks OMW_PUBLIC_URL and returns it without a trailing slash.
+// Empty is allowed: broadcast mail is then refused.
+func PublicURL(raw string) (string, error) {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+		u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("OMW_PUBLIC_URL must be an absolute http(s) URL without a query, like https://mail.example.com")
+	}
+	return raw, nil
 }
 
 // DefaultInboundMaxSize is the largest inbound message accepted by default.

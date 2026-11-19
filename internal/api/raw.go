@@ -26,6 +26,7 @@ type rawRequest struct {
 	Raw      string   `json:"raw"`
 	MailFrom string   `json:"mail_from"`
 	Rcpts    []string `json:"rcpts"`
+	Stream   string   `json:"stream"` // lane B; or an X-OMW-Stream header in the message
 }
 
 // sendRaw queues a complete RFC 5322 message, as written by a mail library
@@ -93,6 +94,11 @@ func (s *Server) sendRaw(w http.ResponseWriter, r *http.Request) {
 		pe.write(w)
 		return
 	}
+	safe, pe := s.rawSafety(r, req.Stream, msg, data, recipients) // lane B: stream, headers, approval holds
+	if pe != nil {
+		pe.write(w)
+		return
+	}
 
 	dom, pe := s.senderDomain(ctx, projectID(r), domainOf(from))
 	if pe != nil {
@@ -136,6 +142,7 @@ func (s *Server) sendRaw(w http.ResponseWriter, r *http.Request) {
 		MessageID: messageID, ReturnPath: dom.ReturnPath,
 		IdempotencyKey: idem, RequestHash: hash[:], Raw: s.Sealer.Seal(signed),
 		RetryUncertain: true, ExpiresAt: now.Add(s.Cfg.DefaultExpiry), Recipients: recipients,
+		Stream: safe.stream, Hold: safe.hold, // lane B
 	}})
 	if pe != nil {
 		pe.write(w)
@@ -144,7 +151,7 @@ func (s *Server) sendRaw(w http.ResponseWriter, r *http.Request) {
 	if out[0].Replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": out[0].ID})
+	writeJSON(w, http.StatusOK, sentBody(out[0], safe.hold)) // lane B
 }
 
 // rawMessage is a parsed message whose header fields are kept byte for

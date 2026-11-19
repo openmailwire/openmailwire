@@ -344,6 +344,11 @@ type NewEmail struct {
 	ExpiresAt      time.Time
 	ScheduledAt    *time.Time // the first delivery attempt; nil means now
 	Recipients     []string   // envelope recipients, lowercased and deduplicated
+	// Lane B (agent safety, safety.go): Stream ("" is transactional) picks
+	// the suppressions that apply; with Hold, unsuppressed recipients are
+	// stored as 'held' until approved.
+	Stream string
+	Hold   *Hold
 }
 
 // Inserted is the outcome of storing one NewEmail.
@@ -414,7 +419,7 @@ func (s *Store) insertEmails(ctx context.Context, es []NewEmail, caps *SendCaps)
 				return nil, err
 			}
 		}
-		sup, err := suppressedAmong(ctx, tx, e.ProjectID, e.Recipients)
+		sup, err := suppressedAmong(ctx, tx, e.ProjectID, e.Recipients, e.Stream)
 		if err != nil {
 			return nil, err
 		}
@@ -439,10 +444,10 @@ func (s *Store) insertEmails(ctx context.Context, es []NewEmail, caps *SendCaps)
 	return out, tx.Commit(ctx)
 }
 
-func suppressedAmong(ctx context.Context, tx pgx.Tx, projectID string, rcpts []string) (map[string]bool, error) {
+func suppressedAmong(ctx context.Context, tx pgx.Tx, projectID string, rcpts []string, stream string) (map[string]bool, error) {
 	suppressed := map[string]bool{}
-	rows, err := tx.Query(ctx, `SELECT address FROM suppressions WHERE project_id = $1 AND address = ANY($2)`,
-		projectID, rcpts)
+	rows, err := tx.Query(ctx, `SELECT DISTINCT address FROM suppressions WHERE project_id = $1 AND address = ANY($2)
+		AND stream = ANY($3)`, projectID, rcpts, suppressionStreams(stream))
 	if err != nil {
 		return nil, err
 	}
@@ -501,6 +506,8 @@ func insertEmail(ctx context.Context, tx pgx.Tx, e NewEmail, suppressed map[stri
 		status := "queued"
 		if suppressed[rcpt] {
 			status = "suppressed"
+		} else if e.Hold != nil {
+			status = "held" // lane B: waits for POST /emails/{id}/approve
 		}
 		var deliveryID string
 		if err := tx.QueryRow(ctx, `INSERT INTO deliveries (email_id, rcpt, rcpt_domain, status, next_attempt_at)
@@ -518,6 +525,9 @@ func insertEmail(ctx context.Context, tx pgx.Tx, e NewEmail, suppressed map[stri
 				return err
 			}
 		}
+	}
+	if e.Hold != nil {
+		return insertHold(ctx, tx, e) // lane B
 	}
 	return nil
 }
@@ -830,7 +840,7 @@ func (s *Store) Sweep(ctx context.Context, retention time.Duration) error {
 	if _, err := s.Pool.Exec(ctx, `UPDATE emails SET raw = NULL, purged_at = now()
 		WHERE raw IS NOT NULL AND created_at < now() - make_interval(secs => $1)
 		  AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.email_id = emails.id
-		                  AND d.status IN ('queued', 'sending', 'deferred'))`, retention.Seconds()); err != nil {
+		                  AND d.status IN ('queued', 'sending', 'deferred', 'held'))`, retention.Seconds()); err != nil { // lane B: keep held mail until decided
 		return fmt.Errorf("purge: %w", err)
 	}
 	// Finished webhook deliveries hold addresses and subjects; keep them only

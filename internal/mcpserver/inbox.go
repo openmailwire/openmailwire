@@ -267,9 +267,11 @@ type ReplyInput struct {
 }
 
 type ReplyOutput struct {
-	ID       string `json:"id"`
-	ThreadID string `json:"thread_id"`
-	Next     string `json:"next"`
+	ID          string   `json:"id"`
+	ThreadID    string   `json:"thread_id"`
+	Held        bool     `json:"held,omitempty"`         // lane B: held for approval
+	HoldReasons []string `json:"hold_reasons,omitempty"` // lane B
+	Next        string   `json:"next"`
 }
 
 func (t *tools) replyToMessage(ctx context.Context, _ *mcp.CallToolRequest, in ReplyInput) (*mcp.CallToolResult, ReplyOutput, error) {
@@ -292,6 +294,10 @@ func (t *tools) replyToMessage(ctx context.Context, _ *mcp.CallToolRequest, in R
 		return nil, ReplyOutput{}, err
 	}
 	out.Next = "call get_email with this id to see delivery, or wait_for_reply to wait for the answer"
+	if out.Held { // lane B
+		out.Next = heldNext(out.HoldReasons)
+		return text(fmt.Sprintf("Reply %s is held for approval, not sent: %s.", out.ID, out.Next)), out, nil
+	}
 	return nil, out, nil
 }
 

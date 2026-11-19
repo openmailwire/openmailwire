@@ -71,6 +71,7 @@ type sendRequest struct {
 	ScheduledAt    *time.Time          `json:"scheduled_at"`
 	RetryUncertain *bool               `json:"retry_uncertain"`
 	Attachments    []attachmentRequest `json:"attachments"`
+	Stream         string              `json:"stream"` // lane B: transactional (default) or broadcast
 }
 
 var tagRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
@@ -86,6 +87,7 @@ type sendPlan struct {
 	retryUncertain bool
 	scheduled      *time.Time
 	expires        time.Time
+	safety         *safetyPlan // lane B: set by planSafety (safety.go)
 }
 
 // validateSend checks a send request without touching the database.
@@ -203,7 +205,7 @@ func (s *Server) newEmail(p *sendPlan, dom store.Domain, now time.Time) (store.N
 	req := p.req
 	raw, err := message.Build(message.Input{
 		From: req.From, To: req.To, Cc: req.Cc, ReplyTo: req.ReplyTo,
-		Subject: req.Subject, Text: req.Text, HTML: req.HTML, Headers: req.Headers,
+		Subject: req.Subject, Text: req.Text, HTML: req.HTML, Headers: p.messageHeaders(), // lane B adds Feedback-ID and unsubscribe
 		MessageID: id + "@" + dom.Name, Date: now, Attachments: p.attachments,
 	})
 	if err != nil {
@@ -217,7 +219,7 @@ func (s *Server) newEmail(p *sendPlan, dom store.Domain, now time.Time) (store.N
 		ID: id, DomainID: dom.ID, From: req.From, To: req.To, Cc: req.Cc, Bcc: req.Bcc, Subject: req.Subject,
 		MessageID: id + "@" + dom.Name, ReturnPath: dom.ReturnPath, Raw: s.Sealer.Seal(signed),
 		Tags: p.tags, RetryUncertain: p.retryUncertain, ExpiresAt: p.expires, ScheduledAt: p.scheduled,
-		Recipients: p.recipients,
+		Recipients: p.recipients, Stream: p.stream(), Hold: p.hold(), // lane B
 	}, nil
 }
 
@@ -242,6 +244,9 @@ func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	plan, pe := validateSend(req, now, s.Cfg.DefaultExpiry)
+	if pe == nil {
+		pe = s.planSafety(r, plan) // lane B: stream, headers, approval holds
+	}
 	if pe != nil {
 		pe.write(w)
 		return
@@ -269,7 +274,7 @@ func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
 	if out[0].Replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": out[0].ID})
+	writeJSON(w, http.StatusOK, sentBody(out[0], e.Hold)) // lane B: {"id"}, plus "held" when held
 }
 
 // sendBatch queues up to 100 emails, all or none. Every item is validated
@@ -320,6 +325,9 @@ func (s *Server) sendBatch(w http.ResponseWriter, r *http.Request) {
 		if pe == nil {
 			pe = allowedBy(key.Policy, plan.from, plan.recipients)
 		}
+		if pe == nil {
+			pe = s.planSafety(r, plan) // lane B
+		}
 		if pe != nil {
 			pe.prefixed(prefix).write(w)
 			return
@@ -360,7 +368,7 @@ func (s *Server) sendBatch(w http.ResponseWriter, r *http.Request) {
 		pe.write(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, batchResponse(out))
+	writeJSON(w, http.StatusOK, batchSent(out, es)) // lane B: batchResponse plus "held"
 }
 
 func batchResponse(out []store.Inserted) map[string]any {

@@ -42,10 +42,17 @@ const (
 	EmailCanceled        = "email.canceled"
 	EmailComplained      = "email.complained" // the recipient reported the email as spam (ARF)
 	EmailReceived        = "email.received"   // an inbox received a message
+
+	// Agent safety (lane B).
+	EmailHeld     = "email.held"     // held for approval by the sending key's require_approval policy
+	EmailApproved = "email.approved" // approved; delivery starts
+	EmailRejected = "email.rejected" // rejected; never sent
+	SendingPaused = "sending.paused" // a circuit breaker paused a key, domain or project
 )
 
 var Types = []string{EmailSent, EmailDelivered, EmailDeliveryDelayed, EmailBounced, EmailFailed, EmailSuppressed,
-	EmailDeliveryUnknown, EmailCanceled, EmailComplained, EmailReceived}
+	EmailDeliveryUnknown, EmailCanceled, EmailComplained, EmailReceived,
+	EmailHeld, EmailApproved, EmailRejected, SendingPaused}
 
 func ValidType(t string) bool {
 	for _, v := range Types {
@@ -80,6 +87,14 @@ func ExternalType(internal string) string {
 		return EmailComplained
 	case "received":
 		return EmailReceived
+	case "held":
+		return EmailHeld
+	case "approved":
+		return EmailApproved
+	case "rejected":
+		return EmailRejected
+	case "sending_paused":
+		return SendingPaused
 	}
 	return ""
 }
@@ -133,6 +148,11 @@ type data struct {
 	Inbox            string   `json:"inbox,omitempty"`
 	ThreadID         string   `json:"thread_id,omitempty"`
 	InReplyToEmailID string   `json:"in_reply_to_email_id,omitempty"`
+
+	// Lane B. email.held/approved/rejected: the hold reasons, or who
+	// decided with their note. sending.paused: the pause and its rates.
+	Approval json.RawMessage `json:"approval,omitempty"`
+	Pause    json.RawMessage `json:"pause,omitempty"`
 }
 
 type complaint struct {
@@ -186,6 +206,20 @@ func Payload(ev store.EventRow, typ string) ([]byte, error) {
 		var c complaint
 		json.Unmarshal(ev.Data, &c)
 		p.Data.Complaint = &c
+	}
+	switch typ { // lane B
+	case EmailHeld, EmailApproved, EmailRejected:
+		p.Data.Delivery = nil
+		if len(ev.Data) > 0 && json.Valid(ev.Data) {
+			p.Data.Approval = ev.Data
+		}
+	case SendingPaused:
+		p.Data.Delivery = nil
+		var d struct {
+			Pause json.RawMessage `json:"pause"`
+		}
+		json.Unmarshal(ev.Data, &d)
+		p.Data.Pause = d.Pause
 	}
 	if typ == EmailReceived {
 		p.Data.Delivery = nil
