@@ -95,6 +95,7 @@ func (s *Server) createInbox(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "create inbox", err)
 		return
 	}
+	s.audit(r, "inbox.created", "inbox", b.ID, map[string]any{"address": b.Address}) // audit log (lane A hook)
 	writeJSON(w, http.StatusCreated, inboxView(b))
 }
 
@@ -144,6 +145,7 @@ func (s *Server) deleteInbox(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "delete inbox", err)
 		return
 	}
+	s.audit(r, "inbox.deleted", "inbox", b.ID, map[string]any{"address": b.Address}) // audit log (lane A hook)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "inbox", "id": b.ID, "deleted": true})
 }
 
@@ -437,16 +439,17 @@ func (s *Server) replyToMessage(root func() http.Handler) http.HandlerFunc {
 	}
 }
 
-// replySubject prefixes "Re: " unless the subject already has it.
+// replySubject prefixes "Re: " unless the subject already has it, and
+// keeps it within the 998-byte subject limit either way (lane A, audit
+// R1#10: a long "Re: …" subject was never shortened).
 func replySubject(subject string) string {
 	s := strings.TrimSpace(subject)
 	if s == "" {
 		return "Re: (no subject)"
 	}
-	if len(s) >= 3 && strings.EqualFold(s[:3], "re:") {
-		return s
+	if len(s) < 3 || !strings.EqualFold(s[:3], "re:") {
+		s = "Re: " + s
 	}
-	s = "Re: " + s
 	if len(s) > 998 {
 		s = strings.ToValidUTF8(s[:998], "")
 	}

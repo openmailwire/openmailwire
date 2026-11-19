@@ -89,44 +89,91 @@ func SPFValue(mechanisms []string) string {
 	return strings.Join(append(parts, "-all"), " ")
 }
 
-// Records lists what the domain owner must publish, all marked pending.
+// What each record is for, and the mailbox providers' rules behind it:
+// shown in a record's detail until it checks out. Gmail and Yahoo (since
+// February 2024) and Microsoft's Outlook.com (since May 2025) require from
+// anyone sending them 5,000 or more messages a day: SPF and DKIM, a DMARC
+// record (p=none is enough) aligned with the From domain, one-click
+// unsubscribe on marketing mail, and a spam rate under 0.3%. Smaller
+// senders need SPF or DKIM, and fare better with all three.
+const (
+	guideDKIM = "DKIM signs every message for this domain. Gmail, Yahoo and Microsoft (Outlook.com) require it from bulk senders " +
+		"(5,000+ messages a day to them) and use it to align with your DMARC record."
+	guideSPF = "SPF authorizes OpenMailWire's sending IPs for the return path (envelope sender). Gmail, Yahoo and Microsoft require SPF " +
+		"or DKIM from every sender, and both from bulk senders."
+	guideMX = "The return path needs an MX record so that receivers can send bounces back; many receivers refuse mail whose " +
+		"envelope sender domain has no MX (or A) record."
+	guideMXUnset = "This server has no bounce host (OMW_BOUNCE_MX or OMW_INBOUND_MX), so this record is optional: point the return " +
+		"path at any mail server you run so that receivers accept it, or ask your operator to configure a bounce host."
+	guideDMARC = "DMARC tells receivers what to do with mail that fails SPF and DKIM. Gmail and Yahoo (since 2024) and Microsoft " +
+		"(Outlook.com, since May 2025) require a DMARC record, at least p=none, from bulk senders, and treat mail without one " +
+		"as more likely spam. Start with p=none; add rua=mailto:… to receive reports."
+)
+
+// Records lists what the domain owner must publish, all marked pending,
+// each with what it is for in its detail.
 func Records(s Spec) []Record {
 	recs := []Record{
-		{Record: "DKIM", Type: "TXT", Name: s.DKIMName(), Value: "v=DKIM1; k=rsa; p=" + s.DKIMPublic, Required: true, Status: StatusPending},
-		{Record: "SPF", Type: "TXT", Name: s.ReturnPath, Value: SPFValue(s.SPFMechanisms), Required: true, Status: StatusPending},
+		{Record: "DKIM", Type: "TXT", Name: s.DKIMName(), Value: "v=DKIM1; k=rsa; p=" + s.DKIMPublic, Required: true,
+			Status: StatusPending, Detail: guideDKIM},
+		{Record: "SPF", Type: "TXT", Name: s.ReturnPath, Value: SPFValue(s.SPFMechanisms), Required: true,
+			Status: StatusPending, Detail: guideSPF},
 	}
-	if s.BounceMX != "" {
-		recs = append(recs, Record{Record: "MX", Type: "MX", Name: s.ReturnPath, Value: s.BounceMX, Priority: 10, Required: true, Status: StatusPending})
+	// The return path's MX is always shown. It is required when this server
+	// receives bounces: at OMW_BOUNCE_MX, or else at the inbound host.
+	if bounce := s.bounceHost(); bounce != "" {
+		recs = append(recs, Record{Record: "MX", Type: "MX", Name: s.ReturnPath, Value: bounce, Priority: 10, Required: true,
+			Status: StatusPending, Detail: guideMX})
+	} else {
+		recs = append(recs, Record{Record: "MX", Type: "MX", Name: s.ReturnPath, Priority: 10, Required: false,
+			Status: StatusPending, Detail: guideMXUnset})
 	}
-	recs = append(recs, Record{Record: "DMARC", Type: "TXT", Name: "_dmarc." + s.Domain, Value: "v=DMARC1; p=none;", Required: false, Status: StatusPending})
+	recs = append(recs, Record{Record: "DMARC", Type: "TXT", Name: "_dmarc." + s.Domain, Value: "v=DMARC1; p=none;", Required: true,
+		Status: StatusPending, Detail: guideDMARC})
 	if s.InboundMX != "" {
 		// Only for inboxes: sending never depends on it.
-		recs = append(recs, Record{Record: "INBOUND", Type: "MX", Name: s.Domain, Value: s.InboundMX, Priority: 10, Required: false, Status: StatusPending})
+		recs = append(recs, Record{Record: "INBOUND", Type: "MX", Name: s.Domain, Value: s.InboundMX, Priority: 10, Required: false,
+			Status: StatusPending, Detail: "needed only to receive mail in inboxes on this domain"})
 	}
 	return recs
 }
 
+// bounceHost is where bounces for the return path go, or "" when this
+// server receives none.
+func (s Spec) bounceHost() string {
+	if s.BounceMX != "" {
+		return s.BounceMX
+	}
+	return s.InboundMX
+}
+
 // Check looks every record up. verified is true when all required records
-// are in place.
+// are in place. A record that is not in place keeps its guidance after the
+// reason.
 func Check(ctx context.Context, r Resolver, s Spec) (recs []Record, verified bool) {
 	recs = Records(s)
 	verified = true
 	for i := range recs {
 		rec := &recs[i]
+		guide := rec.Detail
 		switch rec.Record {
 		case "DKIM":
 			rec.Status, rec.Detail = checkDKIM(ctx, r, rec.Name, s.DKIMPublic)
 		case "SPF":
 			rec.Status, rec.Detail = checkSPF(ctx, r, rec.Name, s.SPFMechanisms)
 		case "MX":
-			rec.Status, rec.Detail = checkMX(ctx, r, rec.Name, s.BounceMX)
+			if rec.Value == "" {
+				rec.Status, rec.Detail = checkAnyMX(ctx, r, rec.Name)
+			} else {
+				rec.Status, rec.Detail = checkMX(ctx, r, rec.Name, rec.Value)
+			}
 		case "DMARC":
-			rec.Status, rec.Detail = checkDMARC(ctx, r, rec.Name)
+			rec.Status, rec.Detail = checkDMARC(ctx, r, s.Domain)
 		case "INBOUND":
 			rec.Status, rec.Detail = checkMX(ctx, r, rec.Name, s.InboundMX)
-			if rec.Status != StatusVerified {
-				rec.Detail += " (needed only to receive mail in inboxes on this domain)"
-			}
+		}
+		if rec.Status != StatusVerified {
+			rec.Detail += ". " + guide
 		}
 		if rec.Required && rec.Status != StatusVerified {
 			verified = false
@@ -219,16 +266,70 @@ func checkMX(ctx context.Context, r Resolver, name, want string) (string, string
 	return StatusFailed, "the MX record points to a different host"
 }
 
-func checkDMARC(ctx context.Context, r Resolver, name string) (string, string) {
-	txts, err := r.LookupTXT(ctx, name)
+// checkAnyMX checks that the return path has some MX record, when this
+// server has no bounce host of its own to point it at.
+func checkAnyMX(ctx context.Context, r Resolver, name string) (string, string) {
+	mxs, err := r.LookupMX(ctx, name)
 	if err != nil {
-		st, _ := lookupFailure(err)
-		return st, "no DMARC record found (recommended, not required)"
+		return lookupFailure(err)
 	}
-	for _, t := range txts {
-		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(t)), "V=DMARC1") {
-			return StatusVerified, ""
+	if len(mxs) == 0 {
+		return StatusMissing, "no MX record found"
+	}
+	return StatusVerified, "MX " + strings.TrimSuffix(mxs[0].Host, ".")
+}
+
+// checkDMARC looks for the domain's DMARC record at _dmarc.<domain>, then,
+// as receivers do for a subdomain without one, at its parent domains. It
+// needs exactly one record, with a valid p= (none, quarantine or reject).
+func checkDMARC(ctx context.Context, r Resolver, domain string) (string, string) {
+	labels := strings.Split(domain, ".")
+	for i := 0; i < len(labels)-1 && i < 6; i++ {
+		name := "_dmarc." + strings.Join(labels[i:], ".")
+		txts, err := r.LookupTXT(ctx, name)
+		if err != nil {
+			var de *net.DNSError
+			if errors.As(err, &de) && de.IsNotFound {
+				continue
+			}
+			return StatusPending, "lookup failed: " + err.Error()
 		}
+		var dmarc []string
+		for _, t := range txts {
+			if v, _, _ := strings.Cut(strings.TrimSpace(t), ";"); strings.EqualFold(strings.ReplaceAll(v, " ", ""), "v=DMARC1") {
+				dmarc = append(dmarc, t)
+			}
+		}
+		switch len(dmarc) {
+		case 0:
+			continue
+		case 1:
+		default:
+			return StatusFailed, "more than one DMARC record at " + name + "; receivers ignore them all, so keep one"
+		}
+		tags := map[string]string{}
+		for _, part := range strings.Split(dmarc[0], ";") {
+			if k, v, ok := strings.Cut(part, "="); ok {
+				tags[strings.ToLower(strings.TrimSpace(k))] = strings.ToLower(strings.TrimSpace(v))
+			}
+		}
+		policy := tags["p"]
+		if i > 0 && tags["sp"] != "" {
+			policy = tags["sp"] // the policy for subdomains
+		}
+		switch policy {
+		case "none", "quarantine", "reject":
+		default:
+			return StatusFailed, "the DMARC record at " + name + " has no valid policy; it needs p=none, p=quarantine or p=reject"
+		}
+		detail := ""
+		if i > 0 {
+			detail = "inherited from " + name + "; "
+		}
+		if policy == "none" {
+			detail += "p=none only monitors: once DMARC reports show that all your mail passes, move to p=quarantine, then p=reject"
+		}
+		return StatusVerified, strings.TrimSuffix(detail, "; ")
 	}
-	return StatusMissing, "no DMARC record found (recommended, not required)"
+	return StatusMissing, "no DMARC record found at _dmarc." + domain
 }

@@ -13,7 +13,6 @@ import (
 	"io"
 	"mime"
 	"mime/quotedprintable"
-	"net/mail"
 	"path"
 	"regexp"
 	"sort"
@@ -84,11 +83,19 @@ func ValidateHeaders(h map[string]string) error {
 		if len(v) > 900 {
 			return fmt.Errorf("header %q is longer than 900 bytes", k)
 		}
+		if !Storable(v) || strings.ContainsFunc(v, func(r rune) bool { return (r < 0x20 && r != '\t') || r == 0x7f }) {
+			return fmt.Errorf("header %q contains a NUL or other control character, or bytes that are not UTF-8", k)
+		}
 	}
 	return nil
 }
 
 // Build renders the message. The result is not signed.
+//
+// Every header line is at most 998 bytes: subjects and display names are
+// folded, and Build refuses what cannot be folded to fit (see the Max…
+// caps). When the message has HTML but no text, a text/plain part is made
+// from the HTML (HTMLToText).
 func Build(in Input) ([]byte, error) {
 	if err := ValidateHeaders(in.Headers); err != nil {
 		return nil, err
@@ -96,13 +103,23 @@ func Build(in Input) ([]byte, error) {
 	if in.MessageID == "" {
 		return nil, errors.New("message: MessageID is required")
 	}
-	from, err := mail.ParseAddress(in.From)
+	from, err := ParseAddress("from", in.From)
 	if err != nil {
-		return nil, fmt.Errorf("from: %w", err)
+		return nil, err
+	}
+	if len(in.Subject) > MaxSubject {
+		return nil, fmt.Errorf("subject is longer than %d bytes", MaxSubject)
+	}
+	if in.Text == "" && in.HTML != "" {
+		in.Text = HTMLToText(in.HTML)
+	}
+	atts, err := attachmentParts(in.Attachments)
+	if err != nil {
+		return nil, err
 	}
 
-	var b bytes.Buffer
-	header(&b, "From", from.String())
+	b := bytes.NewBuffer(make([]byte, 0, estimateSize(in)))
+	header(b, "From", formatAddress(from, len("From: ")))
 	for _, f := range []struct {
 		name string
 		list []string
@@ -111,23 +128,27 @@ func Build(in Input) ([]byte, error) {
 			continue
 		}
 		parts := make([]string, 0, len(f.list))
-		for _, a := range f.list {
-			addr, err := mail.ParseAddress(a)
+		for i, a := range f.list {
+			addr, err := ParseAddress(strings.ToLower(f.name), a)
 			if err != nil {
-				return nil, fmt.Errorf("%s: %w", strings.ToLower(f.name), err)
+				return nil, err
 			}
-			parts = append(parts, addr.String())
+			used := 1 // the continuation line's leading space
+			if i == 0 {
+				used = len(f.name) + 2
+			}
+			parts = append(parts, formatAddress(addr, used))
 		}
-		header(&b, f.name, strings.Join(parts, ",\r\n "))
+		header(b, f.name, strings.Join(parts, ",\r\n "))
 	}
-	header(&b, "Subject", encodeText(in.Subject))
+	header(b, "Subject", foldText("Subject", in.Subject))
 	date := in.Date
 	if date.IsZero() {
 		date = time.Now()
 	}
-	header(&b, "Date", date.Format(time.RFC1123Z))
-	header(&b, "Message-ID", "<"+in.MessageID+">")
-	header(&b, "MIME-Version", "1.0")
+	header(b, "Date", date.Format(time.RFC1123Z))
+	header(b, "Message-ID", "<"+in.MessageID+">")
+	header(b, "MIME-Version", "1.0")
 
 	keys := make([]string, 0, len(in.Headers))
 	for k := range in.Headers {
@@ -135,13 +156,9 @@ func Build(in Input) ([]byte, error) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		header(&b, k, encodeText(in.Headers[k]))
+		header(b, k, encodeText(in.Headers[k]))
 	}
 
-	atts, err := attachmentParts(in.Attachments)
-	if err != nil {
-		return nil, err
-	}
 	body := bodyPart(in.Text, in.HTML)
 	var inline, regular []part
 	for i, a := range in.Attachments {
@@ -158,10 +175,10 @@ func Build(in Input) ([]byte, error) {
 		body = multipartPart("mixed", append([]part{body}, regular...))
 	}
 	for _, h := range body.header {
-		header(&b, h[0], h[1])
+		header(b, h[0], h[1])
 	}
 	b.WriteString("\r\n")
-	if err := body.write(&b); err != nil {
+	if err := body.write(b); err != nil {
 		return nil, err
 	}
 	if !body.multipart {
@@ -250,6 +267,27 @@ func ValidateAttachments(atts []Attachment) error {
 	return err
 }
 
+// estimateSize is about how large the rendered message is, so that it is
+// written into one buffer instead of one that keeps growing (and copying).
+func estimateSize(in Input) int {
+	n := 4096 + len(in.Subject)*2
+	for _, l := range [][]string{in.To, in.Cc, in.ReplyTo} {
+		for _, a := range l {
+			n += len(a)*2 + 8
+		}
+	}
+	for k, v := range in.Headers {
+		n += len(k) + len(v)*2 + 4
+	}
+	// Quoted-printable grows typical text by a few percent.
+	n += (len(in.Text) + len(in.HTML)) * 21 / 20
+	for _, a := range in.Attachments {
+		enc := base64.StdEncoding.EncodedLen(len(a.Data))
+		n += enc + enc/76*2 + 512
+	}
+	return n
+}
+
 func attachmentParts(atts []Attachment) ([]part, error) {
 	if len(atts) > MaxAttachments {
 		return nil, fmt.Errorf("at most %d attachments per email", MaxAttachments)
@@ -311,6 +349,9 @@ func validFilename(name string) error {
 // attachmentType returns the Content-Type header value, with the name
 // parameter that older mail clients use.
 func attachmentType(a Attachment) (string, error) {
+	if err := checkContentType(a.ContentType); err != nil {
+		return "", err
+	}
 	ct := a.ContentType
 	if ct == "" {
 		ct = mime.TypeByExtension(strings.ToLower(path.Ext(a.Filename)))
@@ -337,18 +378,29 @@ func attachmentType(a Attachment) (string, error) {
 // gives back exactly the same value.
 func fold(v string) string { return strings.ReplaceAll(v, "; ", ";\r\n ") }
 
-// writeBase64 writes data in 76-character lines (RFC 2045).
+// writeBase64 writes data in 76-character lines (RFC 2045), a few lines at
+// a time, so that a large attachment is never copied whole.
 func writeBase64(w io.Writer, data []byte) error {
-	enc := base64.StdEncoding.EncodeToString(data)
-	var b strings.Builder
-	for len(enc) > 76 {
-		b.WriteString(enc[:76])
-		b.WriteString("\r\n")
-		enc = enc[76:]
+	const perLine = 57 // input bytes per 76-character line
+	const lines = 64
+	var buf [lines * 78]byte
+	for len(data) > 0 {
+		n := 0
+		for l := 0; l < lines && len(data) > 0; l++ {
+			chunk := data[:min(perLine, len(data))]
+			data = data[len(chunk):]
+			base64.StdEncoding.Encode(buf[n:], chunk)
+			n += base64.StdEncoding.EncodedLen(len(chunk))
+			if len(data) > 0 {
+				buf[n], buf[n+1] = '\r', '\n'
+				n += 2
+			}
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			return err
+		}
 	}
-	b.WriteString(enc)
-	_, err := io.WriteString(w, b.String())
-	return err
+	return nil
 }
 
 func header(b *bytes.Buffer, name, value string) {

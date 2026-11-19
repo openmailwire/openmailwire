@@ -139,8 +139,10 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - `POST /emails/raw`: send a complete message you built yourself (any MIME structure). OpenMailWire removes `Bcc`, adds `Message-ID` and `Date` if missing, and signs it.
 - SMTP submission (`openmailwire submission`) on ports 587 and 465, for apps that only speak SMTP. Clients log in with an API key.
 - `GET /emails/{id}`: the status of each recipient, every attempt, and the event timeline. `GET /emails` lists them, newest first.
-- API keys with a permission (full or sending-only) and a sending policy: caps per hour and per day, and sender and recipient allowlists. Every email records the key that sent it.
-- Domains: add a domain, get its DNS records (DKIM 2048-bit, SPF, return-path MX, DMARC), and verify them against live DNS.
+- API keys with a permission (full or sending-only), a sending policy (caps per hour and per day, sender and recipient allowlists), the networks they may be used from (`allowed_ips`) and an expiry. Every email records the key that sent it, and each key has a request rate limit.
+- An append-only, hash-chained **audit log** of who changed keys, domains, webhooks and inboxes (`GET /audit-log`).
+- Domains: add a domain, get its DNS records (DKIM 2048-bit, SPF, DMARC, the return-path MX), and verify them against live DNS. Each record explains the Gmail, Yahoo and Microsoft sender rules behind it.
+- HTML-only mail gets a generated `text/plain` part. Header lines are folded and never exceed 998 bytes.
 - Delivery:
   - MX lookup with preference order, implicit MX and null MX (RFC 7505).
   - IPv4-only by default.
@@ -322,21 +324,23 @@ The complete reference is the OpenAPI 3.1 document at `/openapi.json` (copy: [do
 
 | Field | Type | Notes |
 |---|---|---|
-| `from` | string | `"Name <addr@domain>"` or `"addr@domain"`. The domain must be added and verified. |
+| `from` | string | `"Name <addr@domain>"` or `"addr@domain"`. The domain must be added and verified. Display names are at most 256 characters, addresses 254. |
 | `to`, `cc`, `bcc` | string or string[] | 50 recipients at most across all three. |
-| `subject` | string | Required. UTF-8 is fine. |
-| `html`, `text` | string | At least one. With both, a `multipart/alternative` message is sent. |
+| `subject` | string | Required, at most 998 bytes. UTF-8 is fine; long subjects are folded. |
+| `html`, `text` | string | At least one. With both, a `multipart/alternative` message is sent. With only `html`, a `text/plain` part is made from it. |
 | `reply_to` | string or string[] | |
 | `headers` | object | Extra headers, e.g. `List-Unsubscribe`. Structural headers are refused. |
 | `tags` | `[{name, value}]` | Letters, digits, `_` and `-`. |
 | `expires_at` | RFC 3339 time | Default 48 h, at most 7 days. OpenMailWire makes no new attempts after this. |
 | `retry_uncertain` | bool | Default `true`. When an attempt's outcome is unknown, retry it (the recipient may get two copies) or stop. Use `false` for receipts. |
 | `scheduled_at` | RFC 3339 time | Send later: in the future, at most 30 days ahead. `expires_at` then counts from `scheduled_at`. Cancel with `POST /emails/{id}/cancel`. |
-| `attachments` | `[{filename, content, content_type?, content_id?}]` | `content` is the file, base64-encoded. `content_type` defaults from the file extension. A `content_id` makes the file inline: refer to it in the HTML as `cid:<content_id>`. At most 20 files and 10 MB (decoded) in total. |
+| `attachments` | `[{filename, content, content_type?, content_id?}]` | `content` is the file, base64-encoded. `content_type` (at most 255 characters) defaults from the file extension. A `content_id` makes the file inline: refer to it in the HTML as `cid:<content_id>`. At most 20 files and 10 MB (decoded) in total. |
 
-Header `Idempotency-Key`: the same key with the same body returns the same `id` (with `Idempotent-Replayed: true`). The same key with a different body returns `409`.
+Header `Idempotency-Key` (printable ASCII, at most 256 characters): the same key with the same body returns the same `id` (with `Idempotent-Replayed: true`). The same key with a different body returns `409`. Keys belong to the API key that sent them, so one agent's keys never replay, reveal or block another's.
 
-Request bodies may be up to 20 MB for `POST /emails`, `/emails/batch` and `/emails/raw`, and 4 MB elsewhere.
+Request bodies may be up to 20 MB for `POST /emails`, `/emails/batch` and `/emails/raw`, and 4 MB elsewhere. A request with a body over 1 MB needs one of the server's large-request slots (`OMW_MAX_LARGE_REQUESTS`); when none frees up within 30 seconds the answer is `503 server_busy` with `Retry-After`.
+
+Text that PostgreSQL cannot store (a NUL character, or bytes that are not UTF-8) is refused with `422`, on every path.
 
 Attachments make the message `multipart/mixed`; inline files go in a `multipart/related` part with the HTML. Both are base64-encoded and covered by the DKIM signature.
 
@@ -344,7 +348,7 @@ Attachments make the message `multipart/mixed`; inline files go in a `multipart/
 
 A JSON array of 1 to 100 emails, each shaped like a `POST /emails` body without `attachments`. Every email is validated and checked against the key's policy first, and the key's caps apply to the batch as a whole; then all are stored in one transaction. If any email is refused, none is stored, and the error message names it (`emails[2]: …`).
 
-Returns `{"data": [{"id"}, …]}` in the same order. An `Idempotency-Key` on the batch is applied to each email as `<key>:<index>`.
+Returns `{"data": [{"id"}, …]}` in the same order. An `Idempotency-Key` on the batch covers each email, in a namespace of its own: it never collides with a single send's key.
 
 ### `GET /emails`
 
@@ -365,7 +369,7 @@ What OpenMailWire changes, and nothing else:
 - turns bare LF or CR line endings into CRLF;
 - adds a `DKIM-Signature` for the `From` domain on top. Signatures already in the message stay.
 
-The `From` header must hold exactly one address, on a domain that is added to the project and verified. Lines longer than 998 bytes are refused (`422`); encode such content with quoted-printable or base64, which mail libraries do for you. API key limits apply as for `POST /emails`, and so does `Idempotency-Key`.
+The `From` header must hold exactly one address, on a domain that is added to the project and verified. Header names are counted ignoring case, a header name with whitespace before its colon (`From :`) is refused, and so is a second `Sender`, `Reply-To` or `Subject`. Lines longer than 998 bytes are refused (`422`); encode such content with quoted-printable or base64, which mail libraries do for you. API key limits apply as for `POST /emails`, and so does `Idempotency-Key`.
 
 ```sh
 curl -X POST localhost:8080/emails/raw \
@@ -377,7 +381,7 @@ curl -X POST localhost:8080/emails/raw \
 
 | Status | `name` | When |
 |---|---|---|
-| `422` | `validation_error` | not base64, no or several `From` addresses, a malformed header, a line over 998 bytes, no recipients |
+| `422` | `validation_error` | not base64, no or several `From` headers or addresses, a malformed header, a line over 998 bytes, a Subject that is not UTF-8, no recipients |
 | `403` | `domain_not_found`, `domain_not_verified` | the `From` domain is not in this project, or not verified yet |
 | `409` | `idempotency_conflict` | the `Idempotency-Key` was used with a different request |
 | `413` | `payload_too_large` | the request is over 20 MB |
@@ -423,15 +427,33 @@ Refusals:
 | a recipient not in `allowed_recipients` | 403 | `recipient_not_allowed`; the message names the first such recipient |
 | hourly or daily cap | 429 | `rate_limit_exceeded`, with a `Retry-After` header (seconds) |
 
+A key can also be limited to networks and in time:
+
+- `allowed_ips`: addresses or CIDR prefixes (`["203.0.113.7", "10.0.0.0/8", "2001:db8::/32"]`). A request from anywhere else answers `403 ip_not_allowed`. Behind a reverse proxy, list it in `OMW_TRUSTED_PROXIES`, so that the client's address is read from `X-Forwarded-For` (the right-most address that is not a trusted proxy).
+- `expires_at`: after this time the key answers `401 api_key_expired`.
+
+Every key may make `OMW_RATE_LIMIT` requests per second on average (bursts of `OMW_RATE_LIMIT_BURST`); more answer `429 rate_limit_exceeded` with `Retry-After`. A remote MCP tool call counts once, however many API calls it makes.
+
 Endpoints (full access only):
 
 | Method | Path | |
 |---|---|---|
-| `POST` | `/api-keys` | `{"name", "permission", "policy"}`. Returns `201` with the key's fields and its `token`, shown once. |
-| `GET` | `/api-keys` | The project's live keys: `id`, `name`, `prefix`, `permission`, `policy`, `created_at`, `last_used_at` (updated at most once a minute). |
+| `POST` | `/api-keys` | `{"name", "permission", "policy", "allowed_ips"?, "expires_at"?}`. Returns `201` with the key's fields and its `token`, shown once. |
+| `GET` | `/api-keys` | The project's live keys: `id`, `name`, `prefix`, `permission`, `policy`, `allowed_ips`, `expires_at`, `created_at`, `last_used_at` (updated at most once a minute). |
 | `GET` | `/api-keys/{id}` | One key. |
-| `PATCH` | `/api-keys/{id}` | `{"name"?, "policy"?}`. The policy is replaced whole; `{}` removes every limit. The permission cannot change. |
+| `PATCH` | `/api-keys/{id}` | `{"name"?, "policy"?, "allowed_ips"?, "expires_at"?}`. The policy is replaced whole; `{}` removes every limit. `null` removes `allowed_ips` or `expires_at`. The permission cannot change. |
 | `DELETE` | `/api-keys/{id}` | Revokes the key at once. |
+
+### Audit log
+
+Every change to API keys, domains, webhooks and inboxes is recorded with the key that made it (or `cli` for the `openmailwire` command, `system` for the control plane itself, e.g. an expired domain claim). Tokens and secrets are never recorded.
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/audit-log?limit=50&before=<id>&action=<action>` | Newest first: `{id, created_at, actor, actor_key_id, action, target_type, target_id, data, entry, prev_hash, hash}`. Full access only. |
+| `GET` | `/audit-log/verify` | Recomputes the chain: `{valid, entries, head_hash, first_invalid_id, problem}`. Full access only. |
+
+The log is append-only (the database refuses `UPDATE` and `DELETE` on it) and hash-chained per project: `hash` is SHA-256 of the previous entry's `hash` bytes (32 zero bytes for the first) followed by `entry`, the exact JSON text of the entry. Changing or removing an entry breaks the chain. Keep the `head_hash` from time to time: if it later disappears from the chain, entries were removed from its end. Actions: `api_key.created`, `api_key.updated`, `api_key.revoked`, `domain.created`, `domain.verified`, `domain.unverified`, `domain.deleted`, `domain.expired`, `webhook.created`, `webhook.deleted`, `inbox.created`, `inbox.deleted`.
 
 An attempt's `tls` is one of:
 
@@ -452,20 +474,24 @@ Events also show what the control plane learned from an attempt: `throttled` (th
 | `POST` | `/domains` | `{"name": "example.com"}`. Creates a DKIM key and returns the records to publish. |
 | `GET` | `/domains` | Lists domains. |
 | `GET` | `/domains/{id}` | One domain with its records and their last check. |
-| `POST` | `/domains/{id}/verify` | Checks DNS now. The domain can send once DKIM and SPF (and the bounce MX, if configured) are found. |
+| `POST` | `/domains/{id}/verify` | Checks DNS now. The domain can send once every required record is found. |
 | `DELETE` | `/domains/{id}` | |
 
 The records you publish:
 
 | Record | Name | Value |
 |---|---|---|
-| DKIM (TXT) | `omw<date><rand>._domainkey.example.com` | `v=DKIM1; k=rsa; p=…` |
-| SPF (TXT) | `bounce.example.com` | `v=spf1 include:<your SPF include> -all`, or the workers' IPs |
-| MX | `bounce.example.com` | your bounce host, when `OMW_BOUNCE_MX` is set |
-| DMARC (TXT, recommended) | `_dmarc.example.com` | start with `v=DMARC1; p=none; rua=mailto:…` |
+| DKIM (TXT, required) | `omw<date><rand>._domainkey.example.com` | `v=DKIM1; k=rsa; p=…` |
+| SPF (TXT, required) | `bounce.example.com` | `v=spf1 include:<your SPF include> -all`, or the workers' IPs |
+| DMARC (TXT, required) | `_dmarc.example.com` | at least `v=DMARC1; p=none;`; add `rua=mailto:…` for reports. A subdomain may rely on its parent's record. |
+| MX (return path) | `bounce.example.com` | your bounce host: `OMW_BOUNCE_MX`, or else `OMW_INBOUND_MX`. Required when either is set; otherwise shown as optional, and any MX for the return path passes. |
 | INBOUND (MX, optional) | `example.com` | your inbound host, when `OMW_INBOUND_MX` is set. Needed only to receive mail in inboxes; sending never depends on it. |
 
-Mail is sent with the envelope sender `b-<delivery>-<mac>@bounce.example.com`. DMARC passes through the DKIM signature, which is aligned with your `From` domain.
+Each record's `detail` says why it is needed until it checks out. Gmail and Yahoo (since February 2024) and Microsoft's Outlook.com (since May 2025) require from anyone sending them 5,000 or more messages a day: SPF and DKIM, a DMARC record (`p=none` is enough) aligned with the `From` domain, one-click unsubscribe on marketing mail, and a spam rate under 0.3%. Smaller senders need SPF or DKIM, and fare better with all three.
+
+Mail is sent with the envelope sender `b-<delivery>-<mac>@bounce.example.com`. DMARC passes through the DKIM signature, which is aligned with your `From` domain, and through SPF on the return path (relaxed alignment).
+
+A domain name is unique within a project, and among verified domains. Any project may add a name, and only the project that proves control of its DNS can verify it; a second project that tries gets `409 domain_verified_elsewhere`. An unverified domain is removed 7 days after it was added (`claim_expires_at`), and so is a failing one once another project has verified the name.
 
 ### Webhooks
 
@@ -624,7 +650,11 @@ Control plane (`openmailwire serve`):
 |---|---|---|
 | `DATABASE_URL` | none | PostgreSQL connection string. |
 | `OMW_SECRET_KEY` | none | 32 bytes, base64 (`openmailwire keygen`). Encrypts DKIM keys and queued messages. |
-| `OMW_LISTEN` | `:8080` | |
+| `OMW_LISTEN` | `127.0.0.1:8080` | Set `:8080` (or a specific address) to accept connections from other machines, e.g. behind a reverse proxy on another host. |
+| `OMW_RATE_LIMIT` | `20` | Requests per second each API key may make on average; `0` turns the limit off. Counted per control plane. |
+| `OMW_RATE_LIMIT_BURST` | twice the rate | Requests a key may make at once. |
+| `OMW_MAX_LARGE_REQUESTS` | `4` | Requests with a body over 1 MB handled at once. More wait up to 30 seconds, then get `503 server_busy`. |
+| `OMW_TRUSTED_PROXIES` | none | Comma-separated addresses or CIDR prefixes of your reverse proxies. Their `X-Forwarded-For` gives the client's address for `allowed_ips`. |
 | `OMW_SPF_INCLUDE` | none | e.g. `_spf.mail.example.net`. If unset, SPF records list the workers' IPs. |
 | `OMW_BOUNCE_MX` | none | Host that receives bounces for the return-path domains: your inbound node. |
 | `OMW_INBOUND_MX` | none | Host that receives mail for inboxes. When set, every domain shows an optional `INBOUND` MX record. |
@@ -701,11 +731,13 @@ API key admin (it reads `DATABASE_URL`):
 
 ```sh
 openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N] \
-  [--allow-to PATTERN]... [--allow-from PATTERN]...
+  [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
 openmailwire apikey list <project-id>
 ```
 
-`--allow-to` and `--allow-from` can be repeated. The same keys can be managed over the API (`/api-keys`).
+`--allow-to`, `--allow-from` and `--allow-ip` can be repeated; `--expires-in 720h` makes the key stop working after 30 days. The same keys can be managed over the API (`/api-keys`). Keys created on the command line are recorded in the audit log with the actor `cli`.
+
+The control plane's HTTP server limits each request: 10 seconds for the header, 3 minutes for the whole request (a 20 MB body needs about 1 Mbit/s), 4 minutes to answer, 64 KB of headers, and 2 minutes for an idle keep-alive connection. Every answer carries `X-Content-Type-Options: nosniff`, and API answers `Cache-Control: no-store`. `GET /health` shows the version only to a caller with a valid API key or worker token.
 
 ## Roadmap
 

@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### API correctness and hardening (v0.6, lane A)
+
+**Security fixes** (from the v0.5.0 audit; each has a regression test):
+- **Smuggled From in raw messages (R1#3).** A header written `From :` (whitespace before the colon) slipped past `POST /emails/raw` and SMTP submission: Go kept it apart from `From`, so a key limited by `allowed_from` could queue and DKIM-sign mail from any address. Header names with whitespace before the colon are now refused, From/To/Cc/Bcc are counted ignoring case on exact names, and a second `Sender`, `Reply-To` or `Subject` is refused.
+- **Domain squatting (R1#4).** Domain names were unique across all projects, so any project could hold a name forever, and the `409` told it which names existed elsewhere. Names are now unique within a project and among verified domains: any project may add a name, only the one that proves control of the DNS can verify it (`409 domain_verified_elsewhere` for a second), and an unverified claim is removed after 7 days (`claim_expires_at`). `openmailwire domains force-verify` takes an optional project id.
+- **Idempotency keys per API key (R1#6).** Keys were per project and checked before the key's policy, so one key could tell which keys another had used (409 against 422), replay another key's request (getting its email id even for recipients outside its own allowlist), and pre-claim keys to block it. They now belong to the API key.
+- **Batch idempotency namespace (R1#7).** A batch item's key `<key>:<index>` collided with a single send that used that literal key. Batch items now have a namespace of their own. A batch sent before the upgrade and retried after it is not recognised as a replay.
+- **Memory per large request (R1#5).** One 13 MB send allocated about 363 MB, with no bound on how many ran at once. Bodies are read into one buffer of their exact size, attachments and raw messages are decoded straight from the request (no string copies), JSON is checked for unknown fields without a second buffer, and attachments are base64-encoded in place: the same send now allocates about 130 MB. Requests with bodies over 1 MB need one of `OMW_MAX_LARGE_REQUESTS` slots (default 4); one that waits more than 30 seconds gets `503 server_busy` with `Retry-After`.
+- **Per-key request rate limit (R1#5).** Each API key may make `OMW_RATE_LIMIT` requests per second (default 20, bursts of `OMW_RATE_LIMIT_BURST`, default twice the rate); more get `429 rate_limit_exceeded` with `Retry-After`. A remote MCP tool call counts once.
+- **Unstorable text (R1#8).** A NUL in a JSON subject, or a raw Subject that is not UTF-8 (8-bit Latin-1, or an encoded-word that decodes to invalid UTF-8), answered `500` (`451` over SMTP, so clients retried forever). Such text is now refused with `422` naming the field, and any text the database refuses is a `422` on every path, never a `500`. Custom header values may not hold control characters, and API key names neither.
+- **Header lines over 998 bytes (R1#9, R3#10).** A 998-byte subject made a 1,007-byte line, long display names lines of 1,222 bytes and more, a long Persian name 1,834 bytes, a long `content_type` 1,108 bytes. Subjects are folded at spaces or written as encoded-words, one per line; address lists are folded between encoded-words and before the address. Display names are capped at 256 characters, addresses at 254 and attachment `content_type` at 255.
+- **Long reply subjects (R1#10).** A received subject that already started with "Re:" was never shortened, so a reply to a 1,000-byte subject was refused. Reply subjects are now always cut to 998 bytes.
+- **HTTP server limits (R4#5).** The control plane set only a header timeout. It now has `ReadTimeout` (3 min), `WriteTimeout` (4 min), `IdleTimeout` (2 min) and `MaxHeaderBytes` (64 KB). **`OMW_LISTEN` now defaults to `127.0.0.1:8080`**: set `:8080` to accept connections from other machines (the compose file already does).
+- Every answer carries `X-Content-Type-Options: nosniff`, and API answers `Cache-Control: no-store`. `GET /health` shows the version only to a caller with a valid API key or worker token.
+
+**Features:**
+- **Generated text part:** an email with only `html` gets a `text/plain` part made from it (links keep their address, lists their bullets).
+- **API key `allowed_ips` and `expires_at`:** a key can be limited to networks (`403 ip_not_allowed`) and in time (`401 api_key_expired`). Set them on `POST /api-keys`, change or remove them (`null`) with `PATCH`, or use `openmailwire apikey create … --allow-ip CIDR --expires-in 720h`. Behind a reverse proxy, `OMW_TRUSTED_PROXIES` names the proxies whose `X-Forwarded-For` is believed.
+- **Audit log:** `GET /audit-log` (full access) lists who created, changed or removed API keys, domains, webhooks and inboxes, with the acting key. It is append-only (the database refuses `UPDATE` and `DELETE`) and hash-chained per project; `GET /audit-log/verify` recomputes the chain and names the first entry that does not check out. Other parts of the server record their own actions with `store.AppendAudit` / `store.AppendAuditTx`.
+- **Domain records:**
+  - DMARC (at least `p=none`) is now required. A subdomain may rely on its parent's record; two records, or one without a valid policy, fail.
+  - The return-path MX is always shown. It points at `OMW_BOUNCE_MX`, or else `OMW_INBOUND_MX`, and is required when either is set.
+  - Each record's `detail` explains the Gmail, Yahoo and Microsoft sender rules behind it until it checks out.
+  - Existing domains keep their status until they are verified again; a re-check now needs the DMARC record.
+
+**Upgrade notes:** migration `0006_api_hardening.sql` drops the global unique index on domain names and gives every currently unverified domain a claim that expires 7 days after the upgrade.
+
 ## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
 ### SMTP submission and raw messages (v0.5)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -16,14 +17,17 @@ import (
 )
 
 type domainResponse struct {
-	Object     string           `json:"object"`
-	ID         string           `json:"id"`
-	Name       string           `json:"name"`
-	Status     string           `json:"status"`
-	CreatedAt  time.Time        `json:"created_at"`
-	VerifiedAt *time.Time       `json:"verified_at"`
-	CheckedAt  *time.Time       `json:"checked_at"`
-	Records    []domains.Record `json:"records"`
+	Object     string     `json:"object"`
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Status     string     `json:"status"`
+	CreatedAt  time.Time  `json:"created_at"`
+	VerifiedAt *time.Time `json:"verified_at"`
+	CheckedAt  *time.Time `json:"checked_at"`
+	// ClaimExpiresAt is when an unverified domain is removed; null once
+	// verified.
+	ClaimExpiresAt *time.Time       `json:"claim_expires_at"`
+	Records        []domains.Record `json:"records"`
 }
 
 func (s *Server) spec(ctx context.Context, d store.Domain) domains.Spec {
@@ -65,7 +69,7 @@ func (s *Server) view(ctx context.Context, d store.Domain) domainResponse {
 	}
 	return domainResponse{
 		Object: "domain", ID: d.ID, Name: d.Name, Status: d.Status, CreatedAt: d.CreatedAt,
-		VerifiedAt: d.VerifiedAt, CheckedAt: d.CheckedAt, Records: recs,
+		VerifiedAt: d.VerifiedAt, CheckedAt: d.CheckedAt, ClaimExpiresAt: d.ClaimExpiresAt, Records: recs,
 	}
 }
 
@@ -108,13 +112,16 @@ func (s *Server) createDomain(w http.ResponseWriter, r *http.Request) {
 		ReturnPath:  s.Cfg.ReturnPathLabel + "." + name,
 	})
 	if errors.Is(err, store.ErrConflict) {
-		writeError(w, http.StatusConflict, "domain_exists", "this domain is already added")
+		// Only this project's own domains conflict: other projects' names
+		// are never revealed.
+		writeError(w, http.StatusConflict, "domain_exists", "this project already has this domain; find it with GET /domains")
 		return
 	}
 	if err != nil {
 		s.internal(w, "create domain", err)
 		return
 	}
+	s.audit(r, "domain.created", "domain", d.ID, map[string]any{"name": d.Name})
 	writeJSON(w, http.StatusCreated, s.view(ctx, d))
 }
 
@@ -174,14 +181,34 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	checks, _ := json.Marshal(recs)
-	if err := s.Store.SaveDomainCheck(r.Context(), d.ID, status, checks); err != nil {
+	err := s.Store.SaveDomainCheck(r.Context(), d.ID, status, checks)
+	if errors.Is(err, store.ErrConflict) {
+		// The DNS records are in place, so the caller controls the domain,
+		// but another project verified the same name first.
+		if err := s.Store.SaveDomainCheck(r.Context(), d.ID, "pending", checks); err != nil {
+			s.internal(w, "save domain check", err)
+			return
+		}
+		writeError(w, http.StatusConflict, "domain_verified_elsewhere", fmt.Sprintf(
+			"another project has already verified %s, and a domain can be verified in only one project at a time; delete it from that project (or ask your OpenMailWire operator), then verify again", d.Name))
+		return
+	}
+	if err != nil {
 		s.internal(w, "save domain check", err)
 		return
 	}
-	d, err := s.Store.GetDomain(r.Context(), d.ProjectID, d.ID)
+	was := d.Status
+	d, err = s.Store.GetDomain(r.Context(), d.ProjectID, d.ID)
 	if err != nil {
 		s.internal(w, "reload domain", err)
 		return
+	}
+	if was != d.Status && (was == "verified" || d.Status == "verified") {
+		action := "domain.verified"
+		if was == "verified" {
+			action = "domain.unverified"
+		}
+		s.audit(r, action, "domain", d.ID, map[string]any{"name": d.Name, "status": d.Status})
 	}
 	writeJSON(w, http.StatusOK, s.view(r.Context(), d))
 }
@@ -195,5 +222,6 @@ func (s *Server) deleteDomain(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "delete domain", err)
 		return
 	}
+	s.audit(r, "domain.deleted", "domain", d.ID, map[string]any{"name": d.Name})
 	writeJSON(w, http.StatusOK, map[string]any{"object": "domain", "id": d.ID, "deleted": true})
 }

@@ -41,7 +41,8 @@ The return-path domain needs an MX (or an A record) even if you do not process b
 
 ## 4. The control plane
 
-- **TLS.** Put a reverse proxy (Caddy, nginx, a load balancer) in front of `OMW_LISTEN`. Workers and apps must reach it over HTTPS.
+- **TLS.** Put a reverse proxy (Caddy, nginx, a load balancer) in front of `OMW_LISTEN`. Workers and apps must reach it over HTTPS. `OMW_LISTEN` defaults to `127.0.0.1:8080`, which suits a proxy on the same machine; set `:8080` when the proxy runs elsewhere (the Docker image's compose file does).
+- **Client addresses.** Set `OMW_TRUSTED_PROXIES` to your proxy's address, so that API keys with `allowed_ips` see the client's address (from `X-Forwarded-For`) instead of the proxy's.
 - **Backups.** Back up PostgreSQL, and separately back up `OMW_SECRET_KEY`. Without that key, the DKIM keys and queued messages in a restored database cannot be decrypted.
 - **Never** set `OMW_ALLOW_UNVERIFIED=true`.
 - **One instance** of `openmailwire serve` for now. Several can share a database safely (leases use `SKIP LOCKED` and migrations take an advisory lock), but that setup is not tested yet.

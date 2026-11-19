@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"mime"
@@ -11,7 +12,9 @@ import (
 	"net/mail"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/openmailwire/openmailwire/internal/message"
 	"github.com/openmailwire/openmailwire/internal/secret"
 	"github.com/openmailwire/openmailwire/internal/store"
 )
@@ -23,9 +26,30 @@ import (
 const maxLineLength = 998
 
 type rawRequest struct {
-	Raw      string   `json:"raw"`
+	Raw      jsonSpan `json:"raw"` // base64; decoded straight from the request body
 	MailFrom string   `json:"mail_from"`
 	Rcpts    []string `json:"rcpts"`
+}
+
+// decodeRaw decodes the raw field without first copying it into a string.
+func decodeRaw(span jsonSpan) ([]byte, error) {
+	if span.isNull() || string(span) == `""` {
+		return nil, errNoContent
+	}
+	if span[0] != '"' {
+		return nil, errors.New("raw must be a string")
+	}
+	inner := []byte(span[1 : len(span)-1])
+	if bytes.IndexByte(inner, '\\') >= 0 {
+		var s string
+		if err := json.Unmarshal(span, &s); err != nil {
+			return nil, err
+		}
+		return base64.StdEncoding.DecodeString(s)
+	}
+	out := make([]byte, base64.StdEncoding.DecodedLen(len(inner)))
+	n, err := base64.StdEncoding.Decode(out, inner)
+	return out[:n], err
 }
 
 // sendRaw queues a complete RFC 5322 message, as written by a mail library
@@ -52,15 +76,16 @@ func (s *Server) sendRaw(w http.ResponseWriter, r *http.Request) {
 	if s.replayed(w, r, idem, hash[:]) {
 		return
 	}
-	if req.Raw == "" {
+	data, err := decodeRaw(req.Raw)
+	if errors.Is(err, errNoContent) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "raw is required: the whole message (headers and body), base64-encoded")
 		return
 	}
-	data, err := base64.StdEncoding.DecodeString(req.Raw)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "raw must be standard base64 (with padding): "+err.Error())
 		return
 	}
+	req.Raw = nil // decoded; let the request body go
 	msg, err := parseRaw(data)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", err.Error())
@@ -150,6 +175,8 @@ func (s *Server) sendRaw(w http.ResponseWriter, r *http.Request) {
 // rawMessage is a parsed message whose header fields are kept byte for
 // byte, so that sending changes nothing but what sendRaw documents.
 type rawMessage struct {
+	data       []byte   // the whole message, CRLF line endings
+	blank      bool     // data has the blank line that ends the header
 	fields     [][]byte // each field with its folded lines and CRLFs
 	body       []byte   // after the blank line
 	from       *mail.Address
@@ -185,7 +212,13 @@ func parseRaw(data []byte) (*rawMessage, error) {
 		head, body = data[:i+2], data[i+4:]
 	}
 
-	m := &rawMessage{body: body, dropFields: map[int]bool{}}
+	m := &rawMessage{data: data, blank: len(body) > 0 || bytes.HasSuffix(data, []byte("\r\n\r\n")),
+		body: body, dropFields: map[int]bool{}}
+	// Every field, by its lowercase name, unfolded. These names are exact:
+	// a name with whitespace before its colon is refused below, because Go's
+	// textproto would keep "From " apart from "From", while DKIM signers and
+	// mail clients treat it as a second From (audit R1#3).
+	values := map[string][]string{}
 	for n, rest := 1, head; len(rest) > 0; n++ {
 		i := bytes.Index(rest, []byte("\r\n"))
 		line := rest[:i+2]
@@ -198,21 +231,30 @@ func parseRaw(data []byte) (*rawMessage, error) {
 			m.fields[last] = append(m.fields[last], line...)
 			continue
 		}
-		if name := fieldName(line); name == "" {
+		name, err := fieldName(line)
+		if err != nil {
+			return nil, fmt.Errorf("line %d of the header: %v", n, err)
+		}
+		if name == "" {
 			return nil, fmt.Errorf("line %d of the header is not a header field (Name: value); separate the header from the body with a blank line", n)
 		}
 		m.fields = append(m.fields, append([]byte(nil), line...))
 	}
-
-	hdr, err := mail.ReadMessage(bytes.NewReader(append(append([]byte(nil), head...), "\r\n"...)))
-	if err != nil {
-		return nil, fmt.Errorf("the header cannot be parsed: %v", err)
+	for _, f := range m.fields {
+		name, _ := fieldName(f)
+		name = strings.ToLower(name)
+		values[name] = append(values[name], strings.TrimSpace(fieldValue(f)))
 	}
-	h := hdr.Header
-	if len(h["From"]) != 1 {
+
+	if len(values["from"]) != 1 {
 		return nil, errors.New("the message must have exactly one From header")
 	}
-	from, err := mail.ParseAddressList(h.Get("From"))
+	for _, name := range []string{"Sender", "Reply-To", "Subject"} {
+		if len(values[strings.ToLower(name)]) > 1 {
+			return nil, fmt.Errorf("the message has more than one %s header; keep one", name)
+		}
+	}
+	from, err := mail.ParseAddressList(values["from"][0])
 	if err != nil {
 		return nil, fmt.Errorf("From: %v", err)
 	}
@@ -220,11 +262,14 @@ func parseRaw(data []byte) (*rawMessage, error) {
 		return nil, errors.New("From must hold exactly one address")
 	}
 	m.from = from[0]
+	if !message.Storable(m.from.Name) || !message.Storable(m.from.Address) || strings.ContainsFunc(m.from.Name, isControl) {
+		return nil, errors.New("From: the display name holds a NUL or other control character, or bytes that are not UTF-8; encode non-ASCII names as UTF-8 encoded-words (mail libraries do this)")
+	}
 	for _, f := range []struct {
 		name string
 		dst  *[]string
 	}{{"To", &m.to}, {"Cc", &m.cc}, {"Bcc", &m.bcc}} {
-		vals := h[f.name]
+		vals := values[strings.ToLower(f.name)]
 		if len(vals) == 0 || strings.TrimSpace(strings.Join(vals, "")) == "" {
 			continue
 		}
@@ -233,17 +278,30 @@ func parseRaw(data []byte) (*rawMessage, error) {
 			return nil, fmt.Errorf("%s: %v", f.name, err)
 		}
 		for _, a := range list {
+			if !message.Storable(a.Address) {
+				return nil, fmt.Errorf("%s: an address holds bytes that are not UTF-8", f.name)
+			}
 			*f.dst = append(*f.dst, a.Address)
 		}
 	}
-	subject := h.Get("Subject")
+	var subject string
+	if v := values["subject"]; len(v) > 0 {
+		subject = v[0]
+	}
 	if dec, err := new(mime.WordDecoder).DecodeHeader(subject); err == nil {
 		subject = dec
+	}
+	switch {
+	case strings.IndexByte(subject, 0) >= 0:
+		return nil, errors.New("Subject contains a NUL character once decoded; remove it")
+	case !utf8.ValidString(subject):
+		return nil, errors.New("Subject is not valid UTF-8: write non-ASCII text as RFC 2047 encoded-words in UTF-8 (=?utf-8?b?…?=), which mail libraries do for you")
 	}
 	m.subject = subject
 
 	for i, f := range m.fields {
-		switch strings.ToLower(fieldName(f)) {
+		name, _ := fieldName(f)
+		switch strings.ToLower(name) {
 		case "bcc", "resent-bcc":
 			m.dropFields[i] = true
 		case "message-id":
@@ -251,6 +309,9 @@ func parseRaw(data []byte) (*rawMessage, error) {
 			if v == "" || m.messageID != "" {
 				m.dropFields[i] = true // blank, or a second one
 				continue
+			}
+			if !message.Storable(v) {
+				return nil, errors.New("Message-ID holds a NUL or bytes that are not UTF-8; remove the header and one is added for you")
 			}
 			m.messageID = v
 		case "date":
@@ -265,9 +326,14 @@ func parseRaw(data []byte) (*rawMessage, error) {
 }
 
 // render writes the message to send: the kept header fields, then a
-// Message-ID and Date when the sender left them out, then the body.
+// Message-ID and Date when the sender left them out, then the body. When
+// nothing changes, it is the message itself, not a copy.
 func (m *rawMessage) render(messageID string, now time.Time) []byte {
+	if len(m.dropFields) == 0 && m.messageID != "" && m.hasDate && m.blank {
+		return m.data
+	}
 	var b bytes.Buffer
+	b.Grow(len(m.data) + 128)
 	for i, f := range m.fields {
 		if !m.dropFields[i] {
 			b.Write(f)
@@ -285,22 +351,27 @@ func (m *rawMessage) render(messageID string, now time.Time) []byte {
 }
 
 // fieldName returns the name of the header field that starts line, or ""
-// when the line is not a field.
-func fieldName(line []byte) string {
+// when the line is not a field. A name with whitespace before its colon
+// (RFC 5322's obsolete syntax) is an error: parsers disagree about it, so it
+// can smuggle a second From past the checks (audit R1#3).
+func fieldName(line []byte) (string, error) {
 	i := bytes.IndexByte(line, ':')
 	if i <= 0 {
-		return ""
+		return "", nil
 	}
-	name := strings.TrimRight(string(line[:i]), " \t") // obsolete syntax allows space before the colon
-	if name == "" {
-		return ""
+	name := string(line[:i])
+	if trimmed := strings.TrimRight(name, " \t"); trimmed != name {
+		if trimmed == "" {
+			return "", nil
+		}
+		return "", fmt.Errorf("the header field %.40q has whitespace before its colon; write it as %q", trimmed+":", trimmed+":")
 	}
 	for j := 0; j < len(name); j++ {
 		if c := name[j]; c <= ' ' || c >= 0x7f {
-			return ""
+			return "", nil
 		}
 	}
-	return name
+	return name, nil
 }
 
 // fieldValue returns a field's value, unfolded.
@@ -319,8 +390,13 @@ func displayAddress(a *mail.Address) string {
 }
 
 // toCRLF turns bare LF and bare CR into CRLF, and ends the message with
-// CRLF.
+// CRLF. A message that already does both is returned as it is.
 func toCRLF(b []byte) []byte {
+	crlf := bytes.Count(b, []byte("\r\n"))
+	if crlf == bytes.Count(b, []byte("\r")) && crlf == bytes.Count(b, []byte("\n")) &&
+		(len(b) == 0 || bytes.HasSuffix(b, []byte("\r\n"))) {
+		return b
+	}
 	var out bytes.Buffer
 	out.Grow(len(b) + len(b)/40 + 2)
 	for i := 0; i < len(b); i++ {

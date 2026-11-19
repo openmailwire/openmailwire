@@ -1,13 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/mail"
 	"regexp"
 	"strconv"
 	"strings"
@@ -50,10 +50,13 @@ type tag struct {
 }
 
 type attachmentRequest struct {
-	Filename    string `json:"filename"`
-	Content     string `json:"content"` // base64
-	ContentType string `json:"content_type"`
-	ContentID   string `json:"content_id"`
+	Filename string `json:"filename"`
+	// Content is the file, base64-encoded. It stays a slice of the request
+	// body until it is decoded, so a 10 MB file is never also a 13 MB
+	// string.
+	Content     jsonSpan `json:"content"`
+	ContentType string   `json:"content_type"`
+	ContentID   string   `json:"content_id"`
 }
 
 type sendRequest struct {
@@ -90,9 +93,12 @@ type sendPlan struct {
 
 // validateSend checks a send request without touching the database.
 func validateSend(req sendRequest, now time.Time, defaultExpiry time.Duration) (*sendPlan, *policyError) {
-	from, err := mail.ParseAddress(req.From)
+	if req.From == "" {
+		return nil, invalid("from is required, like \"Acme <hello@acme.com>\" on a verified domain")
+	}
+	from, err := message.ParseAddress("from", req.From)
 	if err != nil {
-		return nil, invalid("from: %v", err)
+		return nil, invalid("%v", err)
 	}
 	p := &sendPlan{req: req, from: strings.ToLower(from.Address), tags: map[string]string{}, retryUncertain: true}
 	p.fromDomain = domainOf(p.from)
@@ -101,8 +107,10 @@ func validateSend(req sendRequest, now time.Time, defaultExpiry time.Duration) (
 		return nil, invalid("to is required")
 	case strings.TrimSpace(req.Subject) == "":
 		return nil, invalid("subject is required")
-	case len(req.Subject) > 998:
-		return nil, invalid("subject is longer than 998 bytes")
+	case len(req.Subject) > message.MaxSubject:
+		return nil, invalid("subject is longer than %d bytes", message.MaxSubject)
+	case !message.Storable(req.Subject) || strings.ContainsFunc(req.Subject, isControl):
+		return nil, invalid("subject contains a NUL or other control character; remove it")
 	case req.HTML == "" && req.Text == "":
 		return nil, invalid("html or text is required")
 	}
@@ -110,8 +118,8 @@ func validateSend(req sendRequest, now time.Time, defaultExpiry time.Duration) (
 		return nil, invalid("%v", err)
 	}
 	for _, a := range req.ReplyTo {
-		if _, err := mail.ParseAddress(a); err != nil {
-			return nil, invalid("reply_to %q: %v", a, err)
+		if _, err := message.ParseAddress("reply_to", a); err != nil {
+			return nil, invalid("%v", err)
 		}
 	}
 	if err := message.ValidateHeaders(req.Headers); err != nil {
@@ -126,6 +134,7 @@ func validateSend(req sendRequest, now time.Time, defaultExpiry time.Duration) (
 	if p.attachments, err = decodeAttachments(req.Attachments); err != nil {
 		return nil, invalid("%v", err)
 	}
+	p.req.Attachments = nil // decoded; let the request body go
 
 	start := now
 	if req.ScheduledAt != nil {
@@ -163,10 +172,10 @@ func decodeAttachments(in []attachmentRequest) ([]message.Attachment, error) {
 	out := make([]message.Attachment, 0, len(in))
 	total := 0
 	for i, a := range in {
-		if a.Content == "" {
+		data, err := decodeContent(a.Content)
+		if errors.Is(err, errNoContent) {
 			return nil, fmt.Errorf("attachments[%d]: content is required (the file, base64-encoded)", i)
 		}
-		data, err := decodeBase64(a.Content)
 		if err != nil {
 			return nil, fmt.Errorf("attachments[%d]: content is not valid base64: %v", i, err)
 		}
@@ -179,6 +188,37 @@ func decodeAttachments(in []attachmentRequest) ([]message.Attachment, error) {
 		})
 	}
 	return out, message.ValidateAttachments(out)
+}
+
+var errNoContent = errors.New("no content")
+
+// decodeContent decodes an attachment's content straight from the JSON
+// string in the request, without copying it first.
+func decodeContent(span jsonSpan) ([]byte, error) {
+	if span.isNull() || string(span) == `""` {
+		return nil, errNoContent
+	}
+	if len(span) < 2 || span[0] != '"' {
+		return nil, errors.New("content must be a string")
+	}
+	inner := span[1 : len(span)-1]
+	if bytes.ContainsAny(inner, "\\ \t") {
+		// Escapes (such as \n line breaks) or spaces: the rare slow path.
+		var s string
+		if err := json.Unmarshal(span, &s); err != nil {
+			return nil, err
+		}
+		if s == "" {
+			return nil, errNoContent
+		}
+		return decodeBase64(s)
+	}
+	if len(inner)%4 != 0 {
+		return base64.RawStdEncoding.DecodeString(strings.TrimRight(string(inner), "="))
+	}
+	out := make([]byte, base64.StdEncoding.DecodedLen(len(inner)))
+	n, err := base64.StdEncoding.Decode(out, inner)
+	return out[:n], err
 }
 
 // decodeBase64 accepts standard base64, with or without padding and line
@@ -280,7 +320,7 @@ func (s *Server) sendBatch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var items []json.RawMessage
+	var items []jsonSpan
 	if err := json.Unmarshal(body, &items); err != nil || len(items) == 0 || len(items) > maxBatch {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error",
 			fmt.Sprintf("the body must be a JSON array of 1 to %d emails, each shaped like a POST /emails body", maxBatch))
@@ -351,7 +391,7 @@ func (s *Server) sendBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if idem != "" {
-			e.IdempotencyKey, e.RequestHash = idem+":"+strconv.Itoa(i), hashes[i]
+			e.IdempotencyKey, e.RequestHash = batchItemKey(idem, i), hashes[i]
 		}
 		es[i] = e
 	}
@@ -372,13 +412,13 @@ func batchResponse(out []store.Inserted) map[string]any {
 }
 
 // batchReplayed answers a batch whose every item was already stored under
-// <idem>:<index> with the same body. Partly stored batches cannot exist
-// (batches are all or nothing), so anything else goes on to queue, which
-// applies the idempotency rules per item.
+// batchItemKey(idem, index) with the same body. Partly stored batches
+// cannot exist (batches are all or nothing), so anything else goes on to
+// queue, which applies the idempotency rules per item.
 func (s *Server) batchReplayed(w http.ResponseWriter, r *http.Request, idem string, hashes [][]byte) bool {
 	out := make([]store.Inserted, len(hashes))
 	for i, h := range hashes {
-		id, err := s.Store.FindIdempotent(r.Context(), projectID(r), idem+":"+strconv.Itoa(i), h)
+		id, err := s.Store.FindIdempotent(r.Context(), projectID(r), apiKeyOf(r).ID, batchItemKey(idem, i), h)
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return false
@@ -403,9 +443,9 @@ func envelope(lists ...[]string) ([]string, error) {
 	var out []string
 	for _, l := range lists {
 		for _, a := range l {
-			addr, err := mail.ParseAddress(a)
+			addr, err := message.ParseAddress("recipient", a)
 			if err != nil {
-				return nil, fmt.Errorf("recipient %q: %v", a, err)
+				return nil, err
 			}
 			e := strings.ToLower(addr.Address)
 			if !isASCII(e) {
@@ -432,6 +472,9 @@ func domainOf(addr string) string {
 	}
 	return ""
 }
+
+// isControl reports whether r is a control character other than tab.
+func isControl(r rune) bool { return (r < 0x20 && r != '\t') || r == 0x7f }
 
 func isASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
