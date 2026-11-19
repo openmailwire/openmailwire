@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### SDKs: the v0.6.0 API
+
+The Node, Python, Go and PHP SDKs in [`sdks/`](sdks) cover every v0.6.0 endpoint, with the same method names in each language's style:
+- **Emails:** `check` (`POST /emails/check`), `listHeld`, `approve` and `reject` with an optional note, and `replies` (`GET /emails/{id}/replies`). Sends take `stream`, and send results carry `held` and `hold_reasons`.
+- **New resources:** `suppressions` (list with filters and paging, create, delete, CSV export), `pauses` (list, resume), `project` (get, update; `null` turns the per-recipient cap off), `auditLog` (list, verify) and `insights` (get, optionally keeping one window; the server always answers all three).
+- **Domains:** `dkim`, `rotateDkim`, `setEd25519` and `reports`; domains show `claim_expires_at` and `report_addresses`.
+- **Webhooks:** `rotateSecret` with an overlap, Ed25519 signing on create, and the public key on get. The event types include `email.held`, `email.approved`, `email.rejected` and `sending.paused`, and the typed payloads have `approval`, `pause`, `complaint`, and for `email.received` `header_to`, `trust`, `authentication`, `held` and `suspicious_instructions`.
+- **Inboxes and messages:** `inboxes.get` and `inboxes.update` (`hold_unauthenticated`), `messages.release`, reply recipients (`to`) and the reply's `to` and `warnings`; messages show `trust`, `authentication_results`, `held` and `suspicious_instructions`.
+- **API keys:** `allowed_ips`, `expires_at` (both can be cleared on update) and the `require_approval`, `can_approve` and `inboxes` policy fields.
+- **Errors:** `retryAfter` is set for both 429 errors (`rate_limit_exceeded`, `recipient_rate_limited`) and for `503 server_busy`. Each SDK has constants for the error names, including `sending_paused`, `insufficient_permission`, `cannot_approve_own_email`, `server_busy`, `domain_verified_elsewhere`, `ip_not_allowed`, `api_key_expired` and `webhook_limit_reached`, and says whether an error may be retried.
+- **Retries, off by default:** `maxRetries` (Python `max_retries`, Go `Config.MaxRetries`) sends a request answered 429 or 503 again after its `Retry-After`, with the same body and idempotency key, unless the wait is longer than `maxRetryWait` (default 60 s).
+- **Behaviour change:** `waitForDelivery` keeps waiting while a recipient is `held`, which the API documents as not final; `rejected` is final. In Go, `Recipient.Final()` agrees, and `Messages.Reply` returns a `*ReplyResponse` that embeds `SendResponse`.
+
 ## v0.6.0: security hardening, deliverability, agent safety
 
 This release fixes every problem found in an independent review of v0.5, each with a regression test, and adds the safety and deliverability features below. Read **Upgrading** before you deploy it.

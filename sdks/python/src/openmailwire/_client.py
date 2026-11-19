@@ -14,19 +14,36 @@ from .types import (
     ApiKey,
     ApiKeyList,
     ApiKeyPolicy,
+    AuditEntryPage,
+    AuditVerification,
     BatchResponse,
+    CheckResult,
+    CircuitBreaker,
+    Decision,
     Deleted,
+    DkimState,
     Domain,
     DomainList,
+    DomainReports,
     Email,
     EmailPage,
+    EmailReplies,
+    HeldEmailPage,
     Inbox,
     InboxList,
+    Insights,
     Message,
     MessagePage,
     MessageSummary,
+    Pause,
+    PauseList,
+    Project,
+    ReplyResponse,
     SendParams,
     SendResponse,
+    SuppressionCreated,
+    SuppressionDeleted,
+    SuppressionPage,
     Webhook,
     WebhookList,
 )
@@ -35,7 +52,10 @@ __version__ = "0.1.0"
 DEFAULT_BASE_URL = "http://localhost:8080"
 USER_AGENT = f"openmailwire-python/{__version__}"
 
-_PENDING = frozenset(("queued", "sending", "deferred"))
+_PENDING = frozenset(("queued", "sending", "deferred", "held"))
+
+# Marks an argument that was not given, where None means "send null".
+_UNSET: Any = object()
 
 
 def _seg(value: Union[str, int]) -> str:
@@ -44,6 +64,11 @@ def _seg(value: Union[str, int]) -> str:
 
 def _compact(d: Mapping[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _given(d: Mapping[str, Any]) -> Dict[str, Any]:
+    """Leaves out arguments that were not given; keeps None, sent as null."""
+    return {k: v for k, v in d.items() if v is not _UNSET}
 
 
 def _rfc3339(value: Union[datetime, str]) -> str:
@@ -162,6 +187,30 @@ class Emails(_Resource):
         body = _compact({"raw": _b64(raw), "mail_from": mail_from, "rcpts": rcpts})
         return self._request("POST", "/emails/raw", body=body, idempotency_key=idempotency_key)
 
+    def check(self, params: SendParams) -> CheckResult:
+        """Report what :meth:`send` would do with ``params`` now (``would``:
+        send, hold or refuse, with every refusal and warning), without
+        sending anything."""
+        return self._request("POST", "/emails/check", body=_send_body(params))
+
+    def list_held(self, *, limit: Optional[int] = None, before: Optional[str] = None) -> HeldEmailPage:
+        """Emails waiting for approval, newest first."""
+        return self._request("GET", "/emails/held", query={"limit": limit, "before": before})
+
+    def approve(self, email_id: str, *, note: Optional[str] = None) -> Decision:
+        """Approve a held email: its recipients are queued. Needs a
+        ``full_access`` key or one with ``can_approve``; no key approves its
+        own email."""
+        return self._request("POST", f"/emails/{_seg(email_id)}/approve", body=_compact({"note": note}))
+
+    def reject(self, email_id: str, *, note: Optional[str] = None) -> Decision:
+        """Reject a held email: it is never sent."""
+        return self._request("POST", f"/emails/{_seg(email_id)}/reject", body=_compact({"note": note}))
+
+    def replies(self, email_id: str) -> EmailReplies:
+        """The received messages that answer a sent email, oldest first."""
+        return self._request("GET", f"/emails/{_seg(email_id)}/replies")
+
 
 class Domains(_Resource):
     def create(self, name: str) -> Domain:
@@ -181,12 +230,45 @@ class Domains(_Resource):
     def delete(self, domain_id: str) -> Deleted:
         return self._request("DELETE", f"/domains/{_seg(domain_id)}")
 
+    def dkim(self, domain_id: str) -> DkimState:
+        """The domain's DKIM keys, with the records to publish."""
+        return self._request("GET", f"/domains/{_seg(domain_id)}/dkim")
+
+    def rotate_dkim(self, domain_id: str) -> DkimState:
+        """Rotate the DKIM key in two steps: the first call creates a key to
+        publish (``status`` ``pending``), a later call switches signing to it
+        once its record is in DNS (``rotated``). 409 ``dkim_record_not_found``
+        while the record is missing."""
+        return self._request("POST", f"/domains/{_seg(domain_id)}/dkim/rotate")
+
+    def set_ed25519(self, domain_id: str, enabled: bool) -> DkimState:
+        """Turn the extra Ed25519 DKIM signature on or off. Turning it on
+        creates a key to publish first; call again once its record is in DNS."""
+        return self._request("POST", f"/domains/{_seg(domain_id)}/dkim/ed25519", body={"enabled": bool(enabled)})
+
+    def reports(self, domain_id: str, *, days: Optional[int] = None) -> DomainReports:
+        """DMARC aggregate and TLS-RPT reports received for the domain
+        (default: the last 30 days)."""
+        return self._request("GET", f"/domains/{_seg(domain_id)}/reports", query={"days": days})
+
 
 class Webhooks(_Resource):
-    def create(self, endpoint: str, events: Optional[List[str]] = None) -> Webhook:
+    def create(
+        self, endpoint: str, events: Optional[List[str]] = None, *, asymmetric_signing: Optional[bool] = None
+    ) -> Webhook:
         """Create a webhook. The answer carries ``signing_secret``, shown once.
-        Leave out ``events`` to receive every type."""
-        return self._request("POST", "/webhooks", body=_compact({"endpoint": endpoint, "events": events}))
+        Leave out ``events`` to receive every type. ``asymmetric_signing``
+        also signs every request with Ed25519 (``v1a``); the answer then has
+        the ``public_key`` (``whpk_…``) that verifies them."""
+        body = _compact({"endpoint": endpoint, "events": events, "asymmetric_signing": asymmetric_signing})
+        return self._request("POST", "/webhooks", body=body)
+
+    def rotate_secret(self, webhook_id: str, *, overlap_seconds: Optional[int] = None) -> Webhook:
+        """Replace the signing secret (and Ed25519 key). The previous ones keep
+        signing for ``overlap_seconds`` (default one day; 0 stops them at
+        once). The answer carries the new ``signing_secret``, shown once."""
+        body = _compact({"overlap_seconds": overlap_seconds})
+        return self._request("POST", f"/webhooks/{_seg(webhook_id)}/rotate-secret", body=body)
 
     def list(self) -> WebhookList:
         return self._request("GET", "/webhooks")
@@ -201,13 +283,30 @@ class Webhooks(_Resource):
 
 class ApiKeys(_Resource):
     def create(
-        self, name: str, *, permission: Optional[str] = None, policy: Optional[ApiKeyPolicy] = None
+        self,
+        name: str,
+        *,
+        permission: Optional[str] = None,
+        policy: Optional[ApiKeyPolicy] = None,
+        allowed_ips: Optional[List[str]] = None,
+        expires_at: Optional[Union[datetime, str]] = None,
     ) -> ApiKey:
         """Create a key (``full_access`` or ``sending_access``). The answer
-        carries ``token``, shown once. Needs a full-access key."""
-        return self._request(
-            "POST", "/api-keys", body=_compact({"name": name, "permission": permission, "policy": policy})
+        carries ``token``, shown once. Needs a full-access key.
+
+        ``allowed_ips`` takes addresses and CIDR prefixes the key may be used
+        from; ``expires_at`` (a datetime, naive means UTC, or RFC 3339) when it
+        stops working."""
+        body = _compact(
+            {
+                "name": name,
+                "permission": permission,
+                "policy": policy,
+                "allowed_ips": allowed_ips,
+                "expires_at": None if expires_at is None else _rfc3339(expires_at),
+            }
         )
+        return self._request("POST", "/api-keys", body=body)
 
     def list(self) -> ApiKeyList:
         return self._request("GET", "/api-keys")
@@ -215,9 +314,23 @@ class ApiKeys(_Resource):
     def get(self, key_id: str) -> ApiKey:
         return self._request("GET", f"/api-keys/{_seg(key_id)}")
 
-    def update(self, key_id: str, *, name: Optional[str] = None, policy: Optional[ApiKeyPolicy] = None) -> ApiKey:
-        """Rename a key or replace its policy."""
-        return self._request("PATCH", f"/api-keys/{_seg(key_id)}", body=_compact({"name": name, "policy": policy}))
+    def update(
+        self,
+        key_id: str,
+        *,
+        name: Optional[str] = None,
+        policy: Optional[ApiKeyPolicy] = None,
+        allowed_ips: Optional[List[str]] = _UNSET,
+        expires_at: Optional[Union[datetime, str]] = _UNSET,
+    ) -> ApiKey:
+        """Rename a key, or replace its policy, allowed networks or expiry.
+        Arguments left out are unchanged; ``allowed_ips=None`` removes the
+        restriction and ``expires_at=None`` makes the key never expire."""
+        body = _compact({"name": name, "policy": policy})
+        body.update(_given({"allowed_ips": allowed_ips}))
+        if expires_at is not _UNSET:
+            body["expires_at"] = None if expires_at is None else _rfc3339(expires_at)
+        return self._request("PATCH", f"/api-keys/{_seg(key_id)}", body=body)
 
     def delete(self, key_id: str) -> Deleted:
         """Revoke a key."""
@@ -225,12 +338,24 @@ class ApiKeys(_Resource):
 
 
 class Inboxes(_Resource):
-    def create(self, address: str) -> Inbox:
-        """Create an inbox for an address on one of the project's domains."""
-        return self._request("POST", "/inboxes", body={"address": address})
+    def create(self, address: str, *, hold_unauthenticated: Optional[bool] = None) -> Inbox:
+        """Create an inbox for an address on one of the project's domains.
+        ``hold_unauthenticated`` (default True) holds mail whose sender is not
+        authenticated from ``sending_access`` keys until it is released."""
+        body = _compact({"address": address, "hold_unauthenticated": hold_unauthenticated})
+        return self._request("POST", "/inboxes", body=body)
 
     def list(self) -> InboxList:
         return self._request("GET", "/inboxes")
+
+    def get(self, inbox_id: str) -> Inbox:
+        return self._request("GET", f"/inboxes/{_seg(inbox_id)}")
+
+    def update(self, inbox_id: str, *, hold_unauthenticated: bool) -> Inbox:
+        """Change whether mail from unauthenticated senders is held. Needs a full-access key."""
+        return self._request(
+            "PATCH", f"/inboxes/{_seg(inbox_id)}", body={"hold_unauthenticated": bool(hold_unauthenticated)}
+        )
 
     def delete(self, inbox_id: str) -> Deleted:
         return self._request("DELETE", f"/inboxes/{_seg(inbox_id)}")
@@ -260,9 +385,122 @@ class Messages(_Resource):
         """The raw bytes of one attachment (``index`` from ``attachments[].index``)."""
         return self._request("GET", f"/messages/{_seg(message_id)}/attachments/{_seg(index)}", binary=True)
 
-    def reply(self, message_id: str, *, text: Optional[str] = None, html: Optional[str] = None) -> SendResponse:
-        """Reply from the inbox address, threaded with In-Reply-To and References."""
-        return self._request("POST", f"/messages/{_seg(message_id)}/reply", body=_compact({"text": text, "html": html}))
+    def reply(
+        self,
+        message_id: str,
+        *,
+        text: Optional[str] = None,
+        html: Optional[str] = None,
+        to: Optional[List[str]] = None,
+    ) -> ReplyResponse:
+        """Reply from the inbox address, threaded with In-Reply-To and
+        References. ``to`` defaults to the first Reply-To address, or From.
+        The answer has ``id``, ``thread_id``, ``to`` and, when addresses were
+        left out or Reply-To is on another domain, ``warnings``."""
+        body = _compact({"text": text, "html": html, "to": to})
+        return self._request("POST", f"/messages/{_seg(message_id)}/reply", body=body)
+
+    def release(self, message_id: str) -> Message:
+        """Release a held message, so keys with access to its inbox see it.
+        Needs a full-access key. Answers the message without its content."""
+        return self._request("POST", f"/messages/{_seg(message_id)}/release")
+
+
+class Suppressions(_Resource):
+    def list(
+        self,
+        *,
+        limit: Optional[int] = None,
+        before: Optional[str] = None,
+        reason: Optional[str] = None,
+        stream: Optional[str] = None,
+        address: Optional[str] = None,
+        domain: Optional[str] = None,
+    ) -> SuppressionPage:
+        """Suppressed addresses, newest first. Pass ``next_before`` as ``before`` for the next page."""
+        query = {"limit": limit, "before": before, "reason": reason, "stream": stream}
+        query.update(address=address, domain=domain)
+        return self._request("GET", "/suppressions", query=query)
+
+    def create(
+        self, address: str, *, reason: Optional[str] = None, detail: Optional[str] = None, stream: Optional[str] = None
+    ) -> SuppressionCreated:
+        """Stop sending to an address (``stream``: ``all``, the default, or
+        ``broadcast``). ``created`` is False if it was already suppressed.
+        Needs a full-access key."""
+        body = _compact({"address": address, "reason": reason, "detail": detail, "stream": stream})
+        return self._request("POST", "/suppressions", body=body)
+
+    def delete(self, address: str, *, stream: Optional[str] = None) -> SuppressionDeleted:
+        """Send to an address again: remove its suppressions, or only ``stream``'s.
+        Needs a full-access key."""
+        return self._request("DELETE", f"/suppressions/{_seg(address)}", query={"stream": stream})
+
+    def export(
+        self,
+        *,
+        reason: Optional[str] = None,
+        stream: Optional[str] = None,
+        address: Optional[str] = None,
+        domain: Optional[str] = None,
+    ) -> str:
+        """Every matching suppression, as CSV text."""
+        query = {"reason": reason, "stream": stream, "address": address, "domain": domain}
+        return self._request("GET", "/suppressions/export", query=query, text=True)
+
+
+class Pauses(_Resource):
+    def list(self, *, active: Optional[bool] = None, limit: Optional[int] = None) -> PauseList:
+        """Circuit-breaker pauses, newest first; ``active=True`` lists only those still in force."""
+        return self._request("GET", "/pauses", query={"active": active, "limit": limit})
+
+    def resume(self, pause_id: str) -> Pause:
+        """Let the paused key, domain or project send again. Needs a full-access key."""
+        return self._request("POST", f"/pauses/{_seg(pause_id)}/resume")
+
+
+class ProjectSettings(_Resource):
+    def get(self) -> Project:
+        """The project's per-recipient cap and circuit-breaker settings."""
+        return self._request("GET", "/project")
+
+    def update(
+        self,
+        *,
+        max_per_recipient_per_day: Optional[int] = _UNSET,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+    ) -> Project:
+        """Change them. Arguments left out keep their value;
+        ``max_per_recipient_per_day=None`` turns the cap off. Needs a
+        full-access key."""
+        body = _given({"max_per_recipient_per_day": max_per_recipient_per_day})
+        if circuit_breaker is not None:
+            body["circuit_breaker"] = circuit_breaker
+        return self._request("PATCH", "/project", body=body)
+
+
+class AuditLog(_Resource):
+    def list(
+        self, *, limit: Optional[int] = None, before: Optional[Union[str, int]] = None, action: Optional[str] = None
+    ) -> AuditEntryPage:
+        """Audit log entries, newest first. Needs a full-access key."""
+        return self._request("GET", "/audit-log", query={"limit": limit, "before": before, "action": action})
+
+    def verify(self) -> AuditVerification:
+        """Check the whole hash chain on the server. Keep ``head_hash`` to compare later."""
+        return self._request("GET", "/audit-log/verify")
+
+
+class DeliveryInsights(_Resource):
+    def get(self, *, window: Optional[str] = None) -> Insights:
+        """Acceptance, deferral and bounce rates and time to acceptance, per
+        mailbox provider and sending IP, for the windows ``24h``, ``7d`` and
+        ``30d``. The server always computes all three; with ``window``, only
+        that one is kept in ``windows``. Needs a full-access key."""
+        insights = self._request("GET", "/insights")
+        if window and isinstance(insights, dict) and isinstance(insights.get("windows"), list):
+            insights["windows"] = [w for w in insights["windows"] if w.get("window") == window]
+        return cast(Insights, insights)
 
 
 class OpenMailWire:
@@ -271,6 +509,12 @@ class OpenMailWire:
     :param api_key: an ``omw_…`` key. Default: the ``OMW_API_KEY`` environment variable.
     :param base_url: default: ``OMW_API_URL``, then ``http://localhost:8080``.
     :param timeout: per-request timeout in seconds.
+    :param max_retries: how many times to send a request again when it is
+        answered 429 or 503, after waiting its ``Retry-After`` seconds (1 s if
+        there is none). Default 0: never retry. The same body and
+        idempotency key are sent again.
+    :param max_retry_wait: the longest ``Retry-After`` to wait for, in
+        seconds; a longer one is raised at once.
     """
 
     def __init__(
@@ -280,6 +524,8 @@ class OpenMailWire:
         *,
         timeout: float = 30.0,
         opener: Optional[urllib.request.OpenerDirector] = None,
+        max_retries: int = 0,
+        max_retry_wait: float = 60.0,
     ) -> None:
         key = api_key or os.environ.get("OMW_API_KEY")
         if not key:
@@ -287,6 +533,8 @@ class OpenMailWire:
         self._api_key = key
         self.base_url = (base_url or os.environ.get("OMW_API_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
+        self.max_retries = max(0, int(max_retries))
+        self.max_retry_wait = max_retry_wait
         self._opener = opener or urllib.request.build_opener(_NoRedirect)
 
         self.emails = Emails(self)
@@ -295,11 +543,31 @@ class OpenMailWire:
         self.api_keys = ApiKeys(self)
         self.inboxes = Inboxes(self)
         self.messages = Messages(self)
+        self.suppressions = Suppressions(self)
+        self.pauses = Pauses(self)
+        self.project = ProjectSettings(self)
+        self.audit_log = AuditLog(self)
+        self.insights = DeliveryInsights(self)
 
     def __repr__(self) -> str:
         return f"OpenMailWire(base_url={self.base_url!r})"
 
-    def _request(
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Send a request, and again after ``Retry-After`` on 429 and 503 when ``max_retries`` allows."""
+        attempt = 0
+        while True:
+            try:
+                return self._send(method, path, **kwargs)
+            except OpenMailWireError as e:
+                if not e.retryable or attempt >= self.max_retries:
+                    raise
+                wait = float(e.retry_after if e.retry_after is not None else 1)
+                if wait > self.max_retry_wait:
+                    raise
+                attempt += 1
+                time.sleep(wait)
+
+    def _send(
         self,
         method: str,
         path: str,
@@ -308,14 +576,19 @@ class OpenMailWire:
         query: Optional[Mapping[str, Any]] = None,
         idempotency_key: Optional[str] = None,
         binary: bool = False,
+        text: bool = False,
     ) -> Any:
         url = self.base_url + path
         if query:
-            q = {k: v for k, v in query.items() if v is not None and v != ""}
+            q = {
+                k: ("true" if v else "false") if isinstance(v, bool) else v
+                for k, v in query.items()
+                if v is not None and v != ""
+            }
             if q:
                 url += "?" + urllib.parse.urlencode(q)
         headers = {
-            "Accept": "*/*" if binary else "application/json",
+            "Accept": "*/*" if binary else "text/csv, text/plain, */*" if text else "application/json",
             "User-Agent": USER_AGENT,
         }
         data = None
@@ -355,6 +628,8 @@ class OpenMailWire:
 
         if binary:
             return raw
+        if text:
+            return raw.decode("utf-8", "replace")
         if not raw:
             return None
         try:
@@ -366,10 +641,11 @@ class OpenMailWire:
             ) from None
 
     def wait_for_delivery(self, email_id: str, timeout: float = 60.0, interval: float = 1.0) -> Email:
-        """Poll ``emails.get`` until no recipient is queued, sending or
-        deferred, and return that email. Every recipient then has a final
-        status (delivered, bounced, expired, suppressed, unknown or canceled):
-        check each one.
+        """Poll ``emails.get`` until no recipient is queued, sending,
+        deferred or held, and return that email. Every recipient then has a
+        final status (delivered, bounced, expired, suppressed, unknown,
+        canceled or rejected): check each one. A held email waits for a person
+        to approve it, so check ``held`` in the send answer before waiting.
 
         :raises WaitTimeoutError: after ``timeout`` seconds, with ``.email`` set to the last state seen.
         """

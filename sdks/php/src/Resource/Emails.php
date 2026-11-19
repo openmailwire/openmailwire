@@ -13,16 +13,18 @@ final class Emails
     }
 
     /**
-     * Queues an email and returns ['id' => …].
+     * Queues an email and returns ['id' => …], plus 'held' => true and
+     * 'hold_reasons' when the key's require_approval policy holds it.
      *
      * $params uses the API's field names: from, to, cc, bcc, reply_to, subject,
-     * html, text, headers, tags, attachments, scheduled_at, expires_at and
-     * retry_uncertain. Attachment 'content' must be base64
+     * html, text, headers, tags, attachments, scheduled_at, expires_at,
+     * retry_uncertain and stream ('transactional', the default, or
+     * 'broadcast'). Attachment 'content' must be base64
      * (base64_encode(file_get_contents($path))). scheduled_at and expires_at
      * may be DateTimeInterface objects.
      *
      * @param array<string, mixed> $params
-     * @return array{id: string}
+     * @return array{id: string, held?: bool, hold_reasons?: list<string>}
      */
     public function send(array $params, ?string $idempotencyKey = null): array
     {
@@ -89,6 +91,68 @@ final class Emails
             $body['rcpts'] = array_values($rcpts);
         }
         return $this->client->request('POST', '/emails/raw', body: $body, idempotencyKey: $idempotencyKey);
+    }
+
+    /**
+     * Reports what send() would do with $params now ('would': send, hold or
+     * refuse, with every refusal and warning), without sending anything.
+     *
+     * @param array<string, mixed> $params the same fields as send()
+     * @return array<string, mixed>
+     */
+    public function check(array $params): array
+    {
+        return $this->client->request('POST', '/emails/check', body: self::body($params));
+    }
+
+    /**
+     * Emails waiting for approval, newest first.
+     *
+     * @return array{object?: string, data: list<array<string, mixed>>, has_more: bool, next_before: string|null}
+     */
+    public function listHeld(?int $limit = null, ?string $before = null): array
+    {
+        return $this->client->request('GET', '/emails/held', query: ['limit' => $limit, 'before' => $before]);
+    }
+
+    /**
+     * Approves a held email: its recipients are queued. Needs a full_access
+     * key or one with can_approve; no key approves its own email.
+     *
+     * @return array<string, mixed>
+     */
+    public function approve(string $id, ?string $note = null): array
+    {
+        return $this->client->request('POST', '/emails/' . rawurlencode($id) . '/approve', body: self::decision($note));
+    }
+
+    /**
+     * Rejects a held email: it is never sent.
+     *
+     * @return array<string, mixed>
+     */
+    public function reject(string $id, ?string $note = null): array
+    {
+        return $this->client->request('POST', '/emails/' . rawurlencode($id) . '/reject', body: self::decision($note));
+    }
+
+    /**
+     * The received messages that answer a sent email, oldest first.
+     *
+     * @return array{object: string, email_id: string, thread_id: string, data: list<array<string, mixed>>}
+     */
+    public function replies(string $id): array
+    {
+        return $this->client->request('GET', '/emails/' . rawurlencode($id) . '/replies');
+    }
+
+    private static function decision(?string $note): \stdClass
+    {
+        $body = new \stdClass();
+        if ($note !== null) {
+            $body->note = $note;
+        }
+        return $body;
     }
 
     /**

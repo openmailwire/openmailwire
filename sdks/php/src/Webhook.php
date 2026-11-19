@@ -12,6 +12,27 @@ final class Webhook
     public const DEFAULT_TOLERANCE = 300;
 
     /**
+     * The event types a webhook can receive (the 'type' of a verified event).
+     * Newer servers may add more.
+     */
+    public const EVENTS = [
+        'email.sent',
+        'email.delivered',
+        'email.delivery_delayed',
+        'email.bounced',
+        'email.failed',
+        'email.suppressed',
+        'email.delivery_unknown',
+        'email.canceled',
+        'email.complained',
+        'email.received',
+        'email.held',
+        'email.approved',
+        'email.rejected',
+        'sending.paused',
+    ];
+
+    /**
      * Checks that a webhook request was signed by OpenMailWire and is fresh,
      * and returns its decoded JSON body.
      *

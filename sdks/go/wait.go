@@ -10,7 +10,7 @@ import (
 )
 
 // ErrWaitTimeout is returned (wrapped) by WaitForDelivery when its timeout
-// passes while a recipient is still queued, sending or deferred.
+// passes while a recipient is still queued, sending, deferred or held.
 var ErrWaitTimeout = errors.New("openmailwire: timed out waiting for delivery")
 
 // sleep waits for d or until ctx is done.
@@ -42,10 +42,11 @@ func (c *Client) wait(deadline time.Time) (time.Duration, bool) {
 	return d, true
 }
 
-// WaitForDelivery polls Emails.Get until no recipient is queued, sending or
-// deferred, and returns that email. Every recipient then has a final status
-// (delivered, bounced, expired, suppressed, unknown or canceled): check each
-// one.
+// WaitForDelivery polls Emails.Get until no recipient is queued, sending,
+// deferred or held, and returns that email. Every recipient then has a final
+// status (delivered, bounced, expired, suppressed, unknown, canceled or
+// rejected): check each one. A held email waits for a person to approve it,
+// so check SendResponse.Held before waiting on one.
 //
 // After timeout it returns the last state seen and an error wrapping
 // ErrWaitTimeout. A timeout of 0 or less waits until ctx is done.

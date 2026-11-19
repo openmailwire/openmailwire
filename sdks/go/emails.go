@@ -46,7 +46,25 @@ type SendEmailRequest struct {
 	// RetryUncertain retries an attempt whose outcome is unknown (the
 	// default); set it to Ptr(false) for receipts.
 	RetryUncertain *bool `json:"retry_uncertain,omitempty"`
+	// Stream is StreamTransactional (the default) or StreamBroadcast, which
+	// adds a signed one-click unsubscribe and skips unsubscribed addresses.
+	Stream string `json:"stream,omitempty"`
 }
+
+// Streams of an email.
+const (
+	StreamTransactional = "transactional"
+	StreamBroadcast     = "broadcast"
+)
+
+// Hold reasons: the require_approval rules that matched.
+const (
+	HoldAlways         = "always"
+	HoldFirstContact   = "first_contact"
+	HoldHasAttachments = "has_attachments"
+	HoldHasLinks       = "has_links"
+	HoldRecipientsOver = "recipients_over"
+)
 
 // SendRawRequest is the body of POST /emails/raw.
 type SendRawRequest struct {
@@ -57,9 +75,12 @@ type SendRawRequest struct {
 	Rcpts []string `json:"rcpts,omitempty"`
 }
 
-// SendResponse is the id of a queued email.
+// SendResponse is the id of a queued email. Held is true when the key's
+// require_approval policy holds it: nothing is sent until it is approved.
 type SendResponse struct {
-	ID string `json:"id"`
+	ID          string   `json:"id"`
+	Held        bool     `json:"held,omitempty"`
+	HoldReasons []string `json:"hold_reasons,omitempty"`
 }
 
 // BatchResponse lists the ids of a batch, in order.
@@ -73,7 +94,7 @@ type CancelEmailResponse struct {
 	ID     string `json:"id"`
 }
 
-// Recipient statuses. Queued, sending and deferred are not final.
+// Recipient statuses. Queued, sending, deferred and held are not final.
 const (
 	StatusQueued     = "queued"
 	StatusSending    = "sending"
@@ -84,6 +105,10 @@ const (
 	StatusSuppressed = "suppressed"
 	StatusUnknown    = "unknown"
 	StatusCanceled   = "canceled"
+	// StatusHeld waits for approval (EmailsService.Approve).
+	StatusHeld = "held"
+	// StatusRejected was rejected by an approver and is never sent.
+	StatusRejected = "rejected"
 )
 
 // Recipient is one recipient's delivery state.
@@ -99,7 +124,7 @@ type Recipient struct {
 // Final reports whether the recipient's status will not change any more.
 func (r Recipient) Final() bool {
 	switch r.Status {
-	case StatusQueued, StatusSending, StatusDeferred:
+	case StatusQueued, StatusSending, StatusDeferred, StatusHeld:
 		return false
 	}
 	return true
@@ -244,6 +269,157 @@ func (s *EmailsService) Batch(ctx context.Context, emails []SendEmailRequest, op
 func (s *EmailsService) SendRaw(ctx context.Context, req *SendRawRequest, opts ...RequestOption) (*SendResponse, error) {
 	var out SendResponse
 	if err := s.c.do(ctx, "POST", "/emails/raw", nil, req, &out, opts); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ErrorBody is an error in the API's {statusCode, name, message} shape, as
+// CheckResult lists them.
+type ErrorBody struct {
+	StatusCode int    `json:"statusCode"`
+	Name       string `json:"name"`
+	Message    string `json:"message"`
+}
+
+// CheckWarning is something a check found that would not stop the send.
+type CheckWarning struct {
+	// Code is no_text_part, html_too_large, link_domain_mismatch,
+	// missing_unsubscribe, domain_not_verified or large_message.
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// CheckResult is what POST /emails/check answers: what a send would do now.
+type CheckResult struct {
+	Object string `json:"object"`
+	// OK is true when there is no refusal and no warning.
+	OK bool `json:"ok"`
+	// Would is "send", "hold" or "refuse".
+	Would  string `json:"would"`
+	Stream string `json:"stream"`
+	// Size is the message size in bytes as it would be sent (estimated).
+	Size        int64          `json:"size"`
+	HoldReasons []string       `json:"hold_reasons"`
+	Refusals    []ErrorBody    `json:"refusals"`
+	Warnings    []CheckWarning `json:"warnings"`
+}
+
+// Check reports what Send would do with req now (send, hold or refuse,
+// with every refusal and warning), without sending anything.
+func (s *EmailsService) Check(ctx context.Context, req *SendEmailRequest) (*CheckResult, error) {
+	var out CheckResult
+	if err := s.c.do(ctx, "POST", "/emails/check", nil, req, &out, nil); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// HeldEmail is an email waiting for approval.
+type HeldEmail struct {
+	Object string `json:"object"`
+	ID     string `json:"id"`
+	// APIKeyID is the key that sent it.
+	APIKeyID    string   `json:"api_key_id"`
+	From        string   `json:"from"`
+	To          []string `json:"to"`
+	Cc          []string `json:"cc"`
+	Bcc         []string `json:"bcc"`
+	Subject     string   `json:"subject"`
+	Stream      string   `json:"stream"`
+	HoldReasons []string `json:"hold_reasons"`
+	// Recipients are the recipients waiting for approval.
+	Recipients []string  `json:"recipients"`
+	CreatedAt  time.Time `json:"created_at"`
+	// ExpiresAt: held mail nobody decides on expires then.
+	ExpiresAt   time.Time  `json:"expires_at"`
+	ScheduledAt *time.Time `json:"scheduled_at"`
+	// Text is the first 2000 characters of the text, for the reviewer.
+	Text          string `json:"text"`
+	TextTruncated bool   `json:"text_truncated"`
+}
+
+// HeldEmailList is a page of held emails, newest first.
+type HeldEmailList struct {
+	Object     string      `json:"object"`
+	Data       []HeldEmail `json:"data"`
+	HasMore    bool        `json:"has_more"`
+	NextBefore string      `json:"next_before"`
+}
+
+// ListHeldParams pages GET /emails/held. Zero values are left out.
+type ListHeldParams struct {
+	Limit  int
+	Before string
+}
+
+// ListHeld returns the emails waiting for approval, newest first.
+func (s *EmailsService) ListHeld(ctx context.Context, params *ListHeldParams) (*HeldEmailList, error) {
+	if params == nil {
+		params = &ListHeldParams{}
+	}
+	var out HeldEmailList
+	q := query("limit", itoa(params.Limit), "before", params.Before)
+	if err := s.c.do(ctx, "GET", "/emails/held", q, nil, &out, nil); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DecisionRequest is the optional body of Approve and Reject.
+type DecisionRequest struct {
+	// Note says why; it is kept with the decision and sent in the webhook.
+	Note string `json:"note,omitempty"`
+}
+
+// Decision is the answer of Approve and Reject.
+type Decision struct {
+	Object string `json:"object"`
+	ID     string `json:"id"`
+	// Decision is "approved" or "rejected".
+	Decision string `json:"decision"`
+	// Recipients were approved (now queued) or rejected.
+	Recipients []string `json:"recipients"`
+	// Suppressed were approved but suppressed since the email was held, so
+	// they are not sent.
+	Suppressed []string `json:"suppressed"`
+}
+
+func (s *EmailsService) decide(ctx context.Context, id, verb string, req *DecisionRequest) (*Decision, error) {
+	if req == nil {
+		req = &DecisionRequest{}
+	}
+	var out Decision
+	if err := s.c.do(ctx, "POST", "/emails/"+seg(id)+"/"+verb, nil, req, &out, nil); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Approve queues a held email. It needs a full-access key or one whose
+// policy has CanApprove; no key approves its own email. req may be nil.
+func (s *EmailsService) Approve(ctx context.Context, id string, req *DecisionRequest) (*Decision, error) {
+	return s.decide(ctx, id, "approve", req)
+}
+
+// Reject rejects a held email: it is never sent. req may be nil.
+func (s *EmailsService) Reject(ctx context.Context, id string, req *DecisionRequest) (*Decision, error) {
+	return s.decide(ctx, id, "reject", req)
+}
+
+// EmailReplies is the answer of GET /emails/{id}/replies.
+type EmailReplies struct {
+	Object   string `json:"object"`
+	EmailID  string `json:"email_id"`
+	ThreadID string `json:"thread_id"`
+	// Data are the received messages that answer the email, oldest first.
+	Data []MessageSummary `json:"data"`
+}
+
+// Replies returns the received messages that answer a sent email.
+func (s *EmailsService) Replies(ctx context.Context, id string) (*EmailReplies, error) {
+	var out EmailReplies
+	if err := s.c.do(ctx, "GET", "/emails/"+seg(id)+"/replies", nil, nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil

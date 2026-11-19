@@ -5,10 +5,15 @@ declare(strict_types=1);
 namespace OpenMailWire;
 
 use OpenMailWire\Resource\ApiKeys;
+use OpenMailWire\Resource\AuditLog;
 use OpenMailWire\Resource\Domains;
 use OpenMailWire\Resource\Emails;
 use OpenMailWire\Resource\Inboxes;
+use OpenMailWire\Resource\Insights;
 use OpenMailWire\Resource\Messages;
+use OpenMailWire\Resource\Pauses;
+use OpenMailWire\Resource\Project;
+use OpenMailWire\Resource\Suppressions;
 use OpenMailWire\Resource\Webhooks;
 
 /**
@@ -20,7 +25,7 @@ final class Client
     public const VERSION = '0.1.0';
     public const DEFAULT_BASE_URL = 'http://localhost:8080';
 
-    private const PENDING = ['queued', 'sending', 'deferred'];
+    private const PENDING = ['queued', 'sending', 'deferred', 'held'];
 
     public readonly string $baseUrl;
     public readonly Emails $emails;
@@ -29,16 +34,30 @@ final class Client
     public readonly ApiKeys $apiKeys;
     public readonly Inboxes $inboxes;
     public readonly Messages $messages;
+    public readonly Suppressions $suppressions;
+    public readonly Pauses $pauses;
+    public readonly Project $project;
+    public readonly AuditLog $auditLog;
+    public readonly Insights $insights;
 
     private readonly string $apiKey;
 
     /**
-     * @param string|null $apiKey  an "omw_…" key; default: the OMW_API_KEY environment variable
-     * @param string|null $baseUrl default: OMW_API_URL, then http://localhost:8080
-     * @param float       $timeout per-request timeout in seconds
+     * @param string|null $apiKey       an "omw_…" key; default: the OMW_API_KEY environment variable
+     * @param string|null $baseUrl      default: OMW_API_URL, then http://localhost:8080
+     * @param float       $timeout      per-request timeout in seconds
+     * @param int         $maxRetries   how many times a request answered 429 or 503 is sent again, each after
+     *                                  its Retry-After (1 s without one), with the same body and idempotency
+     *                                  key; default 0: never retry
+     * @param float       $maxRetryWait the longest Retry-After to wait for, in seconds; a longer one is thrown at once
      */
-    public function __construct(?string $apiKey = null, ?string $baseUrl = null, private readonly float $timeout = 30.0)
-    {
+    public function __construct(
+        ?string $apiKey = null,
+        ?string $baseUrl = null,
+        private readonly float $timeout = 30.0,
+        private readonly int $maxRetries = 0,
+        private readonly float $maxRetryWait = 60.0,
+    ) {
         $apiKey = ($apiKey !== null && $apiKey !== '') ? $apiKey : self::env('OMW_API_KEY');
         if ($apiKey === null) {
             throw new \InvalidArgumentException("OpenMailWire: no API key. Pass \$apiKey ('omw_…') or set OMW_API_KEY.");
@@ -53,6 +72,11 @@ final class Client
         $this->apiKeys = new ApiKeys($this);
         $this->inboxes = new Inboxes($this);
         $this->messages = new Messages($this);
+        $this->suppressions = new Suppressions($this);
+        $this->pauses = new Pauses($this);
+        $this->project = new Project($this);
+        $this->auditLog = new AuditLog($this);
+        $this->insights = new Insights($this);
     }
 
     private static function env(string $name): ?string
@@ -66,7 +90,8 @@ final class Client
 
     /**
      * Sends one request and returns the decoded JSON answer (or the raw body
-     * when $binary is true). Used by the resource classes.
+     * when $binary or $text is true). A 429 or 503 answer is sent again after
+     * its Retry-After as $maxRetries allows. Used by the resource classes.
      *
      * @internal
      *
@@ -81,18 +106,59 @@ final class Client
         mixed $body = null,
         ?string $idempotencyKey = null,
         bool $binary = false,
+        bool $text = false,
+    ): mixed {
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                return $this->send($method, $path, $query, $body, $idempotencyKey, $binary, $text);
+            } catch (OpenMailWireException $e) {
+                if (!$e->isRetryable() || $attempt >= $this->maxRetries) {
+                    throw $e;
+                }
+                $wait = (float) ($e->retryAfter ?? 1);
+                if ($wait > $this->maxRetryWait) {
+                    throw $e;
+                }
+                usleep((int) ($wait * 1_000_000));
+            }
+        }
+    }
+
+    /**
+     * Makes one attempt of a request.
+     *
+     * @param array<string, scalar|null>|null $query
+     *
+     * @throws OpenMailWireException
+     */
+    private function send(
+        string $method,
+        string $path,
+        ?array $query,
+        mixed $body,
+        ?string $idempotencyKey,
+        bool $binary,
+        bool $text,
     ): mixed {
         $url = $this->baseUrl . $path;
         if ($query !== null) {
             $query = array_filter($query, static fn ($v): bool => $v !== null && $v !== '');
+            // http_build_query() would send booleans as 1 and 0.
+            $query = array_map(static fn ($v) => is_bool($v) ? ($v ? 'true' : 'false') : $v, $query);
             if ($query !== []) {
                 $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
             }
         }
 
+        $accept = 'application/json';
+        if ($binary) {
+            $accept = '*/*';
+        } elseif ($text) {
+            $accept = 'text/csv, text/plain, */*';
+        }
         $headers = [
             'Authorization: Bearer ' . $this->apiKey,
-            'Accept: ' . ($binary ? '*/*' : 'application/json'),
+            'Accept: ' . $accept,
             'User-Agent: openmailwire-php/' . self::VERSION,
             'Expect:',
         ];
@@ -152,7 +218,7 @@ final class Client
         if ($status < 200 || $status > 299) {
             throw self::toException($status, $responseHeaders, $raw);
         }
-        if ($binary) {
+        if ($binary || $text) {
             return $raw;
         }
         if ($raw === '') {
@@ -200,10 +266,11 @@ final class Client
     }
 
     /**
-     * Polls emails->get() until no recipient is queued, sending or deferred,
-     * and returns that email. Every recipient then has a final status
-     * (delivered, bounced, expired, suppressed, unknown or canceled): check
-     * each one.
+     * Polls emails->get() until no recipient is queued, sending, deferred or
+     * held, and returns that email. Every recipient then has a final status
+     * (delivered, bounced, expired, suppressed, unknown, canceled or
+     * rejected): check each one. A held email waits for a person to approve
+     * it, so check 'held' in the send answer before waiting on one.
      *
      * @return array<string, mixed>
      *

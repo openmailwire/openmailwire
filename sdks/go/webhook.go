@@ -25,6 +25,27 @@ var (
 	ErrWebhookSignature = errors.New("openmailwire: no webhook signature matches")
 )
 
+// Webhook event types (WebhookEvent.Type, CreateWebhookRequest.Events).
+// Newer servers may add more.
+const (
+	EventEmailSent            = "email.sent"
+	EventEmailDelivered       = "email.delivered"
+	EventEmailDeliveryDelayed = "email.delivery_delayed"
+	EventEmailBounced         = "email.bounced"
+	EventEmailFailed          = "email.failed"
+	EventEmailSuppressed      = "email.suppressed"
+	EventEmailDeliveryUnknown = "email.delivery_unknown"
+	EventEmailCanceled        = "email.canceled"
+	EventEmailComplained      = "email.complained"
+	// EventEmailReceived: a message arrived in an inbox; Data.EmailID is
+	// the received message (Messages.Get).
+	EventEmailReceived = "email.received"
+	EventEmailHeld     = "email.held"
+	EventEmailApproved = "email.approved"
+	EventEmailRejected = "email.rejected"
+	EventSendingPaused = "sending.paused"
+)
+
 // WebhookEvent is the JSON body of a webhook request.
 type WebhookEvent struct {
 	Type      string           `json:"type"`
@@ -33,7 +54,8 @@ type WebhookEvent struct {
 }
 
 // WebhookEventData is the email an event is about. To holds only the
-// recipient the event concerns.
+// recipient the event concerns; for email.received it is the inbox address,
+// and HeaderTo is the message's own To header.
 type WebhookEventData struct {
 	EmailID   string            `json:"email_id"`
 	CreatedAt time.Time         `json:"created_at"`
@@ -53,6 +75,39 @@ type WebhookEventData struct {
 		EnhancedCode string `json:"enhanced_code,omitempty"`
 		Response     string `json:"response,omitempty"`
 	} `json:"delivery,omitempty"`
+	// Complaint is set for email.complained.
+	Complaint *struct {
+		FeedbackType string `json:"feedback_type,omitempty"`
+		UserAgent    string `json:"user_agent,omitempty"`
+	} `json:"complaint,omitempty"`
+	// Approval is set for email.held (Reasons), email.approved (ApprovedBy,
+	// Note) and email.rejected (RejectedBy, Note).
+	Approval *struct {
+		Reasons    []string `json:"reasons,omitempty"`
+		ApprovedBy string   `json:"approved_by,omitempty"`
+		RejectedBy string   `json:"rejected_by,omitempty"`
+		Note       string   `json:"note,omitempty"`
+	} `json:"approval,omitempty"`
+	// Pause is set for sending.paused.
+	Pause *Pause `json:"pause,omitempty"`
+
+	// The fields below are set for email.received.
+	InboxID          string   `json:"inbox_id,omitempty"`
+	Inbox            string   `json:"inbox,omitempty"`
+	ThreadID         string   `json:"thread_id,omitempty"`
+	InReplyToEmailID string   `json:"in_reply_to_email_id,omitempty"`
+	MessageID        string   `json:"message_id,omitempty"`
+	Cc               []string `json:"cc,omitempty"`
+	HeaderTo         []string `json:"header_to,omitempty"`
+	// Trust is TrustAuthenticated, TrustUnauthenticated or TrustFailed.
+	Trust          string `json:"trust,omitempty"`
+	Authentication *struct {
+		SPF   string `json:"spf,omitempty"`
+		DKIM  string `json:"dkim,omitempty"`
+		DMARC string `json:"dmarc,omitempty"`
+	} `json:"authentication,omitempty"`
+	Held                   bool `json:"held,omitempty"`
+	SuspiciousInstructions bool `json:"suspicious_instructions,omitempty"`
 }
 
 func headerValue(h http.Header, name string) string {

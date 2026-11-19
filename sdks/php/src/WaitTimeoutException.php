@@ -6,7 +6,7 @@ namespace OpenMailWire;
 
 /**
  * Thrown by Client::waitForDelivery() when the timeout passes while a recipient
- * is still queued, sending or deferred. $email is the last state seen.
+ * is still queued, sending, deferred or held. $email is the last state seen.
  */
 class WaitTimeoutException extends \RuntimeException
 {
