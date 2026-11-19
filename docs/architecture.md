@@ -11,12 +11,13 @@ OpenMailWire's roles are built into one binary.
 ## Life of a message
 
 1. **Submit.** `POST /emails` validates the request and checks the API key's policy (allowed senders and recipients, send caps). It renders the MIME message, signs it with the domain's DKIM key, and encrypts it. In one transaction it inserts the email, one *delivery* per recipient, and a `queued` event, then returns `{"id"}`. A suppressed recipient gets a `suppressed` delivery instead of a queued one. A scheduled email's deliveries are not due until `scheduled_at`.
-2. **Lease.** A worker asks for up to N jobs. In one statement the control plane:
-   - picks due deliveries (`FOR UPDATE SKIP LOCKED`), skipping recipient domains that are already at the in-flight cap;
-   - marks them `sending`;
-   - creates a fresh attempt ID with an expiring lease;
-   - returns the signed message and a VERP envelope sender.
-3. **Deliver.** The worker resolves MX records (preference order, implicit MX, null MX) and connects on port 25. It offers STARTTLS when the server supports it and records `none`, `opportunistic` or `verified`. When the domain publishes an MTA-STS policy in `enforce` mode, or the MX host has DNSSEC-signed TLSA records (DANE), TLS is required and must check out (`verified+mta-sts`, `dane`); otherwise the attempt is deferred with `4.7.5`. Then it runs MAIL, RCPT and DATA. The final reply text, which usually contains the receiver's queue ID, is kept.
+2. **Lease.** A worker asks for up to N jobs. Under the lease lock the control plane:
+   - reads the oldest due deliveries (a fixed number, however long the queue), and only when they are all held up goes on domain by domain from where the last such lease stopped, so a backlog on one busy domain never slows leasing down;
+   - skips recipient domains at their in-flight cap, providers in backoff or at their limit for the worker's IP, and providers over the day's warm-up cap of a new IP;
+   - locks the chosen deliveries (`FOR UPDATE SKIP LOCKED`) and checks their status again, so a cancel or an expiry that committed meanwhile wins;
+   - marks them `sending` and creates a fresh attempt ID with an expiring lease;
+   - returns the signed message and a VERP envelope sender. A scheduled message gets a new `Date` and DKIM signature here; a message the control plane cannot decrypt is given back at once (`unseal_failed`), not sent.
+3. **Deliver.** The worker resolves MX records (preference order, implicit MX, null MX) and connects on port 25, or reuses an open connection to that server (`RSET` in between). It uses STARTTLS when the server offers it and records `none`, `opportunistic` or `verified`. When the domain publishes an MTA-STS policy in `enforce` mode, or the MX host has DNSSEC-signed TLSA records (DANE), TLS is required and must check out (`verified+mta-sts`, `dane`); otherwise the attempt is deferred with `4.7.5`. Then it runs MAIL, RCPT and DATA, with a deadline per command, per block of the message and for the final reply, all inside the lease. The final reply text, which usually contains the receiver's queue ID, is kept, with the step it came from.
 4. **Report.** The worker writes the outcome to its outbox, posts it, and deletes it once the control plane has accepted it. The control plane records the attempt, applies the policy (below), and appends an event.
 5. **Sweep.** Every 15 seconds the control plane reclaims expired leases, expires overdue deliveries, and purges message bodies past retention (`OMW_RETENTION` for sent mail, `OMW_INBOUND_RETENTION` for inbox messages).
 
@@ -47,7 +48,7 @@ canceled    (POST /emails/{id}/cancel, while the delivery was queued and never a
 | What happened | Outcome | Retry? |
 |---|---|---|
 | 2xx after DATA | `delivered` | no |
-| 4xx at any step, or connect/DNS failure | `deferred` | yes, with backoff 1m, 5m, 15m, 30m, 1h, 2h, 4h, 4h… until expiry |
+| 4xx at any step, or connect/DNS failure | `deferred` | yes: first after 5–15 min, then 30m, 1h, 2h, 4h, 4h… until expiry; greylisting after 5–15 min each time |
 | 5xx | `bounced` | no |
 | The connection dropped after the body was sent but before the final reply | `unknown` | by default yes, with the same Message-ID |
 | The worker never reported before its lease expired | `unknown` | same as above |
@@ -72,12 +73,15 @@ A unique index handles two requests that race.
 
 - The per-recipient-domain cap (`OMW_DOMAIN_CONCURRENCY`) is enforced centrally when leasing, so adding workers never multiplies the rate a receiver sees. Leases are serialized with an advisory lock, so two workers leasing at once cannot both take a domain's last slot.
 - A slow receiver ties up only its own cap, not the whole queue.
-- **Adaptive throttling.** `receiver_state` holds a lower limit for domains that asked us to slow down. A throttling deferral from a direct worker halves the domain's limit (minimum 1) and sets `backoff_until` to 1, 2, 4… up to 30 minutes after the n-th consecutive throttle; direct workers skip the domain until then. Each delivery raises the limit by one, up to the cap. Attempts already in flight when the domain throttled us belong to the same burst: they neither halve the limit again nor raise it.
-- **Relay routing.** Workers have a kind, `direct` or `relay`. Relay workers lease only deliveries with at least `OMW_RELAY_AFTER_ATTEMPTS` attempts or whose domain is in backoff; while a relay worker is live (heartbeat in the last 2 minutes), direct workers do not lease those. Relay attempts count against their own per-domain cap and never change `receiver_state`, because the receiver sees the smarthost's IPs, not ours.
+- **Providers and sending IPs.** Receivers limit and judge senders per IP, and many domains share one provider's servers. So recipient domains are grouped into scopes: the mailbox provider their MX belongs to (`rcpt_domain_providers`, learned from reports and the rules in `internal/policy/providers.json`), or the domain itself. Each scope has an in-flight limit per sending IP (the provider's `concurrency`, or `OMW_DOMAIN_CONCURRENCY`).
+- **Adaptive throttling.** `receiver_state` holds a lower limit for a scope and IP that asked us to slow down. Only connection- or IP-level replies count (a 421, or `4.7.0`, `4.7.28`, `4.7.650` before RCPT), never a mailbox's or an authentication code. The first one is noted; when a second comes from a different recipient within 15 minutes, the limit halves (minimum 1) and `backoff_until` is set 1, 2, 4… up to 30 minutes after the n-th consecutive throttle; direct workers with that IP skip the scope until then. Each delivery raises the limit by one, up to the cap. Attempts already in flight when the scope throttled us belong to the same burst: they neither halve the limit again nor raise it. Authentication codes are recorded per project and sending domain (`sender_auth_issues`).
+- **Warm-up.** `sending_ips` records when each IP started; `warmup_usage` counts its leased attempts per provider and UTC day against the rules' schedule. IPs that sent before v0.6 are warm.
+- **Relay routing.** Workers have a kind, `direct` or `relay`. Relay workers lease only deliveries with at least `OMW_RELAY_AFTER_ATTEMPTS` attempts, greylisting not counted, or whose scope no live direct worker can take now (backoff or warm-up cap on every direct IP); while a relay worker is live (heartbeat in the last 2 minutes), direct workers do not lease the former. Relay attempts count against their own per-domain cap and never change `receiver_state`, because the receiver sees the smarthost's IPs, not ours.
+- **Lock order.** Reports, the sweep and leases lock a delivery before its attempt, so they never deadlock.
 
 ## Security model
 
-- **API keys** (`omw_…`) and **worker tokens** (`omwk_…`) are random, shown once, and stored only as SHA-256 hashes.
+- **API keys** (`omw_…`) and **worker tokens** (`omwk_…`) are random, shown once, and stored only as SHA-256 hashes. A worker token has one role (`delivery`, `relay` or `inbound`) and is refused elsewhere.
 - **Encryption at rest.** DKIM private keys and message bodies are sealed with AES-256-GCM under `OMW_SECRET_KEY`. Bodies are deleted after `OMW_RETENTION`.
 - **Workers get only what they need:** signed messages, one lease at a time. They never see DKIM keys or other projects' data beyond the jobs they carry.
 - **Project isolation.** A project's API key can read only that project's messages and domains.

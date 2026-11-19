@@ -18,6 +18,14 @@ Code is the easy part of sending email. Receivers decide by reputation, and repu
   - Microsoft SNDS.
   - A listed IP is cheaper to replace than to repair.
 - **Advertise the IP.** Set `OMW_PUBLIC_IP` so SPF records and the attempt timeline show the address mail actually leaves from.
+- **The worker checks itself when it starts**, and refuses to start when a check fails:
+  - `ehlo_fqdn`: `OMW_EHLO` is a fully qualified host name (not `localhost`, not an IP);
+  - `ehlo_a_record`: that name's A record is `OMW_PUBLIC_IP`;
+  - `reverse_dns`: the PTR record of `OMW_PUBLIC_IP` names `OMW_EHLO` (with the A record, this is forward-confirmed reverse DNS);
+  - `port25_egress`: a connection to port 25 of Gmail's MX (or `OMW_SELF_CHECK_SMTP`) gets an SMTP greeting.
+
+  Each failure is logged with what to fix. The result goes out with every heartbeat and shows in `openmailwire workers list` (`ok`, `FAILED: …` or `skipped`). For development only, `OMW_SKIP_SELF_CHECK=true` skips the checks; they are skipped anyway with `OMW_SMTP_OVERRIDE` and on relay workers, which do not send from their own IP.
+- **One token per worker, with its role:** `openmailwire workers add mail1` creates a `delivery` token. Relay workers and inbound nodes get theirs with `--role relay` and `--role inbound`. A token used for another role is refused with `403 wrong_worker_role`, so a leaked inbound node's token cannot lease outgoing mail.
 
 ## 2. DNS you publish once, as the operator
 
@@ -36,6 +44,12 @@ The return-path domain needs an MX (or an A record) even if you do not process b
 
 - Publish what `POST /domains` returns, then call `POST /domains/{id}/verify`.
 - DKIM keys are 2048-bit. Their TXT value is longer than 255 characters. Most DNS dashboards split it automatically; with raw zone files, split it into quoted strings yourself.
+- **Signatures.** `From`, `To`, `Subject`, `Date`, `Message-ID`, `Reply-To` and `Cc` are oversigned: a copy of one of them added in transit breaks the signature instead of being shown to the reader. Optionally, `POST /domains/{id}/dkim/ed25519` `{"enabled": true}` adds an Ed25519 signature (RFC 8463) next to the RSA one: publish the `DKIM_ED25519` record it returns, then call it again. Receivers that do not know Ed25519 ignore that signature and use the RSA one.
+- **Rotating the DKIM key** (once or twice a year, or at once if the key may have leaked), with two selectors and an overlap:
+  1. `POST /domains/{id}/dkim/rotate` creates a key under a new selector and returns its TXT record (`DKIM_NEXT`). Mail is still signed with the current key.
+  2. Publish the record and wait for DNS. Call the same endpoint again: it checks the record (`409 dkim_record_not_found` until it is there) and switches signing to the new key.
+  3. Keep the old record (`DKIM_PREVIOUS`) until its `retire_at`, 8 days later: mail queued before the switch (up to 7 days) carries the old signature. Then delete it. Scheduled mail is signed again when it is sent, so it always carries the current key.
+- **Authentication problems** that receivers report (Gmail's `421 4.7.26`–`4.7.32`, `550 5.7.26`–`5.7.32`: SPF, DKIM or DMARC did not pass, or `From` is not aligned) are about one sending domain, so they never slow a provider down for everyone. They show as an `auth_problem` event on the email and in `GET /domains/{id}/dkim` under `auth_issues`. Fix the records they name.
 - **DMARC.** Start with `p=none` and an aggregate report address (`rua=`). Read the reports, then move to `quarantine` or `reject`.
 - **Register the domain** with [Google Postmaster Tools](https://postmaster.google.com). For Outlook, enroll your IPs in Microsoft SNDS and JMRP.
 
@@ -84,12 +98,15 @@ Receivers can require encrypted, authenticated delivery. Workers honour both sta
 - Workers look up `_mta-sts.<domain>` (TXT), fetch `https://mta-sts.<domain>/.well-known/mta-sts.txt` and cache the policy by its `id` until `max_age` passes. Redirects are not followed, and bodies over 64 KB are refused.
 - **`enforce`:** only the MX hosts the policy lists are used, and only with STARTTLS and a certificate valid for the host. Otherwise the attempt is deferred with `4.7.5` and a response that names the policy. Retries follow the usual schedule, so a receiver that fixes its certificate gets its mail.
 - **`testing`:** mail goes out as usual; the attempt's event notes in `data.tls_policy` what enforce mode would have refused.
-- Workers need outbound HTTPS (port 443) to fetch policies. If a fetch fails, the cached policy (or none) applies, as the RFC requires.
+- Workers need outbound HTTPS (port 443) to fetch policies. If a fetch fails, the cached policy (or none) applies, as the RFC requires. A cached policy is fetched again in the last quarter of its `max_age` (at most a day before it expires), so enforcement does not lapse while the domain keeps its policy.
+- Required TLS (MTA-STS `enforce`, DANE) needs TLS 1.2 or later. Opportunistic TLS takes TLS 1.0 or later: any encryption beats plaintext (RFC 7435).
 - The attempt's `tls` is `verified+mta-sts` when the policy was enforced.
 
 **DANE (RFC 7672)** needs a resolver you trust.
 - Run a DNSSEC-validating resolver next to each worker, e.g. Unbound on `127.0.0.1:53`, and set `OMW_DNSSEC_RESOLVER=127.0.0.1:53`. The worker trusts the resolver's AD bit, so never point it at a resolver across a network you do not control. Public resolvers reached over the internet are not good enough.
 - For each MX host whose address is DNSSEC-signed, the worker asks for `_25._tcp.<mx>` TLSA records. When the answer is authenticated and has usable records (DANE-EE `3` or DANE-TA `2`, selectors `0`/`1`, matching types `0`/`1`/`2`), TLS is required and the certificate must match. Otherwise the attempt is deferred with `4.7.5`.
+- MX and address lookups go through the same resolver. DANE applies only to MX hosts named by a DNSSEC-secure MX answer (RFC 7672 section 2.2.1).
+- When a host's TLSA records are authenticated but none is usable (for example only PKIX usages 0 and 1), TLS is still required, without checking the certificate (RFC 7672 section 2.2): the host is used only if it offers STARTTLS.
 - If the resolver is down, or answers SERVFAIL (DNSSEC validation failed) for a signed host's records, that host is not used and the attempt is deferred. A broken resolver delays mail rather than sending it unprotected, so monitor it like any other dependency.
 - DANE takes precedence over MTA-STS for a host that has TLSA records. The attempt's `tls` is `dane`.
 
@@ -97,9 +114,9 @@ Receivers can require encrypted, authenticated delivery. Workers honour both sta
 
 When your IPs are throttled or blocked by one receiver, a relay worker can hand those messages to another provider (any smarthost that speaks SMTP submission: a transactional email service, your ISP's relay, a second OpenMailWire installation).
 
-1. Register it like any worker: `openmailwire workers add relay-1`.
+1. Register it with the relay role: `openmailwire workers add relay-1 --role relay`.
 2. Run `openmailwire worker` with `OMW_RELAY_HOST`, `OMW_RELAY_PORT` (587), `OMW_RELAY_TLS` (`starttls` or `implicit`) and, usually, `OMW_RELAY_USERNAME` and `OMW_RELAY_PASSWORD`. It can run on the control-plane machine; it does not need port 25.
-3. The relay gets deliveries that already had `OMW_RELAY_AFTER_ATTEMPTS` attempts (default 2, set on the control plane), and deliveries to domains paused by adaptive throttling. While it is live, direct workers leave those to it. Stop it and everything goes back to direct delivery within 2 minutes.
+3. The relay gets deliveries that already had `OMW_RELAY_AFTER_ATTEMPTS` attempts (default 2, set on the control plane; greylisting does not count), and deliveries to a provider no live direct worker can take now: throttled, or over the day's warm-up cap, on every direct IP. While it is live, direct workers leave the former to it. Stop it and everything goes back to direct delivery within 2 minutes.
 
 Before you rely on it:
 - **The smarthost must accept your envelope senders.** Mail leaves with the VERP return path `b-…@bounce.<your domain>`. Many providers only accept senders on domains you verified with them; verify the return-path domains (or the whole domain) there, or the smarthost will refuse every message.
@@ -114,7 +131,7 @@ An inbound node (`openmailwire inbound`) receives three things: bounces sent to 
 **The host.**
 - **Inbound port 25 open**, from the whole internet. (Outbound port 25 is not needed on an inbound node.)
 - **A name and a certificate.** Give it an A record, e.g. `mx1.mail.example.net`, set `OMW_INBOUND_HOSTNAME` to that name, and get a certificate for it (Let's Encrypt is fine) for `OMW_TLS_CERT`/`OMW_TLS_KEY`. Without them, senders deliver in plain text; Gmail and Outlook still deliver, but mark the connection unencrypted. Reload the node after renewing the certificate.
-- **A worker token:** `openmailwire workers add mx1`. The node reaches the control plane over HTTPS at `OMW_CONTROL_URL`, for every recipient and every message, so keep them close.
+- **A worker token with the inbound role:** `openmailwire workers add mx1 --role inbound`. The node reaches the control plane over HTTPS at `OMW_CONTROL_URL`, for every recipient and every message, so keep them close.
 - **No open relay.** The node accepts only addresses the control plane knows: bounce addresses with a valid HMAC, inboxes, and `OMW_FBL_ADDRESS`. Everything else is refused at `RCPT TO` with `550 5.1.1`, so it never sends bounces of its own (no backscatter). If the control plane is unreachable it answers `451`, and senders retry for days.
 
 **DNS you publish, as the operator:**
@@ -146,8 +163,23 @@ Give them one address, e.g. `fbl@mail.example.net`, set `OMW_FBL_ADDRESS` to it,
 ## 9. Warm-up and day-to-day
 
 - **Start small.** New IPs and domains have no reputation. Begin with your most-wanted mail (sign-in codes, receipts) at low volume and grow week by week.
+- **Automatic IP warm-up** (`OMW_WARMUP`, on by default). A sending IP the control plane has not seen before starts at day 1 of a schedule: per mailbox provider, at most 50 attempts on day 1, then 100, 200, 400, 800, 1,500, 3,000, 6,000, 12,000, 25,000, 50,000 and 100,000; from day 13 it is warm and only the concurrency limits apply. The schedule applies to Google, Microsoft, Yahoo and Apple in the built-in rules; copy [`internal/policy/providers.json`](../internal/policy/providers.json), change it (a list of daily caps per provider, or `"default"`) and set `OMW_PROVIDER_RULES` to use your own. Days are UTC.
+  - Mail over the day's cap waits for the next day, or goes to a relay worker if one is live. It never goes out of the warming IP.
+  - `openmailwire workers list` shows each IP's day and what is left today per provider: `day 3, google 120/200 left, microsoft 200/200 left, …`.
+  - IPs that sent mail before you upgraded to v0.6 count as warm. An IP that already has a good history elsewhere (moved from another server) can be marked warm with `openmailwire workers warm <name>`; `--restart` starts a warm-up over, e.g. after a blocklisting.
 - **Watch the attempt timeline.** Sudden 421/4.7.x deferrals from one receiver mean slow down. Bounces with 5.7.x mean authentication or reputation, which recipient suppression cannot fix.
-- **Adaptive throttling slows down for you.** A "slow down" deferral (421, `4.7.28`, `4.7.650`, "too many", "rate") halves that domain's concurrency, from `OMW_DOMAIN_CONCURRENCY` down to 1, and pauses direct workers for 1, 2, 4… up to 30 minutes. Each later delivery raises the limit by one. The timeline shows `throttled` and `throttle_relaxed` events, and `SELECT * FROM receiver_state` shows every domain's current limit and pause. If one receiver keeps throttling you, lower your volume to it; the pauses only space out the retries.
+- **Throttling per mailbox provider and sending IP slows down for you.** Recipient domains are grouped by the provider their MX hosts belong to (learned from each attempt's MX host: all Google Workspace domains are `google`); a domain of no known provider is its own group. Each group has a concurrency limit per sending IP: the provider's `concurrency` in the rules (Google 20, Microsoft 10, Yahoo 5, …), or `OMW_DOMAIN_CONCURRENCY`. On top of that, `OMW_DOMAIN_CONCURRENCY` caps each recipient domain across all workers.
+  - Only connection- or IP-level replies mean "slow down": a 421 at any step, or `4.7.0`, `4.7.28` (Gmail) or `4.7.650` (Outlook) at the greeting, EHLO or MAIL FROM. A busy mailbox (`4.2.x`, e.g. Gmail's "receiving mail at a rate"), too many recipients (`4.5.3`) or an authentication code (`4.7.26`–`4.7.32` but `4.7.28`) never does. The reply text is not used.
+  - The first such reply only waits. When a second recipient gets one within 15 minutes, the group's limit for that IP halves (down to 1) and that IP pauses for it for 1, 2, 4… up to 30 minutes. Other IPs go on. Each later delivery raises the limit by one.
+  - The timeline shows `throttled` and `throttle_relaxed` events (with the `scope` and `source_ip`), and `SELECT * FROM receiver_state` shows every group's current limit and pause per IP. If one provider keeps throttling you, lower your volume to it; the pauses only space out the retries.
+- **Retries and greylisting.** The first retry comes 5 to 15 minutes after the first attempt (spread at random, so a burst does not retry at once), then after 30 minutes, 1, 2 and 4 hours until the message expires. A greylisting reply (`451 … greylisted`) is retried 5 to 15 minutes later whatever the attempt count, and does not count toward `OMW_RELAY_AFTER_ATTEMPTS`.
 - **Bulk-sender rules.** Gmail and Yahoo require SPF, DKIM, DMARC, a one-click unsubscribe (`List-Unsubscribe` and `List-Unsubscribe-Post` headers) on marketing mail, and a spam-complaint rate under 0.3%.
 - **Drain before maintenance.** `openmailwire workers drain <name>` stops new jobs to a worker. In-flight deliveries finish, then you can stop it.
 
+
+## 10. Upgrading to v0.6
+
+- **Upgrade the control plane before the workers.** v0.6 workers send fields (`stage`, `self_check`) that v0.5 control planes refuse. A v0.6 worker keeps such refused reports in its outbox and sends them once the control plane is upgraded, but its heartbeats fail until then.
+- Migration `0008_deliverability.sql` clears `receiver_state` (throttling state is relearned within minutes) and marks every IP that has sent mail as warm.
+- Worker tokens created before v0.6 keep working for every role. New tokens have one role: create inbound nodes' tokens with `--role inbound` and relay workers' with `--role relay`.
+- Direct workers now run the self-check at start. Fix what it reports, or set `OMW_SKIP_SELF_CHECK=true` on development machines.

@@ -126,13 +126,13 @@ func (s *Store) LeaseJobs(ctx context.Context, o LeaseOptions) ([]LeasedJob, err
 		return nil, err
 	}
 
-	head, err := scanHead(ctx, tx)
+	head, read, err := scanHead(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
 	picked := st.choose(head, o.Max)
 	usedCursor := false
-	if len(picked) < o.Max && len(head) == leaseHead {
+	if len(picked) < o.Max && read == leaseHead {
 		// The head of the queue is held up. Go on domain by domain from
 		// where the last such lease stopped, at most twice leaseDomains
 		// domains.
@@ -501,35 +501,33 @@ func (st *leaseState) blockedFilters() (domains, scopes, relayScopes []string) {
 
 const candidateCols = `d.id::text, d.rcpt_domain, COALESCE(NULLIF(p.provider, ''), d.rcpt_domain), d.attempts, d.greylists`
 
-func scanCandidates(rows pgx.Rows) ([]candidate, error) {
-	defer rows.Close()
-	var out []candidate
-	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.id, &c.domain, &c.scope, &c.attempts, &c.greylists); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
 // scanHead reads the oldest due deliveries. The LIMIT comes before any
 // filter on limits, so this reads at most leaseHead rows however long the
-// queue is.
-func scanHead(ctx context.Context, tx pgx.Tx) ([]candidate, error) {
-	rows, err := tx.Query(ctx, `SELECT `+candidateCols+`
+// queue is. read is how many rows it read, expired ones included.
+func scanHead(ctx context.Context, tx pgx.Tx) (cands []candidate, read int, err error) {
+	rows, err := tx.Query(ctx, `SELECT `+candidateCols+`, e.expires_at > now() AND e.raw IS NOT NULL
 		FROM (SELECT id, rcpt_domain, attempts, greylists, next_attempt_at, email_id FROM deliveries
 		      WHERE status IN ('queued', 'deferred') AND next_attempt_at <= now()
 		      ORDER BY next_attempt_at LIMIT $1) d
 		JOIN emails e ON e.id = d.email_id
 		LEFT JOIN rcpt_domain_providers p ON p.rcpt_domain = d.rcpt_domain
-		WHERE e.expires_at > now() AND e.raw IS NOT NULL
 		ORDER BY d.next_attempt_at`, leaseHead)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return scanCandidates(rows)
+	defer rows.Close()
+	for rows.Next() {
+		var c candidate
+		var live bool
+		if err := rows.Scan(&c.id, &c.domain, &c.scope, &c.attempts, &c.greylists, &live); err != nil {
+			return nil, 0, err
+		}
+		read++
+		if live { // expired or purged ones wait for the sweep
+			cands = append(cands, c)
+		}
+	}
+	return cands, read, rows.Err()
 }
 
 // scanDomains visits recipient domains with queued or deferred deliveries
@@ -822,7 +820,18 @@ func throttle(ctx context.Context, tx pgx.Tx, at attemptRef, ceiling int) error 
 func relax(ctx context.Context, tx pgx.Tx, at attemptRef, ceiling int) error {
 	var limit, throttles int
 	var last *time.Time
-	err := tx.QueryRow(ctx, `SELECT "limit", throttles, last_throttled_at FROM receiver_state
+	// Most deliveries go to scopes that never throttled us or have
+	// recovered: look without a lock first, so their reports do not queue
+	// on one row.
+	err := tx.QueryRow(ctx, `SELECT "limit", throttles FROM receiver_state
+		WHERE scope = $1 AND source_ip = $2`, at.scope, at.ip).Scan(&limit, &throttles)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && limit >= ceiling && throttles == 0 {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = tx.QueryRow(ctx, `SELECT "limit", throttles, last_throttled_at FROM receiver_state
 		WHERE scope = $1 AND source_ip = $2 FOR UPDATE`, at.scope, at.ip).Scan(&limit, &throttles, &last)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
@@ -861,23 +870,25 @@ func receiverEvent(ctx context.Context, tx pgx.Tx, at attemptRef, typ string, da
 // learnProvider records which provider a recipient domain's MX belongs to,
 // from a direct worker's report, and returns the domain's scope.
 func learnProvider(ctx context.Context, tx pgx.Tx, rules *policy.Rules, domain, mxHost string) (string, error) {
-	if mxHost != "" {
-		provider := rules.ProviderForMX(mxHost)
-		if _, err := tx.Exec(ctx, `INSERT INTO rcpt_domain_providers (rcpt_domain, provider, mx_host) VALUES ($1, $2, $3)
-			ON CONFLICT (rcpt_domain) DO UPDATE SET provider = EXCLUDED.provider, mx_host = EXCLUDED.mx_host, updated_at = now()
-			WHERE rcpt_domain_providers.provider <> EXCLUDED.provider
-			   OR rcpt_domain_providers.updated_at < now() - interval '1 day'`, domain, provider, protocol.CleanText(mxHost, 255)); err != nil {
-			return "", err
-		}
-		if provider != "" {
-			return provider, nil
-		}
-		return domain, nil
-	}
 	var provider string
-	err := tx.QueryRow(ctx, `SELECT provider FROM rcpt_domain_providers WHERE rcpt_domain = $1`, domain).Scan(&provider)
+	var fresh bool
+	err := tx.QueryRow(ctx, `SELECT provider, updated_at > now() - interval '1 day' FROM rcpt_domain_providers
+		WHERE rcpt_domain = $1`, domain).Scan(&provider, &fresh)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", err
+	}
+	if mxHost != "" {
+		learned := rules.ProviderForMX(mxHost)
+		// Written only when new, changed or a day old, so reports to a busy
+		// domain do not all lock its row.
+		if errors.Is(err, pgx.ErrNoRows) || learned != provider || !fresh {
+			if _, err := tx.Exec(ctx, `INSERT INTO rcpt_domain_providers (rcpt_domain, provider, mx_host) VALUES ($1, $2, $3)
+				ON CONFLICT (rcpt_domain) DO UPDATE SET provider = EXCLUDED.provider, mx_host = EXCLUDED.mx_host, updated_at = now()`,
+				domain, learned, protocol.CleanText(mxHost, 255)); err != nil {
+				return "", err
+			}
+		}
+		provider = learned
 	}
 	if provider == "" {
 		return domain, nil

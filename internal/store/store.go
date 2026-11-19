@@ -903,8 +903,13 @@ func (s *Store) Sweep(ctx context.Context, retention time.Duration) error {
 		                  AND d.status IN ('queued', 'sending', 'deferred'))`, retention.Seconds()); err != nil {
 		return fmt.Errorf("purge: %w", err)
 	}
-	// Warm-up counts are needed for today only; DKIM keys past their
-	// overlap are no longer published.
+	// Throttling state of a scope that has been quiet for a day is
+	// forgotten; warm-up counts are needed for today only; DKIM keys past
+	// their overlap are no longer published.
+	if _, err := s.Pool.Exec(ctx, `DELETE FROM receiver_state
+		WHERE updated_at < now() - interval '1 day' AND (backoff_until IS NULL OR backoff_until < now())`); err != nil {
+		return fmt.Errorf("purge receiver state: %w", err)
+	}
 	if _, err := s.Pool.Exec(ctx, `DELETE FROM warmup_usage WHERE day < (now() AT TIME ZONE 'UTC')::date - 2`); err != nil {
 		return fmt.Errorf("purge warm-up usage: %w", err)
 	}

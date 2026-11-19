@@ -34,3 +34,37 @@ func TestLoadInbound(t *testing.T) {
 		t.Fatalf("%+v %v", in, err)
 	}
 }
+
+func TestDeliverabilitySettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OMW_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	c, err := LoadControl()
+	if err != nil || !c.Warmup || c.ProviderRules == nil || c.ProviderRules.Provider("google") == nil {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	t.Setenv("OMW_WARMUP", "false")
+	t.Setenv("OMW_PROVIDER_RULES", "/nonexistent/rules.json")
+	if _, err := LoadControl(); err == nil {
+		t.Fatal("a missing rules file must be refused")
+	}
+	t.Setenv("OMW_PROVIDER_RULES", "")
+	if c, err := LoadControl(); err != nil || c.Warmup {
+		t.Fatalf("OMW_WARMUP=false: %+v %v", c.Warmup, err)
+	}
+
+	t.Setenv("OMW_CONTROL_URL", "https://mail.example.com")
+	t.Setenv("OMW_WORKER_TOKEN", "omwk_x")
+	w, err := LoadWorker()
+	if err != nil || w.SkipSelfCheck || w.SelfCheckSMTP != "" {
+		t.Fatalf("worker defaults: %+v %v", w, err)
+	}
+	t.Setenv("OMW_SKIP_SELF_CHECK", "true")
+	t.Setenv("OMW_SELF_CHECK_SMTP", "mx.example.net:25")
+	if w, err := LoadWorker(); err != nil || !w.SkipSelfCheck || w.SelfCheckSMTP != "mx.example.net:25" {
+		t.Fatalf("worker settings: %+v %v", w, err)
+	}
+	t.Setenv("OMW_SELF_CHECK_SMTP", "mx.example.net")
+	if _, err := LoadWorker(); err == nil {
+		t.Fatal("OMW_SELF_CHECK_SMTP without a port must be refused")
+	}
+}
