@@ -679,6 +679,19 @@ class ClientTest(unittest.TestCase):
         self.assertEqual([r["status"] for r in e["recipients"]], ["delivered", "bounced"])
         self.assertEqual(calls, [f"/emails/{ID}"] * 3)
 
+    def test_wait_for_delivery_waits_while_held(self):
+        states = [["held"], ["held"], ["rejected"]]
+        calls = []
+
+        def handler(r):
+            calls.append(r.path)
+            return 200, email(states[min(len(calls) - 1, len(states) - 1)]), {}
+
+        client = self.serve(handler)
+        e = client.wait_for_delivery(ID, timeout=5, interval=0.01)
+        self.assertEqual([r["status"] for r in e["recipients"]], ["rejected"])
+        self.assertEqual(len(calls), 3)
+
     def test_wait_for_delivery_timeout(self):
         client = self.serve(lambda r: (200, email(["deferred"]), {}))
         with self.assertRaises(WaitTimeoutError) as cm:

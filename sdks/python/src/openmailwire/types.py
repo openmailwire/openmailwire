@@ -169,7 +169,7 @@ class Decision(TypedDict, total=False):
 
 class Recipient(TypedDict, total=False):
     email: str
-    #: queued, sending, deferred, delivered, bounced, expired, suppressed, unknown or canceled
+    #: queued, sending, deferred, held, delivered, bounced, expired, suppressed, unknown, canceled or rejected
     status: str
     attempts: int
     next_attempt_at: Optional[str]

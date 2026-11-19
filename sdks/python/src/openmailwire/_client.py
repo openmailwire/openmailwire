@@ -52,7 +52,7 @@ __version__ = "0.1.0"
 DEFAULT_BASE_URL = "http://localhost:8080"
 USER_AGENT = f"openmailwire-python/{__version__}"
 
-_PENDING = frozenset(("queued", "sending", "deferred"))
+_PENDING = frozenset(("queued", "sending", "deferred", "held"))
 
 # Marks an argument that was not given, where None means "send null".
 _UNSET: Any = object()
@@ -641,10 +641,11 @@ class OpenMailWire:
             ) from None
 
     def wait_for_delivery(self, email_id: str, timeout: float = 60.0, interval: float = 1.0) -> Email:
-        """Poll ``emails.get`` until no recipient is queued, sending or
-        deferred, and return that email. Every recipient then has a final
-        status (delivered, bounced, expired, suppressed, unknown or canceled):
-        check each one.
+        """Poll ``emails.get`` until no recipient is queued, sending,
+        deferred or held, and return that email. Every recipient then has a
+        final status (delivered, bounced, expired, suppressed, unknown,
+        canceled or rejected): check each one. A held email waits for a person
+        to approve it, so check ``held`` in the send answer before waiting.
 
         :raises WaitTimeoutError: after ``timeout`` seconds, with ``.email`` set to the last state seen.
         """

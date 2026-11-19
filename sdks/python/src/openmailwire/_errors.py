@@ -88,8 +88,8 @@ class WebhookVerificationError(Exception):
 
 class WaitTimeoutError(TimeoutError):
     """Raised by ``wait_for_delivery`` when the timeout passes while a
-    recipient is still queued, sending or deferred. ``email`` is the last
-    state seen."""
+    recipient is still queued, sending, deferred or held. ``email`` is the
+    last state seen."""
 
     def __init__(self, message: str, email: Dict[str, Any]) -> None:
         super().__init__(message)

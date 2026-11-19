@@ -10,7 +10,7 @@ import (
 )
 
 // ErrWaitTimeout is returned (wrapped) by WaitForDelivery when its timeout
-// passes while a recipient is still queued, sending or deferred.
+// passes while a recipient is still queued, sending, deferred or held.
 var ErrWaitTimeout = errors.New("openmailwire: timed out waiting for delivery")
 
 // sleep waits for d or until ctx is done.

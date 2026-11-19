@@ -218,7 +218,7 @@ A circuit breaker pauses a key, a domain or the whole project when its bounce or
 
 ### Waiting
 
-`wait_for_delivery(email_id, timeout=60.0, interval=1.0)` polls `emails.get` until no recipient is `queued`, `sending` or `deferred`, and returns the email. Each recipient then has a final status: `delivered`, `bounced`, `expired`, `suppressed`, `unknown` or `canceled`. Check each one. After `timeout` seconds it raises `WaitTimeoutError` (a `TimeoutError`), whose `email` is the last state seen.
+`wait_for_delivery(email_id, timeout=60.0, interval=1.0)` polls `emails.get` until no recipient is `queued`, `sending`, `deferred` or `held`, and returns the email. Each recipient then has a final status: `delivered`, `bounced`, `expired`, `suppressed`, `unknown`, `canceled` or `rejected`. Check each one. A held email waits for a person, so check `held` in the send answer before waiting on it. After `timeout` seconds it raises `WaitTimeoutError` (a `TimeoutError`), whose `email` is the last state seen.
 
 `wait_for_reply(email_id, timeout=60.0, interval=2.0, inbox_id=None)` polls the inboxes until messages arrive whose `in_reply_to_email_id` is `email_id`, and returns them newest first. It returns `[]` if none arrived in time. It looks at the 50 newest messages of each inbox, or only of `inbox_id`.
 

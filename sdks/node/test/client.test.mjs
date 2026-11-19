@@ -649,6 +649,15 @@ test("waitForDelivery polls until no recipient is queued, sending or deferred", 
   assert.ok(mock.requests.every((r) => r.path === `/emails/${ID}`));
 });
 
+test("waitForDelivery keeps waiting while a recipient is held", async () => {
+  const states = [["held"], ["held"], ["rejected"]];
+  let n = 0;
+  const c = await client(() => ({ body: email(states[Math.min(n++, states.length - 1)]) }));
+  const e = await c.waitForDelivery(ID, 5_000, { intervalMs: 10 });
+  assert.deepEqual(e.recipients.map((r) => r.status), ["rejected"]);
+  assert.equal(mock.requests.length, 3);
+});
+
 test("waitForDelivery throws WaitTimeoutError with the last state", async () => {
   const c = await client(() => ({ body: email(["deferred"]) }));
   await assert.rejects(c.waitForDelivery(ID, 50, { intervalMs: 10 }), (err) => {

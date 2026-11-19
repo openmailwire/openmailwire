@@ -95,7 +95,7 @@ export class WebhookVerificationError extends Error {
 
 /**
  * Thrown by `waitForDelivery` when the timeout passes while a recipient is
- * still queued, sending or deferred. `email` is the last state seen.
+ * still queued, sending, deferred or held. `email` is the last state seen.
  */
 export class WaitTimeoutError extends Error {
   readonly email: Email;

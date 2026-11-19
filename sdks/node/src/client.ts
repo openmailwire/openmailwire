@@ -92,7 +92,7 @@ interface RequestOptions {
 
 type Requester = <T>(method: string, path: string, options?: RequestOptions) => Promise<T>;
 
-const PENDING = new Set(["queued", "sending", "deferred"]);
+const PENDING = new Set(["queued", "sending", "deferred", "held"]);
 
 function env(name: string): string | undefined {
   return typeof process !== "undefined" ? process.env?.[name] : undefined;
@@ -656,9 +656,11 @@ export class OpenMailWire {
   }
 
   /**
-   * Polls `emails.get` until no recipient is queued, sending or deferred, and
-   * returns that email. Every recipient then has a final status (delivered,
-   * bounced, expired, suppressed, unknown or canceled): check each one.
+   * Polls `emails.get` until no recipient is queued, sending, deferred or
+   * held, and returns that email. Every recipient then has a final status
+   * (delivered, bounced, expired, suppressed, unknown, canceled or rejected):
+   * check each one. A held email waits for a person to approve it, so check
+   * `held` in the send answer before waiting on one.
    *
    * @throws WaitTimeoutError after `timeoutMs`, carrying the last state seen.
    */
