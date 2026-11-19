@@ -781,7 +781,7 @@ curl localhost:8080/inboxes/<inbox id>/messages -H "Authorization: Bearer omw_â€
 
 ## SDKs
 
-Client libraries live in [`sdks/`](sdks): Node.js/TypeScript, Python, Go and PHP. Each covers the whole API (emails, domains, webhooks, API keys, inboxes and messages), can wait for delivery or for a reply, and verifies webhook signatures. They use only each language's standard library (curl for PHP), and they are MIT licensed so that apps under any licence can embed them. They are not published to npm, PyPI or Packagist yet; each README says how to install from this repository.
+Client libraries live in [`sdks/`](sdks): Node.js/TypeScript, Python, Go and PHP. Each covers the whole API (emails with checks and approvals, domains with DKIM and reports, webhooks, API keys, inboxes and messages, suppressions, pauses, the project's settings, the audit log and insights), can wait for delivery or for a reply, and verifies webhook signatures. They use only each language's standard library (curl for PHP), and they are MIT licensed so that apps under any licence can embed them. They are not published to npm, PyPI or Packagist yet; each README says how to install from this repository.
 
 | Language | Install | Docs |
 |---|---|---|
