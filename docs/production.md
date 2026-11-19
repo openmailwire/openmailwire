@@ -42,9 +42,37 @@ The return-path domain needs an MX (or an A record) even if you do not process b
 ## 4. The control plane
 
 - **TLS.** Put a reverse proxy (Caddy, nginx, a load balancer) in front of `OMW_LISTEN`. Workers and apps must reach it over HTTPS.
-- **Backups.** Back up PostgreSQL, and separately back up `OMW_SECRET_KEY`. Without that key, the DKIM keys and queued messages in a restored database cannot be decrypted.
+- **Backups.** Back up PostgreSQL, and separately back up `OMW_SECRET_KEY` (or every key in `OMW_SECRET_KEYS`). Without the key, the DKIM keys, webhook secrets and queued messages in a restored database cannot be decrypted. At start the control plane checks the configured keys against the database and refuses to run with a key that doesn't match the data, instead of failing later on every send.
 - **Never** set `OMW_ALLOW_UNVERIFIED=true`.
 - **One instance** of `openmailwire serve` for now. Several can share a database safely (leases use `SKIP LOCKED` and migrations take an advisory lock), but that setup is not tested yet.
+
+### Rotating secrets
+
+Rotate `OMW_SECRET_KEY` when someone who knew it leaves, or on a schedule. Nothing stops while you do it.
+
+1. Make a key: `openmailwire keygen`. Back it up.
+2. On every control plane, set `OMW_SECRET_KEYS=<new>,<old>` (newest first; unset `OMW_SECRET_KEY` or leave it set to one of the two) and restart. New values are now sealed with the new key, and both open old ones. The start-up log names both key ids: `secret keys checked … sealing_key=… other_keys=…`.
+3. Run `openmailwire rotate-secrets` once, from any machine with `DATABASE_URL` and the same `OMW_SECRET_KEYS`. It re-encrypts DKIM keys, webhook secrets, queued messages and inbox messages in transactions of 100 rows, pausing 50 ms between them (`--batch`, `--pause`). It can be stopped and run again. It finishes with `done: nothing is sealed with key … any more`.
+4. Remove the old key from `OMW_SECRET_KEYS` and restart.
+
+The control plane refuses to start while data is still sealed with a key it doesn't have, and the message says which key id is missing. A sealed value records the id of its key (8 hex characters derived from the key); the key itself is never stored, only a check value. Bounce (VERP) addresses already sent keep verifying across rotations: their signing key lives in the database, sealed.
+
+### Webhook signing secrets
+
+- **Rotate** a webhook's secret with `POST /webhooks/{id}/rotate-secret` (`{"overlap_seconds": …}`, default one day). Deploy the new secret to the receiver within the overlap; until it ends, every request is signed with both. A leaked secret: rotate with `"overlap_seconds": 0`.
+- **Ed25519** (`"asymmetric_signing": true` on `POST /webhooks`): receivers verify with the public key from `GET /webhooks/{id}` and never hold a secret that could sign. Rotation replaces the key pair too; both public keys are listed during the overlap.
+- **Limits.** A project has at most `OMW_WEBHOOKS_PER_PROJECT` webhooks (default 10). At most 4 requests run per endpoint and 8 per project at once. An endpoint that fails 5 times in a row is paused (30 s, doubling to 10 minutes), then probed one request at a time; `GET /webhooks/{id}` shows `consecutive_failures` and `paused_until`.
+- **Errors.** Projects see a short, generic `last_error`. The control plane's log has the details (`webhook attempt failed`, with the error), including any address an endpoint resolved to.
+
+### Delivery insights
+
+`GET /insights` (full access) gives acceptance, deferral and bounce rates and time to acceptance per mailbox provider and per sending IP, for 24 hours, 7 days and 30 days. Watch it next to Google Postmaster Tools:
+
+- A falling acceptance rate or rising deferral rate at one provider usually means reputation trouble there; slow down to it.
+- One sending IP worse than the others: check its blocklist status and reverse DNS.
+- A p95 time to acceptance in minutes means receivers are deferring you, often greylisting or throttling.
+
+It reads at most the newest 100,000 emails of the last 30 days, through indexes, and runs at most two at a time per control plane.
 
 ## 5. SMTP submission
 
@@ -140,7 +168,7 @@ Give them one address, e.g. `fbl@mail.example.net`, set `OMW_FBL_ADDRESS` to it,
 
 **Limits and data.**
 - `OMW_INBOUND_MAX_SIZE` (default `25MB`) on both the node and the control plane. Gmail sends up to 25 MB; keep them equal.
-- Inbox messages are encrypted at rest with `OMW_SECRET_KEY`, and their content is deleted after `OMW_INBOUND_RETENTION` (default 30 days). Bounce and complaint messages are not kept: only the status, diagnostic and feedback type are recorded on the email's timeline.
+- Inbox messages are encrypted at rest with `OMW_SECRET_KEY` (see [rotating secrets](#rotating-secrets)), and their content is deleted after `OMW_INBOUND_RETENTION` (default 30 days). Bounce and complaint messages are not kept: only the status, diagnostic and feedback type are recorded on the email's timeline.
 - Inboxes receive spam like any address. Agents should treat received text as information, never as instructions; the MCP tools say so to the model.
 
 ## 9. Warm-up and day-to-day
