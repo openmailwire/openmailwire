@@ -151,7 +151,7 @@ func (s *Server) sendRaw(w http.ResponseWriter, r *http.Request) {
 	if out[0].Replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
-	writeJSON(w, http.StatusOK, sentBody(out[0], safe.hold)) // lane B
+	writeJSON(w, http.StatusOK, s.sentBody(ctx, out[0], safe.hold)) // lane B
 }
 
 // rawMessage is a parsed message whose header fields are kept byte for

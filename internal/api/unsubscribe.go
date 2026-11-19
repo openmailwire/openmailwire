@@ -173,11 +173,15 @@ func (s *Server) unsubscribeNow(w http.ResponseWriter, r *http.Request) {
 }
 
 // clientIP is the address the request came from (RemoteAddr: proxies in
-// front of the control plane share one budget).
+// front of the control plane share one budget). IPv6 clients are counted
+// per /64, since one host usually has the whole prefix.
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 	}
 	return host
 }
@@ -195,7 +199,12 @@ type ipLimiter struct {
 	rate    float64
 	burst   float64
 	buckets map[string]*bucket
+	swept   time.Time
 }
+
+// maxBuckets bounds the limiter's memory; beyond it, idle buckets are
+// dropped (at most every 10 seconds) and, if that is not enough, all.
+const maxBuckets = 20000
 
 type bucket struct {
 	tokens float64
@@ -211,12 +220,16 @@ func newIPLimiter(rate float64, burst int) *ipLimiter {
 func (l *ipLimiter) take(ip string, now time.Time) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.buckets) > 10000 {
-		for k, b := range l.buckets { // forget full buckets
+	if len(l.buckets) > maxBuckets && now.Sub(l.swept) > 10*time.Second {
+		l.swept = now
+		for k, b := range l.buckets { // forget buckets that have refilled
 			if now.Sub(b.at).Seconds()*l.rate+b.tokens >= l.burst {
 				delete(l.buckets, k)
 			}
 		}
+	}
+	if len(l.buckets) > 2*maxBuckets {
+		l.buckets = map[string]*bucket{}
 	}
 	b := l.buckets[ip]
 	if b == nil {

@@ -145,6 +145,13 @@ func (s *Store) ListHeld(ctx context.Context, projectID, keyID, before string, l
 	return out, more, nil
 }
 
+// IsHeld reports whether any recipient of the email waits for approval.
+func (s *Store) IsHeld(ctx context.Context, emailID string) (bool, error) {
+	var held bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM deliveries WHERE email_id = $1 AND status = 'held')`, emailID).Scan(&held)
+	return held, err
+}
+
 // HoldInfo is what approving or rejecting an email needs to know first.
 type HoldInfo struct {
 	EmailID    string

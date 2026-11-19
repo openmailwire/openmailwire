@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Agent safety and compliance
+
+Server-enforced rules for agents, on every path that sends (`POST /emails`, batches, `POST /emails/raw` and SMTP submission, inbox replies, MCP).
+
+**Approval holds.**
+- Key policy `require_approval` with the rules `always`, `first_contact`, `has_attachments`, `has_links` and `recipients_over: N`. A matching email is stored with delivery status `held` and answers `{"id", "held": true, "hold_reasons"}`.
+- `GET /emails/held`, `POST /emails/{id}/approve` and `POST /emails/{id}/reject` (with an optional `note`), for `full_access` keys and keys whose policy has `can_approve`. A key never approves its own email (`403 cannot_approve_own_email`); deciding twice answers `409 not_held`.
+- New delivery statuses `held` and `rejected`; webhooks `email.held`, `email.approved` and `email.rejected`.
+- Held mail expires at its `expires_at` (`email.failed`), and its body is not purged before.
+
+**Streams and one-click unsubscribe.**
+- `stream: "transactional" | "broadcast"` on `POST /emails` and batches; `stream` or an `X-OMW-Stream` header on `POST /emails/raw`.
+- Broadcast mail goes to one recipient and gets `List-Unsubscribe` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058), DKIM-signed, pointing at `OMW_PUBLIC_URL/u/{token}`. The token is HMAC-signed over the project and the address.
+- `POST /u/{token}` (no key) suppresses the address for broadcast mail at once; `GET` only shows a confirm page. Both are rate-limited per client IP. Without `OMW_PUBLIC_URL`, broadcast mail is refused with `422 unsubscribe_unavailable`.
+- Every message gets `Feedback-ID: <stream>:<api key id>:<project id>:omw`.
+- Suppressions now have a stream: `all` (bounces, complaints) or `broadcast` (unsubscribes).
+
+**Suppressions API.** `GET /suppressions` (filters and pagination), `POST /suppressions`, `DELETE /suppressions/{address}` and `GET /suppressions/export` (CSV). Sending keys may read.
+
+**Project settings.** `GET /project` and `PATCH /project` (full access):
+- `max_per_recipient_per_day`: at most N emails per recipient in any 24 hours, across all keys, checked under a project lock; `429 recipient_rate_limited` with `Retry-After`.
+- `circuit_breaker`: `enabled`, `bounce_rate` (default 0.05), `complaint_rate` (default 0.001), `min_recipients` (default 50).
+
+**Circuit breakers.** Rolling 24-hour bounce and complaint rates per API key, per sending domain and per project, counted from every bounce and complaint however it arrives. A tripped breaker refuses sends with `403 sending_paused` (naming the rate, the scope and how to resume) and fires `sending.paused`. `GET /pauses` and `POST /pauses/{id}/resume` (full access). The send path only looks up active pauses.
+
+**`POST /emails/check`.** The body of `POST /emails`; sends nothing. Answers `would` (`send`, `hold` or `refuse`), every refusal that would apply, the hold reasons, the size and warnings (`no_text_part`, `html_too_large`, `link_domain_mismatch`, `missing_unsubscribe`, `domain_not_verified`, `large_message`).
+
+**MCP.** New tools `check_email`, `list_held`, `approve_email`, `reject_email` (offered only to keys that may approve; destructive), `list_suppressions`, `add_suppression` and `list_pauses`. `send_email` takes `stream`, and it and `reply_to_message` say when a send is held.
+
+**Configuration.** `OMW_PUBLIC_URL`. **Migration** `0007_agent_safety.sql`, which also backfills the project contacts from past deliveries. `golang.org/x/net` (already in the module graph) becomes a direct dependency, for the public suffix list.
+
 ## v0.5.0: agent inboxes, SMTP submission, delivery quality, SDKs, dashboard, docs for models
 
 ### SMTP submission and raw messages (v0.5)

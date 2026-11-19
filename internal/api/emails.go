@@ -274,7 +274,7 @@ func (s *Server) sendEmail(w http.ResponseWriter, r *http.Request) {
 	if out[0].Replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
-	writeJSON(w, http.StatusOK, sentBody(out[0], e.Hold)) // lane B: {"id"}, plus "held" when held
+	writeJSON(w, http.StatusOK, s.sentBody(r.Context(), out[0], e.Hold)) // lane B: {"id"}, plus "held" when held
 }
 
 // sendBatch queues up to 100 emails, all or none. Every item is validated
@@ -368,7 +368,7 @@ func (s *Server) sendBatch(w http.ResponseWriter, r *http.Request) {
 		pe.write(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, batchSent(out, es)) // lane B: batchResponse plus "held"
+	writeJSON(w, http.StatusOK, s.batchSent(ctx, out, es)) // lane B: batchResponse plus "held"
 }
 
 func batchResponse(out []store.Inserted) map[string]any {

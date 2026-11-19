@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -74,6 +75,15 @@ func TestIPLimiter(t *testing.T) {
 	}
 	if w := l.take("1.2.3.4", now.Add(1100*time.Millisecond)); w != 0 {
 		t.Fatalf("refill: %v", w)
+	}
+	for addr, want := range map[string]string{
+		"192.0.2.7:4242":             "192.0.2.7",
+		"[2001:db8:1:2:3:4:5:6]:443": "2001:db8:1:2::/64",
+		"[2001:db8:1:2:ffff::1]:443": "2001:db8:1:2::/64",
+	} {
+		if got := clientIP(&http.Request{RemoteAddr: addr}); got != want {
+			t.Errorf("clientIP(%s) = %s, want %s", addr, got, want)
+		}
 	}
 }
 

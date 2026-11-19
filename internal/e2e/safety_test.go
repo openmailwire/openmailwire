@@ -315,6 +315,13 @@ func TestSafetyHoldsOnRawAndBatch(t *testing.T) {
 		t.Fatalf("plain raw: %d %v", code, b)
 	}
 
+	// Nothing is held when every recipient is suppressed: nothing waits.
+	e.call("POST", "/suppressions", "", map[string]any{"address": "gone@example.test"})
+	code, b = sfSend(agent, "a@rawhold.test", []string{"gone@example.test"}, map[string]any{"text": "https://rawhold.test/x"})
+	if code != 200 || b["held"] != nil || sfStatusOf(agent, b["id"].(string), "gone@example.test") != "suppressed" {
+		t.Fatalf("held but suppressed: %d %v", code, b)
+	}
+
 	code, b = agent.call("POST", "/emails/batch", "", []map[string]any{
 		{"from": "a@rawhold.test", "to": "r@example.test", "subject": "s", "text": "https://rawhold.test/x"},
 		{"from": "a@rawhold.test", "to": "r@example.test", "subject": "s", "text": "nothing to click"},

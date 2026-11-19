@@ -370,10 +370,18 @@ func (s *Server) settleSafety(r *http.Request, es []store.NewEmail, out []store.
 // ---- answers ----
 
 // sentBody answers a send: {"id"}, plus "held" and "hold_reasons" when the
-// email waits for approval.
-func sentBody(o store.Inserted, hold *store.Hold) map[string]any {
+// email waits for approval (not when every recipient was suppressed).
+func (s *Server) sentBody(ctx context.Context, o store.Inserted, hold *store.Hold) map[string]any {
 	b := map[string]any{"id": o.ID}
-	if hold != nil && !o.Replayed {
+	if hold == nil || o.Replayed {
+		return b
+	}
+	held, err := s.Store.IsHeld(ctx, o.ID)
+	if err != nil {
+		s.Log.Error("is held", "err", err)
+		held = true // the hold was stored; say so rather than nothing
+	}
+	if held {
 		b["held"] = true
 		b["hold_reasons"] = hold.Reasons
 	}
@@ -381,10 +389,10 @@ func sentBody(o store.Inserted, hold *store.Hold) map[string]any {
 }
 
 // batchSent answers a batch like batchResponse, marking held emails.
-func batchSent(out []store.Inserted, es []store.NewEmail) map[string]any {
+func (s *Server) batchSent(ctx context.Context, out []store.Inserted, es []store.NewEmail) map[string]any {
 	data := make([]map[string]any, len(out))
 	for i, o := range out {
-		data[i] = sentBody(o, es[i].Hold)
+		data[i] = s.sentBody(ctx, o, es[i].Hold)
 	}
 	return map[string]any{"data": data}
 }

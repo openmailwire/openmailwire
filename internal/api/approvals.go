@@ -18,7 +18,10 @@ import (
 	"github.com/openmailwire/openmailwire/internal/store"
 )
 
-const previewRunes = 2000
+const (
+	previewRunes = 2000
+	previewMax   = 2 << 20 // larger sealed messages are not opened for a preview
+)
 
 type heldEmailResponse struct {
 	Object      string     `json:"object"`
@@ -95,6 +98,9 @@ func (s *Server) listHeld(w http.ResponseWriter, r *http.Request) {
 func (s *Server) preview(sealed []byte) (string, bool) {
 	if sealed == nil {
 		return "", false
+	}
+	if len(sealed) > previewMax {
+		return "", true
 	}
 	raw, err := s.Sealer.Open(sealed)
 	if err != nil {

@@ -31,6 +31,9 @@ Agents are becoming email's busiest senders: support agents, sales agents, agent
 | **Facts, not guesses.** "Did it arrive?" needs a real answer. | a per-recipient timeline with the receiver's exact SMTP reply, and `unknown` when the truth is unknown | available |
 | **Errors it can act on.** | errors name the cause and the next step, e.g. which DNS record is missing | available |
 | **Its own inbox.** Agents must read replies, not only send. | addresses an agent owns, with replies threaded to the message they answer, and MCP tools to wait for and answer them | available (v0.5) |
+| **A person in the loop, per agent.** | approval holds the server enforces: a key's first contact with someone, links, attachments or many recipients wait until a person (or a reviewing agent) approves | unreleased (v0.6) |
+| **Brakes on a bad run.** One agent must not burn the domain. | circuit breakers that pause a key, domain or project whose bounce or complaint rate goes over the limit, and a per-recipient daily cap across all agents | unreleased (v0.6) |
+| **Bulk-mail rules built in.** | one-click unsubscribe (RFC 8058) on broadcast mail, `Feedback-ID` on every message, a suppressions API, and a pre-send check | unreleased (v0.6) |
 | **Docs written for models.** | [`/llms.txt`](docs/llms.txt) and an [OpenAPI 3.1 spec](docs/openapi.json) at `/openapi.json`, served by every control plane | available |
 
 ### Connect an agent (MCP)
@@ -153,6 +156,13 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Retries: a backoff schedule (1 min → 4 h), with expiry instead of endless retries.
 - Recipient failures (5.1.x) are suppressed automatically. Policy blocks (5.7.x) never suppress recipients.
 - Each project has its own API keys, domains, messages and suppression list.
+- Agent safety and compliance (see [Agent safety](#agent-safety)):
+  - **approval holds**: a key's `require_approval` rules (`always`, `first_contact`, `has_attachments`, `has_links`, `recipients_over`) hold matching mail until a person or a reviewing key approves it;
+  - **streams**: `transactional` and `broadcast`; broadcast mail gets a one-click unsubscribe link (RFC 8058), and every message a `Feedback-ID` for Gmail's feedback loop;
+  - **suppressions API**: list, add, remove and export (CSV);
+  - **per-recipient cap**: at most N emails per recipient per day, across every key of the project;
+  - **circuit breakers**: a key, sending domain or project whose bounce rate goes over 5% or complaint rate over 0.1% (configurable) is paused until a person resumes it;
+  - **`POST /emails/check`**: what a send would do, and why, without sending.
 - Inbound mail (`openmailwire inbound`), see [Inbound mail](#inbound-mail):
   - inboxes on your domains, with messages threaded to the emails they answer, attachments, and replies that go through the normal send path;
   - bounce processing: delivery status notifications (RFC 3464) to the signed VERP address mark a delivery `bounced`, even after `delivered`;
@@ -327,7 +337,8 @@ The complete reference is the OpenAPI 3.1 document at `/openapi.json` (copy: [do
 | `subject` | string | Required. UTF-8 is fine. |
 | `html`, `text` | string | At least one. With both, a `multipart/alternative` message is sent. |
 | `reply_to` | string or string[] | |
-| `headers` | object | Extra headers, e.g. `List-Unsubscribe`. Structural headers are refused. |
+| `headers` | object | Extra headers, e.g. `List-Unsubscribe` on transactional mail. Structural headers are refused, and so is `Feedback-ID`, which OpenMailWire sets. |
+| `stream` | string | `transactional` (default) or `broadcast` (newsletters and other bulk mail). A broadcast email has one recipient and gets OpenMailWire's one-click unsubscribe headers; see [Streams and unsubscribe](#streams-and-one-click-unsubscribe). |
 | `tags` | `[{name, value}]` | Letters, digits, `_` and `-`. |
 | `expires_at` | RFC 3339 time | Default 48 h, at most 7 days. OpenMailWire makes no new attempts after this. |
 | `retry_uncertain` | bool | Default `true`. When an attempt's outcome is unknown, retry it (the recipient may get two copies) or stop. Use `false` for receipts. |
@@ -363,7 +374,8 @@ What OpenMailWire changes, and nothing else:
 - removes `Bcc` (and `Resent-Bcc`);
 - adds `Message-ID` and `Date` when they are missing;
 - turns bare LF or CR line endings into CRLF;
-- adds a `DKIM-Signature` for the `From` domain on top. Signatures already in the message stay.
+- adds a `DKIM-Signature` for the `From` domain on top. Signatures already in the message stay;
+- sets `Feedback-ID` (replacing one in the message) and, on broadcast mail, the `List-Unsubscribe` pair (replacing any in the message). Pass `"stream": "broadcast"`, or an `X-OMW-Stream: broadcast` header, which is removed (SMTP submission clients can set it).
 
 The `From` header must hold exactly one address, on a domain that is added to the project and verified. Lines longer than 998 bytes are refused (`422`); encode such content with quoted-printable or base64, which mail libraries do for you. API key limits apply as for `POST /emails`, and so does `Idempotency-Key`.
 
@@ -384,7 +396,7 @@ curl -X POST localhost:8080/emails/raw \
 
 ### `GET /emails/{id}`
 
-Returns `recipients[]` (status: `queued`, `sending`, `deferred`, `delivered`, `bounced`, `expired`, `suppressed`, `unknown` or `canceled`), `attempts[]` (worker, source IP, MX host, outcome, SMTP code, enhanced code, response, TLS), `events[]`, `scheduled_at` and `api_key_id` (the key that sent it).
+Returns `recipients[]` (status: `queued`, `sending`, `deferred`, `delivered`, `bounced`, `expired`, `suppressed`, `unknown`, `canceled`, `held` (waiting for approval) or `rejected`), `attempts[]` (worker, source IP, MX host, outcome, SMTP code, enhanced code, response, TLS), `events[]`, `scheduled_at` and `api_key_id` (the key that sent it).
 
 ### `POST /emails/{id}/cancel`
 
@@ -397,7 +409,7 @@ Each key has a **permission**:
 | Permission | Can call |
 |---|---|
 | `full_access` (default) | everything |
-| `sending_access` | `POST /emails`, `POST /emails/batch`, `POST /emails/raw`; `GET /emails` and `GET /emails/{id}` for its own emails; `POST /emails/{id}/cancel` for its own emails; `GET /domains` and `GET /domains/{id}`; and `/mcp`, whose tools have the same limits |
+| `sending_access` | `POST /emails`, `POST /emails/batch`, `POST /emails/raw`; `GET /emails` and `GET /emails/{id}` for its own emails; `POST /emails/{id}/cancel` for its own emails; `GET /domains` and `GET /domains/{id}`; `POST /emails/check`; `GET /emails/held` (its own held emails); reading `GET /suppressions`, `/suppressions/export`, `/pauses` and `/project`; approving and rejecting held emails with `can_approve`; and `/mcp`, whose tools have the same limits |
 
 Anything else answers `403 insufficient_permission`.
 
@@ -413,6 +425,7 @@ Each key can also have a **policy**. Every field is optional; a missing field me
 ```
 
 - `max_per_hour` and `max_per_day` count the recipients the key queued in a rolling hour and a rolling 24 hours. Suppressed and canceled recipients do not count.
+- `require_approval` and `can_approve` hold the key's mail for approval, and let a key approve others' held mail: see [Approval holds](#approval-holds).
 - Patterns match lowercase addresses. `*` matches any characters within the local part or within the domain part, so `*@acme.com` does not match `a@mail.acme.com`; add `*@*.acme.com` for that.
 
 Refusals:
@@ -490,6 +503,10 @@ Event types:
 | `email.canceled` | the recipient of a scheduled email was canceled before it was sent |
 | `email.complained` | the recipient reported the email as spam through a feedback loop; `data.complaint` holds the feedback type |
 | `email.received` | an inbox received a message (see below) |
+| `email.held` | the email is held for approval; `data.approval.reasons` lists the rules that matched |
+| `email.approved` | a held email was approved and is being delivered; `data.approval` has `approved_by` (a key id) and `note` |
+| `email.rejected` | a held email was rejected and will never be sent; `data.approval` has `rejected_by` and `note` |
+| `sending.paused` | a circuit breaker paused a key, a domain or the project; `data` is the email whose bounce or complaint tripped it, `data.pause` the pause (scope, reason, rate, threshold, counts, id) |
 
 Every event about a sent email is about **one recipient**, and `data.to` holds only that recipient. A bounce reported later by a delivery status notification is an `email.bounced` too, with the DSN's status and diagnostic in `data.delivery`.
 
@@ -498,6 +515,94 @@ Every event about a sent email is about **one recipient**, and `data.to` holds o
 Requests are signed twice with the same HMAC-SHA256 signature: once in Resend's Svix headers (`svix-id`, `svix-timestamp`, `svix-signature`) and once in the [Standard Webhooks](https://www.standardwebhooks.com) headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`). A handler written for Resend webhooks verifies them unchanged.
 
 Failed deliveries are retried after 5 s, 5 min, 30 min, 2 h, 5 h, 10 h and 10 h, then marked failed. Endpoints must use `https` and resolve to public addresses (checked when connecting). That way a webhook cannot be used to reach the control plane's internal network.
+
+### Agent safety
+
+Every rule here is enforced by the server, on every path that sends: `POST /emails`, batches, `POST /emails/raw` (and so SMTP submission), inbox replies and MCP.
+
+#### Approval holds
+
+A key's policy can hold its mail for a person, or a reviewing agent, to approve:
+
+```json
+{
+  "require_approval": {"first_contact": true, "has_links": true, "recipients_over": 5},
+  "allowed_from": ["agent@acme.com"]
+}
+```
+
+| Rule | Holds an email when |
+|---|---|
+| `always: true` | always |
+| `first_contact: true` | a recipient was never sent mail by this project (held, rejected and suppressed mail do not count) |
+| `has_attachments: true` | it has an attachment, inline ones included |
+| `has_links: true` | its text or HTML has a web link (`mailto:`, `cid:` and `#` links do not count) |
+| `recipients_over: N` | it has more than N recipients |
+
+A held email answers `{"id", "held": true, "hold_reasons": ["first_contact"]}`. Its recipients have status `held`, and the `email.held` webhook fires. Nothing is sent until it is decided:
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/emails/held` | Held emails, newest first, with `hold_reasons`, the held recipients and the first 2000 characters of the text. `?limit` (up to 50) and `?before`. Approvers see the whole project's; other keys see their own. |
+| `POST` | `/emails/{id}/approve` | `{"note"?}`. The held recipients are queued (webhook `email.approved`). A recipient suppressed in the meantime is not sent to. Refused while the sender's key, domain or project is paused. |
+| `POST` | `/emails/{id}/reject` | `{"note"?}`. The held recipients become `rejected` (webhook `email.rejected`) and stop counting toward caps. |
+
+Approving and rejecting need a `full_access` key or a key whose policy has `"can_approve": true`. No key approves its own email (`403 cannot_approve_own_email`), so an agent with `can_approve` can review other agents but never wave its own mail through. Deciding twice answers `409 not_held`. Held mail that nobody decides on expires at its `expires_at` (status `expired`, webhook `email.failed`); its body is kept until then. Each decision is recorded with the deciding key.
+
+#### Streams and one-click unsubscribe
+
+Send newsletters and other bulk mail with `"stream": "broadcast"`. A broadcast email has exactly one recipient, so its unsubscribe link belongs to that address; send many with `POST /emails/batch`. OpenMailWire adds, and DKIM signs:
+
+```
+List-Unsubscribe: <https://mail.example.com/u/{token}>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+```
+
+The token is signed (HMAC) over the project and the address, so it cannot be forged or pointed at someone else. Gmail, Yahoo and other providers `POST` to it when the recipient clicks "Unsubscribe": the address is then suppressed for broadcast mail at once (reason `unsubscribe`, stream `broadcast`), and transactional mail still reaches it. A browser that opens the link with `GET` only gets a page with a confirm button, because link scanners open links too. `/u/` needs no key and is rate-limited per client IP. Broadcast mail needs `OMW_PUBLIC_URL`; without it, it is refused with `422 unsubscribe_unavailable`. Put a visible unsubscribe link in the body as well: `POST /emails/check` warns when there is none.
+
+Every message also gets `Feedback-ID: <stream>:<api key id>:<project id>:omw`, by which Gmail's feedback loop (Postmaster Tools) reports complaint rates, so a misbehaving agent shows up by its key.
+
+#### Suppressions
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/suppressions` | Newest first. Filters: `reason`, `stream` (`all` or `broadcast`), `address`, `domain`; `?limit` and `?before` (the opaque `next_before`). |
+| `POST` | `/suppressions` | `{"address", "reason"?, "detail"?, "stream"?}`. `reason` is a short name (`manual` by default, e.g. `customer_request`). `stream` `all` (default) stops all mail, `broadcast` only bulk mail. `201`, or `200` with the existing row. Full access. |
+| `DELETE` | `/suppressions/{address}` | Send to the address again (`?stream=` removes one stream's suppression only). Full access. |
+| `GET` | `/suppressions/export` | Every suppression as CSV: `address,stream,reason,detail,created_at`. Takes the same filters. |
+
+Bounces (5.1.x) and complaints suppress for every stream, unsubscribes for broadcast only. Sending keys may read but not change the list.
+
+#### Project settings: per-recipient cap and circuit breakers
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/project` | `{"id", "name", "max_per_recipient_per_day", "circuit_breaker": {"enabled", "bounce_rate", "complaint_rate", "min_recipients"}, "updated_at"}` |
+| `PATCH` | `/project` | Change any of them; fields left out keep their value. `"max_per_recipient_per_day": null` turns the cap off. Full access. |
+
+**`max_per_recipient_per_day`** (default: off) caps the emails one address gets from the project in any 24 hours, whichever keys send them. A send over it is refused with `429 recipient_rate_limited` and a `Retry-After` header. Suppressed recipients do not count; held mail counts until it is rejected. The cap is checked under a project lock, so parallel agents cannot overshoot it together. It counts the sends made while it is on.
+
+**Circuit breakers** watch the rolling 24-hour bounce and complaint rates of every API key, every sending domain and the whole project. Once a scope has at least `min_recipients` recipients (default 50) and its bounces are above `bounce_rate` (default 5%) or its complaints above `complaint_rate` (default 0.1%), it is paused: every send from it answers `403 sending_paused`, with the rate, the scope and how to resume, and the `sending.paused` webhook fires. Bounces and complaints count wherever they are recorded: SMTP replies, bounce reports and feedback loops.
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/pauses` | Pauses, newest first (`?active=true` for those in force): `scope` (`api_key`, `domain` or `project`), `scope_id`, `scope_name`, `reason`, `rate`, `threshold`, `recipients`, `bounces`, `complaints`, `created_at`, `resumed_at`, `resumed_by`, `active`. |
+| `POST` | `/pauses/{id}/resume` | Resume after finding the cause. The scope's counts start over. Full access; recorded with the key. |
+
+#### `POST /emails/check`
+
+Takes the body of `POST /emails` and sends nothing. It answers what a send would do now (`"would": "send" | "hold" | "refuse"`), every refusal that would apply (the key's policy and caps, the domain, a pause, the per-recipient cap), the `hold_reasons`, the size, and warnings:
+
+| `code` | |
+|---|---|
+| `no_text_part` | HTML without a plain-text part |
+| `html_too_large` | HTML over 102 KB, which Gmail clips |
+| `link_domain_mismatch` | links to sites other than the sender's domain |
+| `missing_unsubscribe` | broadcast mail without a visible unsubscribe link, or without `OMW_PUBLIC_URL` |
+| `domain_not_verified` | the `From` domain is missing or unverified |
+| `large_message` | over 10 MB |
+
+MCP tools: `check_email`, `list_held`, `approve_email` and `reject_email` (offered only to keys that may approve, and marked destructive), `list_suppressions`, `add_suppression` (full access) and `list_pauses`. `send_email` and `reply_to_message` say when a send is held. Resuming a pause and removing a suppression are left to people, on purpose.
 
 ### Inboxes and received messages
 
@@ -625,6 +730,7 @@ Control plane (`openmailwire serve`):
 | `DATABASE_URL` | none | PostgreSQL connection string. |
 | `OMW_SECRET_KEY` | none | 32 bytes, base64 (`openmailwire keygen`). Encrypts DKIM keys and queued messages. |
 | `OMW_LISTEN` | `:8080` | |
+| `OMW_PUBLIC_URL` | none | Where recipients and mailbox providers reach the control plane, e.g. `https://mail.example.com`. Broadcast mail needs it for its one-click unsubscribe links (`/u/{token}`); without it, broadcast sends are refused. Use `https`: mailbox providers ignore one-click links over plain `http`. |
 | `OMW_SPF_INCLUDE` | none | e.g. `_spf.mail.example.net`. If unset, SPF records list the workers' IPs. |
 | `OMW_BOUNCE_MX` | none | Host that receives bounces for the return-path domains: your inbound node. |
 | `OMW_INBOUND_MX` | none | Host that receives mail for inboxes. When set, every domain shows an optional `INBOUND` MX record. |
@@ -714,6 +820,8 @@ openmailwire apikey list <project-id>
 - [x] **Agent keys**: sending-only keys, per-key send caps (per hour, per day), recipient and sender allowlists, and an audit trail per key: every email records its key, and `GET /emails?api_key_id=` lists them (v0.4).
 - [x] **`llms.txt` and OpenAPI**, served by the control plane at `/llms.txt` and `/openapi.json` (v0.5).
 - [x] **Agent inboxes**: inbound SMTP, replies threaded by `In-Reply-To`, an `email.received` webhook and MCP tools to wait for and answer replies (v0.5).
+- [x] **Agent safety**: approval holds, a per-recipient daily cap, circuit breakers on bounce and complaint rates, a pre-send check (unreleased, v0.6).
+- [x] **Bulk-mail compliance**: streams, one-click unsubscribe (RFC 8058), `Feedback-ID`, a suppressions API (unreleased, v0.6).
 
 **Delivery**
 - [x] **Bounce processing**: an inbound listener for the return-path MX that parses DSNs and checks the VERP HMAC (v0.5).
