@@ -252,28 +252,40 @@ func TestJobBoundedByLease(t *testing.T) {
 
 // TestReportsKeptOnAuthErrors (R3, unproven): a revoked token or a wrong
 // role (401, 403) is fixed by the operator, so the report stays in the
-// outbox; other 4xx answers drop it.
+// outbox, as does a refusal of new fields by a control plane older than the
+// worker; other 4xx answers drop it.
 func TestReportsKeptOnAuthErrors(t *testing.T) {
-	status := http.StatusUnauthorized
 	var mu sync.Mutex
+	status, body := 0, ""
 	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		w.WriteHeader(status)
-		w.Write([]byte(`{"name":"x"}`))
+		w.Write([]byte(body))
 	}))
 	defer cp.Close()
 	r := testRunner(t, cp, nil, config.Worker{})
-	for i, code := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict} {
+	cases := []struct {
+		status int
+		body   string
+		kept   bool
+	}{
+		{http.StatusUnauthorized, `{"name":"invalid_worker_token"}`, true},
+		{http.StatusForbidden, `{"name":"wrong_worker_role"}`, true},
+		{http.StatusUnprocessableEntity, `{"name":"validation_error","message":"json: unknown field \"stage\""}`, true},
+		{http.StatusUnprocessableEntity, `{"name":"validation_error","message":"attempt_id or outcome is invalid"}`, false},
+		{http.StatusConflict, `{"name":"attempt_of_another_worker"}`, false},
+		{http.StatusNotFound, `{"name":"not_found"}`, false},
+	}
+	for i, c := range cases {
 		mu.Lock()
-		status = code
+		status, body = c.status, c.body
 		mu.Unlock()
 		id := "00000000-0000-4000-8000-00000000000" + string(rune('1'+i))
 		r.submit(context.Background(), protocol.Report{AttemptID: id, Outcome: protocol.OutcomeDelivered})
 		_, err := os.Stat(filepath.Join(r.outbox, id+".json"))
-		kept := err == nil
-		if kept != (code != http.StatusConflict) {
-			t.Errorf("answer %d: report kept = %v", code, kept)
+		if kept := err == nil; kept != c.kept {
+			t.Errorf("answer %d %s: report kept = %v", c.status, c.body, kept)
 		}
 	}
 }

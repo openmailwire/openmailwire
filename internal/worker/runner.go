@@ -265,6 +265,11 @@ func (r *Runner) send(ctx context.Context, path string, rep protocol.Report) {
 		// outcome must survive until then.
 		r.log.Error("the control plane refuses this worker's token; the report stays in the outbox until it accepts it",
 			"attempt", rep.AttemptID, "status", he.Status, "err", err)
+	case errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity && strings.Contains(he.Body, "unknown field"):
+		// A control plane older than this worker (before v0.6) refuses
+		// fields it does not know. Keep the report until it is upgraded.
+		r.log.Error("the control plane is older than this worker and refuses its report; upgrade the control plane first. The report stays in the outbox",
+			"attempt", rep.AttemptID, "err", err)
 	case errors.As(err, &he) && he.Permanent():
 		r.log.Error("report rejected; dropping it", "attempt", rep.AttemptID, "err", err)
 		os.Remove(path)

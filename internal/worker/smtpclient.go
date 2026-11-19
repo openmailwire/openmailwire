@@ -282,9 +282,13 @@ func (p *sessionPool) closeIdle() {
 	closeAll(all)
 }
 
+// closeAll says goodbye to connections in the background, so a job never
+// waits for a stale server to answer QUIT.
 func closeAll(cs []*smtpClient) {
 	for _, c := range cs {
-		c.bind(context.Background())
-		c.quit()
+		go func(c *smtpClient) {
+			c.bind(context.Background())
+			c.quit()
+		}(c)
 	}
 }

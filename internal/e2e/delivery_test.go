@@ -22,14 +22,15 @@ import (
 	"github.com/openmailwire/openmailwire/internal/worker"
 )
 
-// newDeliveryEnv is newEnv plus a clean receiver_state, which newEnv's
-// TRUNCATE does not reach (it references neither projects nor workers).
-// The table is emptied again when the test ends, so no other test meets a
-// domain in backoff.
+// newDeliveryEnv is newEnv plus a clean receiver_state and the other
+// delivery tables newEnv's TRUNCATE does not reach (they reference neither
+// projects nor workers). They are emptied again when the test ends, so no
+// other test meets a scope in backoff or a learned provider.
 func newDeliveryEnv(t *testing.T, tweak func(*config.Control)) *env {
 	e := newEnv(t, tweak)
 	reset := func() {
-		if _, err := e.st.Pool.Exec(context.Background(), `TRUNCATE receiver_state`); err != nil {
+		if _, err := e.st.Pool.Exec(context.Background(),
+			`TRUNCATE receiver_state, rcpt_domain_providers, sending_ips, warmup_usage, lease_cursor`); err != nil {
 			t.Error(err)
 		}
 	}
