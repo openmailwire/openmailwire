@@ -15,5 +15,8 @@ RUN apk add --no-cache ca-certificates && adduser -D -u 10001 openmailwire
 USER openmailwire
 WORKDIR /home/openmailwire
 COPY --from=build /out/openmailwire /usr/local/bin/openmailwire
+# Inside a container the control plane must listen on all interfaces; the
+# binary's own default is loopback.
+ENV OMW_LISTEN=:8080
 ENTRYPOINT ["openmailwire"]
 CMD ["help"]

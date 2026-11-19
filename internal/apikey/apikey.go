@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strings"
 )
@@ -196,4 +197,66 @@ func Describe(patterns []string) string {
 		return strings.Join(patterns, ", ")
 	}
 	return strings.Join(patterns[:show], ", ") + fmt.Sprintf(" and %d more", len(patterns)-show)
+}
+
+// MaxAllowedIPs is how many networks a key's allowed_ips may list.
+const MaxAllowedIPs = 100
+
+// ParseAllowedIPs parses a key's allowed_ips: CIDR prefixes
+// ("203.0.113.0/24", "2001:db8::/32") or single addresses (a /32 or /128).
+// Prefixes are normalized ("203.0.113.9/24" becomes "203.0.113.0/24") and
+// deduplicated. An empty list is refused: leave the field out to allow
+// every address.
+func ParseAllowedIPs(in []string) ([]netip.Prefix, error) {
+	if len(in) == 0 {
+		return nil, fmt.Errorf("allowed_ips is empty; leave it out (or set it to null) to allow every address")
+	}
+	if len(in) > MaxAllowedIPs {
+		return nil, fmt.Errorf("allowed_ips has more than %d entries", MaxAllowedIPs)
+	}
+	seen := map[netip.Prefix]bool{}
+	out := make([]netip.Prefix, 0, len(in))
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		var p netip.Prefix
+		var err error
+		if strings.Contains(s, "/") {
+			p, err = netip.ParsePrefix(s)
+		} else {
+			var a netip.Addr
+			if a, err = netip.ParseAddr(s); err == nil {
+				p = netip.PrefixFrom(a, a.BitLen())
+			}
+		}
+		if err != nil || p.Addr().Zone() != "" {
+			return nil, fmt.Errorf("allowed_ips: %q is not an IP address or CIDR prefix; write it like 203.0.113.7, 203.0.113.0/24 or 2001:db8::/32", raw)
+		}
+		if p.Addr().Is4In6() {
+			p = netip.PrefixFrom(p.Addr().Unmap(), max(p.Bits()-96, 0))
+		}
+		p = p.Masked()
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// AllowsIP reports whether ip is inside one of prefixes. Nil prefixes
+// allow every address; an invalid ip is allowed by none.
+func AllowsIP(prefixes []netip.Prefix, ip netip.Addr) bool {
+	if prefixes == nil {
+		return true
+	}
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap().WithZone("")
+	for _, p := range prefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

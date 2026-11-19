@@ -52,6 +52,7 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "create webhook", err)
 		return
 	}
+	s.audit(r, "webhook.created", "webhook", hook.ID, map[string]any{"endpoint": hook.Endpoint, "events": hook.Events}) // audit log (lane A hook)
 	resp := webhookView(hook)
 	resp.SigningSecret = whsec // shown once
 	writeJSON(w, http.StatusCreated, resp)
@@ -108,5 +109,6 @@ func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "delete webhook", err)
 		return
 	}
+	s.audit(r, "webhook.deleted", "webhook", id, nil) // audit log (lane A hook)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "webhook", "id": id, "deleted": true})
 }

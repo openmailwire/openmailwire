@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -49,14 +50,15 @@ Usage:
   openmailwire keygen                         print a new OMW_SECRET_KEY
   openmailwire project create <name>          create a project and its first API key
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
-                       [--allow-to PATTERN]... [--allow-from PATTERN]...
+                       [--allow-to PATTERN]... [--allow-from PATTERN]... [--allow-ip CIDR]... [--expires-in DURATION]
                                               create an API key, e.g. one per agent, with its limits
   openmailwire apikey list <project-id>       list a project's live API keys
   openmailwire workers add <name>             register a worker and print its token
   openmailwire workers list
   openmailwire workers drain <name>           stop giving the worker new jobs
   openmailwire workers resume <name>
-  openmailwire domains force-verify <domain>  mark a domain verified without DNS (development only)
+  openmailwire domains force-verify <domain> [project-id]
+                                              mark a domain verified without DNS (development only)
   openmailwire mcp                            MCP server on stdio for AI agents (needs OMW_API_URL, OMW_API_KEY)
   openmailwire dev-sink [addr]                local SMTP sink that prints what it receives (development only)
   openmailwire version
@@ -141,7 +143,7 @@ func serve(ctx context.Context, log *slog.Logger) error {
 		Store: st, Sealer: sealer, MACKey: secret.Derive(cfg.SecretKey, "openmailwire/verp"),
 		Resolver: domains.NewResolver(cfg.DNSServer), Cfg: cfg, Log: log, Version: version,
 	}
-	httpSrv := &http.Server{Addr: cfg.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	httpSrv := newHTTPServer(cfg.Listen, srv.Handler())
 
 	go func() {
 		t := time.NewTicker(15 * time.Second)
@@ -157,6 +159,25 @@ func serve(ctx context.Context, log *slog.Logger) error {
 				if err := st.SweepInbound(ctx, cfg.InboundRetention); err != nil && ctx.Err() == nil {
 					log.Error("sweep inbound", "err", err)
 				}
+			}
+		}
+	}()
+	go func() {
+		// Unverified domain claims expire (store.DomainClaim).
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			expired, err := st.ExpireDomainClaims(ctx)
+			if err != nil && ctx.Err() == nil {
+				log.Error("expire domain claims", "err", err)
+			}
+			for _, d := range expired {
+				log.Info("unverified domain claim expired", "domain", d.Name, "project", d.ProjectID)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
 			}
 		}
 	}()
@@ -181,6 +202,28 @@ func serve(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+// HTTP server limits. ReadTimeout bounds a whole request, body included, and
+// also the handler's run: when it passes, net/http cancels the request's
+// context. The longest handlers are MCP waits (wait_for_reply, up to 120 s),
+// and a 20 MB body needs about 1 Mbit/s to arrive within it. WriteTimeout
+// counts from the end of the request header, so it covers the body read,
+// the work and the answer.
+const (
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 3 * time.Minute
+	httpWriteTimeout      = 4 * time.Minute
+	httpIdleTimeout       = 2 * time.Minute
+	httpMaxHeaderBytes    = 64 << 10
+)
+
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr: addr, Handler: h,
+		ReadHeaderTimeout: httpReadHeaderTimeout, ReadTimeout: httpReadTimeout,
+		WriteTimeout: httpWriteTimeout, IdleTimeout: httpIdleTimeout, MaxHeaderBytes: httpMaxHeaderBytes,
+	}
 }
 
 func runWorker(ctx context.Context, log *slog.Logger) error {
@@ -270,10 +313,13 @@ func projectCmd(ctx context.Context, args []string) error {
 const apikeyUsage = `usage:
   openmailwire apikey create <project-id> <name> [--sending-only] [--max-per-hour N] [--max-per-day N]
                              [--allow-to PATTERN]... [--allow-from PATTERN]...
+                             [--allow-ip CIDR]... [--expires-in DURATION]
   openmailwire apikey list <project-id>
 
 Patterns match addresses; "*" matches any characters within the local part
-or the domain part: --allow-to '*@acme.com' --allow-from agent@acme.com`
+or the domain part: --allow-to '*@acme.com' --allow-from agent@acme.com.
+--allow-ip limits where the key may be used from (203.0.113.7, 10.0.0.0/8);
+--expires-in makes it stop working after a while (720h).`
 
 // patterns collects a repeatable flag.
 type patterns []string
@@ -320,9 +366,11 @@ func apikeyCreate(ctx context.Context, args []string) error {
 	sendingOnly := fs.Bool("sending-only", false, "")
 	perHour := fs.Int("max-per-hour", 0, "")
 	perDay := fs.Int("max-per-day", 0, "")
-	var allowTo, allowFrom patterns
+	var allowTo, allowFrom, allowIP patterns
 	fs.Var(&allowTo, "allow-to", "")
 	fs.Var(&allowFrom, "allow-from", "")
+	fs.Var(&allowIP, "allow-ip", "")
+	expiresIn := fs.Duration("expires-in", 0, "")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return fmt.Errorf("%v\n\n%s", err, apikeyUsage)
@@ -349,6 +397,20 @@ func apikeyCreate(ctx context.Context, args []string) error {
 	if err := policy.Normalize(); err != nil {
 		return err
 	}
+	var ips []netip.Prefix
+	if len(allowIP) > 0 {
+		if ips, err = apikey.ParseAllowedIPs(allowIP); err != nil {
+			return err
+		}
+	}
+	var expires *time.Time
+	if *expiresIn < 0 {
+		return errors.New("--expires-in must be positive, like 720h")
+	}
+	if *expiresIn > 0 {
+		t := time.Now().UTC().Add(*expiresIn)
+		expires = &t
+	}
 	permission := apikey.FullAccess
 	if *sendingOnly {
 		permission = apikey.SendingAccess
@@ -357,12 +419,24 @@ func apikeyCreate(ctx context.Context, args []string) error {
 		token, hash := secret.NewToken("omw_")
 		k, err := st.NewAPIKey(ctx, store.APIKey{
 			ProjectID: projectID, Name: name, Prefix: token[:10], Permission: permission, Policy: policy,
+			AllowedIPs: ips, ExpiresAt: expires,
 		}, hash)
 		if err != nil {
 			return fmt.Errorf("create key (is %s a project id?): %w", projectID, err)
 		}
-		fmt.Printf("api key     %s\nid          %s\npermission  %s\npolicy      %s\n\nThe key is shown once. Store it now.\n",
-			token, k.ID, k.Permission, policyJSON(k.Policy))
+		if err := st.AppendAudit(ctx, store.AuditEntry{ProjectID: projectID, Actor: store.ActorCLI, Action: "api_key.created",
+			TargetType: "api_key", TargetID: k.ID, Data: map[string]any{"name": name, "prefix": k.Prefix,
+				"permission": k.Permission, "policy": k.Policy, "allowed_ips": allowIP, "expires_at": k.ExpiresAt}}); err != nil {
+			return err
+		}
+		fmt.Printf("api key     %s\nid          %s\npermission  %s\npolicy      %s\n", token, k.ID, k.Permission, policyJSON(k.Policy))
+		if len(ips) > 0 {
+			fmt.Printf("allowed ips %s\n", strings.Join(allowIP, ", "))
+		}
+		if expires != nil {
+			fmt.Printf("expires     %s\n", expires.Format(time.RFC3339))
+		}
+		fmt.Print("\nThe key is shown once. Store it now.\n")
 		return nil
 	})
 }
@@ -394,7 +468,12 @@ func policyJSON(p apikey.Policy) string {
 
 func newAPIKey(ctx context.Context, st *store.Store, projectID, name string) (string, error) {
 	token, hash := secret.NewToken("omw_")
-	if err := st.CreateAPIKey(ctx, projectID, name, token[:10], hash); err != nil {
+	k, err := st.NewAPIKey(ctx, store.APIKey{ProjectID: projectID, Name: name, Prefix: token[:10]}, hash)
+	if err != nil {
+		return "", err
+	}
+	if err := st.AppendAudit(ctx, store.AuditEntry{ProjectID: projectID, Actor: store.ActorCLI, Action: "api_key.created",
+		TargetType: "api_key", TargetID: k.ID, Data: map[string]any{"name": name, "prefix": k.Prefix, "permission": k.Permission}}); err != nil {
 		return "", err
 	}
 	return token, nil
@@ -489,11 +568,23 @@ func devSink(ctx context.Context, args []string) error {
 }
 
 func domainsCmd(ctx context.Context, args []string) error {
-	if len(args) != 2 || args[0] != "force-verify" {
-		return errors.New("usage: openmailwire domains force-verify <domain>")
+	if (len(args) != 2 && len(args) != 3) || args[0] != "force-verify" {
+		return errors.New("usage: openmailwire domains force-verify <domain> [project-id]")
+	}
+	project := ""
+	if len(args) == 3 {
+		project = args[2]
 	}
 	return withStore(ctx, func(st *store.Store) error {
-		if err := st.ForceVerify(ctx, args[1]); err != nil {
+		err := st.ForceVerify(ctx, args[1], project)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return fmt.Errorf("no project has the domain %s (add it with POST /domains first)", args[1])
+		case errors.Is(err, store.ErrConflict) && project == "":
+			return fmt.Errorf("several projects have added %s, or another has it verified; pass the project id", args[1])
+		case errors.Is(err, store.ErrConflict):
+			return fmt.Errorf("another project has %s verified; a domain can be verified in only one project", args[1])
+		case err != nil:
 			return err
 		}
 		fmt.Printf("%s marked verified without a DNS check. Receivers will still check DNS.\n", args[1])

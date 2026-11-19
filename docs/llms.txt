@@ -58,11 +58,13 @@ Webhooks (full access):
 - `DELETE /webhooks/{id}`: stop sending to it.
 
 API keys (full access):
-- `POST /api-keys`: create `{"name", "permission", "policy"}`. Returns `token` (`omw_…`) once.
+- `POST /api-keys`: create `{"name", "permission", "policy", "allowed_ips"?, "expires_at"?}`. Returns `token` (`omw_…`) once.
 - `GET /api-keys`: list keys (never their tokens).
 - `GET /api-keys/{id}`: one key.
-- `PATCH /api-keys/{id}`: change `name`, or replace `policy`.
+- `PATCH /api-keys/{id}`: change `name`, or replace `policy`, `allowed_ips` or `expires_at` (`null` removes either).
 - `DELETE /api-keys/{id}`: revoke the key.
+- `GET /audit-log`: who changed keys, domains, webhooks and inboxes, newest first (full access).
+- `GET /audit-log/verify`: recompute the audit log's hash chain (full access).
 
 Inboxes and messages:
 - `POST /inboxes`: create `{"address"}` on one of the project's domains. Full access.
@@ -102,6 +104,8 @@ Every error is `{"statusCode": 422, "name": "validation_error", "message": "…"
 
 - `missing_api_key` (401): send `Authorization: Bearer omw_…`.
 - `invalid_api_key` (401): the key is wrong or revoked. Stop and ask for a valid key.
+- `api_key_expired` (401): the key's `expires_at` has passed. Ask for a new key.
+- `ip_not_allowed` (403): the key may be used only from its `allowed_ips`. Do not retry from here; tell the user.
 - `insufficient_permission` (403): this key is `sending_access`. Ask a person with a `full_access` key to do it.
 - `domain_not_found` (403): the `from` domain is not in the project. Use a verified domain from `GET /domains`, or add it with `POST /domains` (full access).
 - `domain_not_verified` (403): publish the domain's DNS records, then `POST /domains/{id}/verify`. DNS can take minutes; do not loop.
@@ -110,10 +114,12 @@ Every error is `{"statusCode": 422, "name": "validation_error", "message": "…"
 - `not_found` (404): wrong id, or not visible to this key (`sending_access` keys see only their own emails).
 - `idempotency_conflict` (409): this `Idempotency-Key` was used with a different body. A retry must repeat the identical body; a new email needs a new key.
 - `cannot_cancel` (409): every recipient was already attempted or finished. `GET /emails/{id}` shows what happened.
-- `domain_exists` (409): the domain is already added; find it with `GET /domains`.
+- `domain_exists` (409): this project already has the domain; find it with `GET /domains`.
+- `domain_verified_elsewhere` (409): another project verified this domain first. Only one project can have it verified.
 - `payload_too_large` (413): the body is over 20 MB. Attachments: at most 10 MB decoded and 20 files.
 - `validation_error` (422): fix the field the message names. Never retry unchanged.
-- `rate_limit_exceeded` (429): the key's hourly or daily cap. Wait `Retry-After` seconds, then retry with the same `Idempotency-Key`. If the wait is long, tell the user.
+- `rate_limit_exceeded` (429): the key's hourly or daily cap, or too many requests per second. Wait `Retry-After` seconds, then retry with the same `Idempotency-Key`. If the wait is long, tell the user.
+- `server_busy` (503): too many large requests at once. Wait `Retry-After` seconds and retry with the same `Idempotency-Key`.
 - `internal_error` (500): retry later with the same `Idempotency-Key`.
 
 ## Limits
@@ -121,7 +127,7 @@ Every error is `{"statusCode": 422, "name": "validation_error", "message": "…"
 - 50 recipients per email (`to`, `cc` and `bcc` together); 100 emails per batch.
 - Attachments: 20 files and 10 MB decoded per email. Request bodies on the email endpoints: 20 MB.
 - `expires_at`: default 48 hours, at most 7 days after the send time. `scheduled_at`: at most 30 days ahead.
-- `Idempotency-Key`: at most 256 characters, unique per project.
+- `Idempotency-Key`: printable ASCII, at most 256 characters, unique per API key.
 - Tag names and values: letters, digits, `_` and `-`.
 
 ## Webhooks

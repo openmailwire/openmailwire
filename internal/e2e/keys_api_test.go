@@ -643,12 +643,15 @@ func TestBatch(t *testing.T) {
 	if code, _, b = keysCall(e.harness, "POST", "/emails/batch", map[string]string{"Idempotency-Key": "batch-1"}, items); code != 409 {
 		t.Fatalf("batch conflict: %d %v", code, b)
 	}
-	// Each item is stored under <key>:<index>.
-	if _, again := e.call("POST", "/emails", "batch-1:0", item("a@acme.test", "b1@example.test", "one")); again["id"] != ids[0] {
-		t.Fatalf("item idempotency key: %v, want %s", again["id"], ids[0])
+	// Batch items have their own idempotency namespace (v0.6, audit R1#7):
+	// a single send with the literal key "batch-1:0" is a new email.
+	code, single := e.call("POST", "/emails", "batch-1:0", item("a@acme.test", "b4@example.test", "four"))
+	if code != 200 || single["id"] == ids[0] {
+		t.Fatalf("single send with key batch-1:0: %d %v", code, single)
 	}
-	if n := len(e.smtp.Messages()); n != 3 {
-		t.Fatalf("sent %d messages, want 3", n)
+	e.waitStatus(single["id"].(string), "b4@example.test", "delivered")
+	if n := len(e.smtp.Messages()); n != 4 {
+		t.Fatalf("sent %d messages, want 4", n)
 	}
 }
 

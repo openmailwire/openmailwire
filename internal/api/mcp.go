@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 
@@ -15,7 +16,9 @@ type inProcess struct{ h func() http.Handler }
 
 func (t inProcess) RoundTrip(req *http.Request) (*http.Response, error) {
 	rec := httptest.NewRecorder()
-	t.h().ServeHTTP(rec, req)
+	// A hop: the outer request already passed the rate limit and holds any
+	// large-body slot it needs (hardening.go).
+	t.h().ServeHTTP(rec, req.WithContext(context.WithValue(req.Context(), hopKey{}, true)))
 	return rec.Result(), nil
 }
 
@@ -26,7 +29,7 @@ func (s *Server) mcpHandler(root func() http.Handler) http.Handler {
 		return mcpserver.New(&mcpserver.APIClient{
 			Base: "http://openmailwire.internal",
 			Key:  bearer(r),
-			HTTP: &http.Client{Transport: inProcess{root}},
+			HTTP: &http.Client{Transport: hopTransport{inner: inProcess{root}, ip: s.clientIP(r)}},
 		}, s.Version)
 	}, &mcp.StreamableHTTPOptions{Stateless: true, Logger: s.Log})
 	return s.withProject(h.ServeHTTP)

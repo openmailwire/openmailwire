@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/openmailwire/openmailwire/internal/dkimkey"
@@ -40,15 +41,26 @@ func bodyLimit(r *http.Request) int64 {
 }
 
 // readBody reads the request body, answering 413 when it is over the
-// limit.
+// limit. A body with a Content-Length is read into one buffer of exactly
+// that size, never into one that grows (and copies) as it fills.
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	body, err := io.ReadAll(r.Body)
+	var body []byte
+	var err error
+	if n := r.ContentLength; n > 0 && n <= bodyLimit(r) {
+		body = make([]byte, n)
+		_, err = io.ReadFull(r.Body, body)
+	} else {
+		body, err = io.ReadAll(r.Body)
+	}
 	if err != nil {
 		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
+		switch {
+		case errors.As(err, &tooBig):
 			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
 				fmt.Sprintf("request body is larger than %d MB", tooBig.Limit>>20))
-		} else {
+		case errors.Is(err, errServerBusy):
+			writeBusy(w)
+		default:
 			writeError(w, http.StatusBadRequest, "bad_request", "could not read the request body")
 		}
 		return nil, false
@@ -56,24 +68,39 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	return body, true
 }
 
-// idempotencyKey reads the Idempotency-Key header.
+// idempotencyKey reads the Idempotency-Key header: printable ASCII, at most
+// 256 characters.
 func idempotencyKey(r *http.Request) (string, *policyError) {
 	idem := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if len(idem) > 256 {
 		return "", invalid("Idempotency-Key is longer than 256 characters")
 	}
+	for i := 0; i < len(idem); i++ {
+		if c := idem[i]; c < 0x20 || c > 0x7e {
+			return "", invalid("Idempotency-Key may contain only printable ASCII characters, like a UUID or order-42")
+		}
+	}
 	return idem, nil
 }
 
-// replayed answers the request and returns true when idem was already used
-// in this project: with the first email's id for the same body, or 409 for
-// a different one. Checking before anything else means a retry of a send
-// that succeeded is never refused by a cap it has since reached.
+// batchItemKey is the idempotency key stored for item i of a batch sent
+// with key idem. The separator (a control character) cannot occur in an
+// Idempotency-Key header, so batch items never collide with single sends.
+func batchItemKey(idem string, i int) string {
+	return idem + "\x1f" + strconv.Itoa(i)
+}
+
+// replayed answers the request and returns true when the request's API key
+// already used idem: with the first email's id for the same body, or 409
+// for a different one. Keys are scoped to the API key, so checking before
+// the key's policy reveals and replays nothing of another key's. Checking
+// before anything else means a retry of a send that succeeded is never
+// refused by a cap it has since reached.
 func (s *Server) replayed(w http.ResponseWriter, r *http.Request, idem string, hash []byte) bool {
 	if idem == "" {
 		return false
 	}
-	id, err := s.Store.FindIdempotent(r.Context(), projectID(r), idem, hash)
+	id, err := s.Store.FindIdempotent(r.Context(), projectID(r), apiKeyOf(r).ID, idem, hash)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return false
@@ -141,6 +168,8 @@ func (s *Server) queue(r *http.Request, es []store.NewEmail) ([]store.Inserted, 
 	case errors.Is(err, store.ErrConflict):
 		return nil, &policyError{Status: http.StatusConflict, Name: "idempotency_conflict",
 			Message: "this Idempotency-Key was already used with a different request"}
+	case unstorable(err):
+		return nil, errUnstorable
 	case err != nil:
 		return nil, s.internalErr("insert email", err)
 	}

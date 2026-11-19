@@ -57,6 +57,8 @@ var publicRoutes = []route{
 	{"GET", "/api-keys/{id}", full},
 	{"PATCH", "/api-keys/{id}", full},
 	{"DELETE", "/api-keys/{id}", full},
+	{"GET", "/audit-log", full},
+	{"GET", "/audit-log/verify", full},
 
 	{"POST", "/inboxes", full},
 	{"GET", "/inboxes", sending},

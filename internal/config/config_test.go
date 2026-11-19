@@ -34,3 +34,33 @@ func TestLoadInbound(t *testing.T) {
 		t.Fatalf("%+v %v", in, err)
 	}
 }
+
+// Audit R4#5: the control plane listened on every interface by default.
+func TestControlDefaults(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OMW_SECRET_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	for _, k := range []string{"OMW_LISTEN", "OMW_RATE_LIMIT", "OMW_RATE_LIMIT_BURST", "OMW_MAX_LARGE_REQUESTS", "OMW_TRUSTED_PROXIES"} {
+		t.Setenv(k, "")
+	}
+	c, err := LoadControl()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != "127.0.0.1:8080" || c.KeyRate != DefaultKeyRate || c.KeyBurst != 2*DefaultKeyRate ||
+		c.LargeRequests != DefaultLargeRequests || c.TrustedProxies != nil {
+		t.Fatalf("%+v", c)
+	}
+	t.Setenv("OMW_RATE_LIMIT", "0.5")
+	t.Setenv("OMW_TRUSTED_PROXIES", "10.0.0.0/8, 127.0.0.1")
+	if c, err = LoadControl(); err != nil || c.KeyRate != 0.5 || c.KeyBurst != 1 || len(c.TrustedProxies) != 2 ||
+		c.TrustedProxies[1].String() != "127.0.0.1/32" {
+		t.Fatalf("%+v %v", c.APILimits, err)
+	}
+	for k, v := range map[string]string{"OMW_RATE_LIMIT": "fast", "OMW_TRUSTED_PROXIES": "proxy.local"} {
+		t.Setenv(k, v)
+		if _, err := LoadControl(); err == nil {
+			t.Errorf("%s=%s accepted", k, v)
+		}
+		t.Setenv(k, "")
+	}
+}

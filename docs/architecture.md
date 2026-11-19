@@ -61,7 +61,7 @@ A late report still counts. If a worker reports `delivered` after its lease was 
 
 ## Idempotency
 
-`Idempotency-Key` is unique per project. The request body is hashed:
+`Idempotency-Key` is unique per API key, so one key can never replay, reveal or block another's requests. Batch items get keys in a namespace of their own (the batch's key, a control character, the item's index), which no header can produce. The request body is hashed:
 
 - same key, same hash: the original ID;
 - same key, different hash: `409`.

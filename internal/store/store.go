@@ -249,23 +249,29 @@ type Domain struct {
 	CreatedAt   time.Time
 	VerifiedAt  *time.Time
 	CheckedAt   *time.Time
+	// ClaimExpiresAt is when an unverified domain is removed (DomainClaim);
+	// nil once it has been verified.
+	ClaimExpiresAt *time.Time
 }
 
 const domainCols = `id::text, project_id::text, name, status, dkim_selector, dkim_public, dkim_private,
-	return_path, checks, created_at, verified_at, checked_at`
+	return_path, checks, created_at, verified_at, checked_at, claim_expires_at`
 
 func scanDomain(row pgx.Row) (Domain, error) {
 	var d Domain
 	err := row.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Status, &d.Selector, &d.DKIMPublic, &d.DKIMPrivate,
-		&d.ReturnPath, &d.Checks, &d.CreatedAt, &d.VerifiedAt, &d.CheckedAt)
+		&d.ReturnPath, &d.Checks, &d.CreatedAt, &d.VerifiedAt, &d.CheckedAt, &d.ClaimExpiresAt)
 	return d, err
 }
 
+// CreateDomain adds a domain to a project, unverified, with a claim that
+// expires after DomainClaim. ErrConflict when the project already has it;
+// other projects' domains never conflict.
 func (s *Store) CreateDomain(ctx context.Context, d Domain) (Domain, error) {
 	out, err := scanDomain(s.Pool.QueryRow(ctx, `INSERT INTO domains
-		(project_id, name, dkim_selector, dkim_public, dkim_private, return_path)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+domainCols,
-		d.ProjectID, d.Name, d.Selector, d.DKIMPublic, d.DKIMPrivate, d.ReturnPath))
+		(project_id, name, dkim_selector, dkim_public, dkim_private, return_path, claim_expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7)) RETURNING `+domainCols,
+		d.ProjectID, d.Name, d.Selector, d.DKIMPublic, d.DKIMPrivate, d.ReturnPath, DomainClaim.Seconds()))
 	if isUniqueViolation(err) {
 		return Domain{}, ErrConflict
 	}
@@ -299,19 +305,40 @@ func (s *Store) DomainByName(ctx context.Context, projectID, name string) (Domai
 	return d, noRows(err)
 }
 
+// SaveDomainCheck records the outcome of a DNS check. Verifying clears the
+// domain's claim expiry for good. ErrConflict when the domain would become
+// verified while another project has the same name verified.
 func (s *Store) SaveDomainCheck(ctx context.Context, id, status string, checks []byte) error {
 	_, err := s.Pool.Exec(ctx, `UPDATE domains SET status = $2, checks = $3, checked_at = now(),
-		verified_at = CASE WHEN $2 = 'verified' THEN COALESCE(verified_at, now()) ELSE NULL END
+		verified_at = CASE WHEN $2 = 'verified' THEN COALESCE(verified_at, now()) ELSE NULL END,
+		claim_expires_at = CASE WHEN $2 = 'verified' THEN NULL ELSE claim_expires_at END
 		WHERE id = $1`, id, status, checks)
+	if isUniqueViolation(err) {
+		return ErrConflict
+	}
 	return err
 }
 
 // ForceVerify marks a domain verified without DNS checks. For development
-// and tests only; the CLI exposes it behind an explicit flag.
-func (s *Store) ForceVerify(ctx context.Context, name string) error {
-	tag, err := s.Pool.Exec(ctx, `UPDATE domains SET status = 'verified', verified_at = now() WHERE name = $1`, name)
-	if err == nil && tag.RowsAffected() == 0 {
+// and tests only; the CLI exposes it behind an explicit flag. With
+// projectID empty the name must belong to exactly one project (ErrConflict
+// otherwise, or when another project has it verified).
+func (s *Store) ForceVerify(ctx context.Context, name, projectID string) error {
+	var n int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM domains WHERE name = $1 AND ($2 = '' OR project_id::text = $2)`,
+		name, projectID).Scan(&n); err != nil {
+		return err
+	}
+	switch {
+	case n == 0:
 		return ErrNotFound
+	case n > 1:
+		return ErrConflict
+	}
+	_, err := s.Pool.Exec(ctx, `UPDATE domains SET status = 'verified', verified_at = now(), claim_expires_at = NULL
+		WHERE name = $1 AND ($2 = '' OR project_id::text = $2)`, name, projectID)
+	if isUniqueViolation(err) {
+		return ErrConflict
 	}
 	return err
 }
@@ -405,7 +432,7 @@ func (s *Store) insertEmails(ctx context.Context, es []NewEmail, caps *SendCaps)
 	counted := 0
 	for i, e := range es {
 		if e.IdempotencyKey != "" {
-			id, err := findIdempotent(ctx, tx, e.ProjectID, e.IdempotencyKey, e.RequestHash)
+			id, err := findIdempotent(ctx, tx, e.ProjectID, e.APIKeyID, e.IdempotencyKey, e.RequestHash)
 			if err == nil {
 				out[i] = Inserted{ID: id, Replayed: true}
 				continue
@@ -482,7 +509,7 @@ func insertEmail(ctx context.Context, tx pgx.Tx, e NewEmail, suppressed map[stri
 			subject, message_id, return_path, idempotency_key, request_hash, raw, tags, retry_uncertain, expires_at,
 			api_key_id, scheduled_at, quota_rcpts)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-		ON CONFLICT (project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+		ON CONFLICT (api_key_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
 		e.ID, e.ProjectID, nullString(e.DomainID), e.From, nonNil(e.To), nonNil(e.Cc), nonNil(e.Bcc),
 		e.Subject, e.MessageID, e.ReturnPath, nullString(e.IdempotencyKey), e.RequestHash, e.Raw, tags,
 		e.RetryUncertain, e.ExpiresAt, nullString(e.APIKeyID), e.ScheduledAt, quota)
@@ -522,18 +549,20 @@ func insertEmail(ctx context.Context, tx pgx.Tx, e NewEmail, suppressed map[stri
 	return nil
 }
 
-// FindIdempotent returns the email stored with this idempotency key:
-// ErrNotFound when there is none, ErrConflict when it was stored for a
-// different request body.
-func (s *Store) FindIdempotent(ctx context.Context, projectID, key string, hash []byte) (string, error) {
-	return findIdempotent(ctx, s.Pool, projectID, key, hash)
+// FindIdempotent returns the email the API key stored with this
+// idempotency key: ErrNotFound when there is none, ErrConflict when it was
+// stored for a different request body. Keys are scoped to the API key, so
+// one key never sees, replays or blocks another key's requests.
+func (s *Store) FindIdempotent(ctx context.Context, projectID, apiKeyID, key string, hash []byte) (string, error) {
+	return findIdempotent(ctx, s.Pool, projectID, apiKeyID, key, hash)
 }
 
-func findIdempotent(ctx context.Context, q querier, projectID, key string, hash []byte) (string, error) {
+func findIdempotent(ctx context.Context, q querier, projectID, apiKeyID, key string, hash []byte) (string, error) {
 	var id string
 	var h []byte
-	err := q.QueryRow(ctx, `SELECT id::text, request_hash FROM emails WHERE project_id = $1 AND idempotency_key = $2`,
-		projectID, key).Scan(&id, &h)
+	err := q.QueryRow(ctx, `SELECT id::text, request_hash FROM emails
+		WHERE api_key_id = $2 AND idempotency_key = $3 AND project_id = $1`,
+		projectID, nullString(apiKeyID), key).Scan(&id, &h)
 	if err != nil {
 		return "", noRows(err)
 	}

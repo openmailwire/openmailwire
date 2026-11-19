@@ -40,6 +40,8 @@ type Control struct {
 	FBLAddress       string        // where feedback loops (ARF complaints) are sent
 	InboundRetention time.Duration // inbound message bodies are purged this long after arrival
 	InboundMaxSize   int64         // largest inbound message, in bytes
+
+	APILimits // rate limits, large bodies, trusted proxies (api.go)
 }
 
 // DatabaseURL returns DATABASE_URL or an error when it is unset.
@@ -53,7 +55,7 @@ func DatabaseURL() (string, error) {
 
 func LoadControl() (Control, error) {
 	c := Control{
-		Listen:          env("OMW_LISTEN", ":8080"),
+		Listen:          env("OMW_LISTEN", "127.0.0.1:8080"),
 		ReturnPathLabel: env("OMW_RETURN_PATH_LABEL", "bounce"),
 		SPFInclude:      os.Getenv("OMW_SPF_INCLUDE"),
 		BounceMX:        os.Getenv("OMW_BOUNCE_MX"),
@@ -100,6 +102,9 @@ func LoadControl() (Control, error) {
 		return c, err
 	}
 	if c.InboundMaxSize, err = envSize("OMW_INBOUND_MAX_SIZE", DefaultInboundMaxSize); err != nil {
+		return c, err
+	}
+	if c.APILimits, err = loadAPILimits(); err != nil {
 		return c, err
 	}
 	return c, nil
