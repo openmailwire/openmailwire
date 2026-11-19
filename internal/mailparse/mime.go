@@ -16,6 +16,7 @@ import (
 	"net/mail"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/charmap"
@@ -248,15 +249,26 @@ func parseAddresses(v string) []*mail.Address {
 
 // FormatAddress renders an address for display and for reuse in the send
 // API: "Name <addr>", with the name quoted when it needs to be.
+//
+// Both parts come from the sender, so characters that could make the text
+// look like more than one address are removed: line breaks (CR, LF, U+2028,
+// U+2029) and other control characters become spaces, and bidirectional
+// controls, which can reorder what a reader (or a model) sees, are dropped.
 func FormatAddress(a *mail.Address) string {
-	name := strings.TrimSpace(a.Name)
+	name := CleanDisplay(a.Name)
+	addr := strings.Map(func(r rune) rune {
+		if r <= ' ' || r == 0x7f || unicode.IsControl(r) || isBidiControl(r) || r == '\u2028' || r == '\u2029' {
+			return -1
+		}
+		return r
+	}, a.Address)
 	if name == "" {
-		return a.Address
+		return addr
 	}
 	if strings.ContainsAny(name, "\"()<>[]:;@\\,.") {
 		name = `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(name) + `"`
 	}
-	return name + " <" + a.Address + ">"
+	return name + " <" + addr + ">"
 }
 
 // formatAddresses formats an address list.
@@ -323,7 +335,7 @@ func walkPart(h header, body []byte, depth int, count *int, visit func(part)) {
 		mt = "text/plain"
 	}
 	if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" && depth < maxDepth {
-		for _, sub := range splitMultipart(body, params["boundary"]) {
+		for _, sub := range splitMultipart(body, params["boundary"], maxParts-*count) {
 			sh, sb := splitMessage(sub)
 			walkPart(parseHeader(sh), sb, depth+1, count, visit)
 		}
@@ -336,13 +348,16 @@ func walkPart(h header, body []byte, depth int, count *int, visit func(part)) {
 	})
 }
 
-// splitMultipart returns the body parts between boundary delimiters. A
-// missing closing delimiter ends the last part at the end of the body.
-func splitMultipart(body []byte, boundary string) [][]byte {
-	delim := "--" + boundary
+// splitMultipart returns at most limit body parts between boundary
+// delimiters. A missing closing delimiter ends the last part at the end of
+// the body. Lines are compared as bytes and nothing past the limit is
+// collected, so a body made only of delimiters costs no more than a short
+// one (it used to allocate 30 times its size).
+func splitMultipart(body []byte, boundary string, limit int) [][]byte {
+	delim := []byte("--" + boundary)
 	var parts [][]byte
 	start := -1
-	for off := 0; off < len(body); {
+	for off := 0; off < len(body) && len(parts) < limit; {
 		end := bytes.IndexByte(body[off:], '\n')
 		next := len(body)
 		line := body[off:]
@@ -350,8 +365,7 @@ func splitMultipart(body []byte, boundary string) [][]byte {
 			line = body[off : off+end]
 			next = off + end + 1
 		}
-		t := strings.TrimRight(string(line), " \t\r")
-		if t == delim || t == delim+"--" {
+		if rest, ok := bytes.CutPrefix(bytes.TrimRight(line, " \t\r"), delim); ok && (len(rest) == 0 || string(rest) == "--") {
 			if start >= 0 {
 				stop := off
 				if stop >= 2 && body[stop-2] == '\r' && body[stop-1] == '\n' {
@@ -364,17 +378,40 @@ func splitMultipart(body []byte, boundary string) [][]byte {
 				}
 				parts = append(parts, body[start:stop])
 			}
-			if t == delim+"--" {
+			if len(rest) > 0 {
 				return parts
 			}
 			start = next
 		}
 		off = next
 	}
-	if start >= 0 && start < len(body) {
+	if start >= 0 && start < len(body) && len(parts) < limit {
 		parts = append(parts, body[start:])
 	}
 	return parts
 }
 
 func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// CleanDisplay makes sender-written text (a display name, a subject) safe
+// to show on one line: control characters and line or paragraph separators
+// become spaces, bidirectional controls are dropped, and runs of white
+// space collapse to one space.
+func CleanDisplay(s string) string {
+	return collapseSpace(strings.Map(func(r rune) rune {
+		switch {
+		case isBidiControl(r) || r == '\ufeff':
+			return -1
+		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029':
+			return ' '
+		}
+		return r
+	}, s))
+}
+
+// isBidiControl reports whether r is a Unicode bidirectional formatting
+// character: the embeddings, overrides and isolates (U+202A–U+202E,
+// U+2066–U+2069) and the implicit marks (U+200E, U+200F, U+061C).
+func isBidiControl(r rune) bool {
+	return r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069' || r == '\u200e' || r == '\u200f' || r == '\u061c'
+}
