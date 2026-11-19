@@ -4069,9 +4069,12 @@
               "SPF",
               "MX",
               "DMARC",
-              "INBOUND"
+              "INBOUND",
+              "DKIM_NEXT",
+              "DKIM_PREVIOUS",
+              "DKIM_ED25519"
             ],
-            "description": "What the record is for. `MX` receives bounces for the return-path domain. `INBOUND` (an MX on the domain itself) is shown only when the server receives mail for inboxes, and is not required for sending."
+            "description": "What the record is for. `MX` receives bounces for the return-path domain. `INBOUND` (an MX on the domain itself) is shown only when the server receives mail for inboxes, and is not required for sending. `DKIM_NEXT` is a new key waiting for its record during a rotation, `DKIM_PREVIOUS` the key before it, kept published until its overlap ends, and `DKIM_ED25519` the optional Ed25519 key; see `GET /domains/{id}/dkim`."
           },
           "type": {
             "type": "string",
