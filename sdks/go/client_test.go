@@ -533,6 +533,43 @@ func TestNonJSONError(t *testing.T) {
 	eq(t, *apiErr, Error{StatusCode: 502, Name: "http_error", Message: "Bad Gateway"})
 }
 
+// R4#10 (the Python SDK forwarded Authorization on redirects): the Go SDK
+// refuses every redirect, also with a caller's own http.Client.
+func TestRedirectsAreRefused(t *testing.T) {
+	var otherHits int
+	var otherAuth string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits++
+		otherAuth = r.Header.Get("Authorization")
+		w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer other.Close()
+	c, m := serve(t, func(recorded) *reply {
+		return &reply{status: 307, headers: map[string]string{"Location": other.URL + "/domains"}, body: ""}
+	})
+	_, err := c.Domains.List(ctx)
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 307 || apiErr.Name != "redirect_refused" ||
+		!strings.Contains(apiErr.Message, other.URL) {
+		t.Fatalf("want redirect_refused, got %v", err)
+	}
+	if otherHits != 0 || m.last().Header.Get("Authorization") != "Bearer "+testKey {
+		t.Fatalf("the redirect was followed (%d requests, Authorization %q)", otherHits, otherAuth)
+	}
+
+	own := &http.Client{Timeout: 5 * time.Second}
+	c2, err := New(Config{APIKey: testKey, BaseURL: c.BaseURL, HTTPClient: own})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Domains.List(ctx); !errors.As(err, &apiErr) || apiErr.Name != "redirect_refused" || otherHits != 0 {
+		t.Fatalf("a caller's client followed the redirect: %v", err)
+	}
+	if own.CheckRedirect != nil {
+		t.Fatal("the caller's client was changed")
+	}
+}
+
 func TestConnectionError(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	url := srv.URL

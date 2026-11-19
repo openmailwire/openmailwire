@@ -94,3 +94,31 @@ test("refuses missing headers, a bad timestamp and a bad secret", async () => {
   await rejects(verifyWebhook(SECRET, { ...svixHeaders(), "svix-timestamp": "soon" }, BODY), /timestamp/);
   await rejects(verifyWebhook("whsec_***", svixHeaders(), BODY), /signing secret/);
 });
+
+// Ed25519 ("v1a"). The request vector is pinned on the server side by
+// internal/webhook TestSDKVector (seed 00 01 … 1f); every SDK checks it.
+const V1A = {
+  publicKey: "whpk_A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  id: "msg_2Lh9KQHvQbLvjGF3s3hQqZ1u",
+  ts: "1700000000",
+  body: '{"type":"email.delivered","data":{"email_id":"e1"}}',
+  sig: "v1a,De0zbXw3fa+WDUWMYmuFVJsBTTtbEkQJi1dS49Vm48H2mguOCtQ8embnNXP20I+H5cLV4SkJSc/+h7BGhrm2Dw==",
+};
+const v1aHeaders = (sig = V1A.sig) => ({ "webhook-id": V1A.id, "webhook-timestamp": V1A.ts, "webhook-signature": sig });
+
+test("verifies v1a (Ed25519) signatures with a whpk_ public key", async () => {
+  const event = await verifyWebhook(V1A.publicKey, v1aHeaders(), V1A.body, FOREVER);
+  assert.equal(event.data.email_id, "e1");
+  // Next to v1 signatures and during a rotation (two v1a signatures).
+  const other = "v1a," + Buffer.alloc(64).toString("base64");
+  assert.equal((await verifyWebhook(V1A.publicKey, v1aHeaders(`v1,AAAA ${other} ${V1A.sig}`), V1A.body, FOREVER)).type, "email.delivered");
+});
+
+test("refuses bad v1a signatures, keys and mixed-up schemes", async () => {
+  await rejects(verifyWebhook(V1A.publicKey, v1aHeaders(), V1A.body.replace("e1", "e2"), FOREVER), /no webhook signature matches/);
+  // A v1a signature never satisfies an HMAC secret, nor the reverse.
+  await rejects(verifyWebhook(SECRET, v1aHeaders(), V1A.body, FOREVER), /no webhook signature matches/);
+  await rejects(verifyWebhook(V1A.publicKey, v1aHeaders(V1A.sig.replace("v1a,", "v1,")), V1A.body, FOREVER), /no webhook signature matches/);
+  await rejects(verifyWebhook("whpk_AAAA", v1aHeaders(), V1A.body, FOREVER), /public key/);
+  await rejects(verifyWebhook(V1A.publicKey, v1aHeaders(), V1A.body), /too old/);
+});

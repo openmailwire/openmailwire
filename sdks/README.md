@@ -8,7 +8,8 @@ Client libraries for the OpenMailWire HTTP API, in four languages. Each one cove
 - **API keys:** create, list, get, update, delete;
 - **inboxes and messages:** create, list and delete inboxes; list, read and reply to received messages; download attachments;
 - **waiting:** wait until every recipient has a final status; wait for a reply to a sent email;
-- **webhook verification** for both the Svix (`svix-*`) and Standard Webhooks (`webhook-*`) headers, with several signatures, a constant-time comparison and a timestamp tolerance.
+- **webhook verification** for both the Svix (`svix-*`) and Standard Webhooks (`webhook-*`) headers, with several signatures (so secret rotations need no code change), a constant-time comparison and a timestamp tolerance. Pass the `whsec_…` secret for HMAC (`v1`) signatures, or the webhook's `whpk_…` public key for Ed25519 (`v1a`) signatures.
+- **no redirects:** a 3xx answer is an error named `redirect_refused`, so the API key is never sent to another address.
 
 | Language | Directory | Install | Needs |
 |---|---|---|---|

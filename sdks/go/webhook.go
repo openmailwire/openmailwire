@@ -1,6 +1,7 @@
 package openmailwire
 
 import (
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -20,7 +21,7 @@ const DefaultWebhookTolerance = 5 * time.Minute
 var (
 	ErrWebhookHeaders   = errors.New("openmailwire: missing webhook headers: expected svix-id, svix-timestamp and svix-signature, or webhook-id, webhook-timestamp and webhook-signature")
 	ErrWebhookTimestamp = errors.New("openmailwire: webhook timestamp is invalid or outside the tolerance")
-	ErrWebhookSecret    = errors.New("openmailwire: the signing secret is not a valid whsec_… value")
+	ErrWebhookSecret    = errors.New("openmailwire: the signing secret is not a valid whsec_… value or whpk_… public key")
 	ErrWebhookSignature = errors.New("openmailwire: no webhook signature matches")
 )
 
@@ -66,13 +67,19 @@ func headerValue(h http.Header, name string) string {
 	return ""
 }
 
-// VerifyWebhook checks that a webhook request was signed by OpenMailWire with
-// secret ("whsec_…") and is fresh.
+// VerifyWebhook checks that a webhook request was signed by OpenMailWire and
+// is fresh.
+//
+// secret is either the webhook's signing secret ("whsec_…"), checked against
+// the "v1" (HMAC-SHA256) signatures, or its Ed25519 public key ("whpk_…",
+// from Webhooks.Get), checked against the "v1a" signatures of webhooks
+// created with asymmetric signing.
 //
 //   - It accepts both header families: svix-id/svix-timestamp/svix-signature
 //     and webhook-id/webhook-timestamp/webhook-signature.
-//   - It accepts any of several space-separated "v1,<base64>" signatures.
-//   - It compares signatures in constant time.
+//   - It accepts any of several space-separated signatures, so it keeps
+//     working while a secret is rotated.
+//   - It compares HMAC signatures in constant time.
 //   - It refuses timestamps more than tolerance from now; 0 means
 //     DefaultWebhookTolerance.
 //
@@ -88,32 +95,53 @@ func VerifyWebhook(secret string, header http.Header, body []byte, tolerance tim
 	if id == "" || ts == "" || sigs == "" {
 		return ErrWebhookHeaders
 	}
+	// At most 15 digits, as the other SDKs: a far-future value such as
+	// 9223372036854775807 would overflow time arithmetic below.
 	unix, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil || unix < 0 || strings.HasPrefix(ts, "+") {
+	if err != nil || unix < 0 || len(ts) > 15 || strings.HasPrefix(ts, "+") {
 		return fmt.Errorf("%w: %q is not a unix time", ErrWebhookTimestamp, ts)
 	}
-	age := time.Since(time.Unix(unix, 0))
-	if age > tolerance {
+	now := time.Now().Unix()
+	tol := int64(tolerance / time.Second)
+	if now-unix > tol {
 		return fmt.Errorf("%w: too old", ErrWebhookTimestamp)
 	}
-	if -age > tolerance {
+	if unix-now > tol {
 		return fmt.Errorf("%w: in the future", ErrWebhookTimestamp)
 	}
 
-	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
-	if err != nil || len(key) == 0 {
-		return ErrWebhookSecret
-	}
-	m := hmac.New(sha256.New, key)
-	m.Write([]byte(id + "." + ts + "."))
-	m.Write(body)
-	expected := []byte(base64.StdEncoding.EncodeToString(m.Sum(nil)))
-
+	signed := make([]byte, 0, len(id)+len(ts)+2+len(body))
+	signed = append(append(append(signed, id+"."...), ts+"."...), body...)
 	ok := false
-	for _, part := range strings.Split(sigs, " ") {
-		version, sig, found := strings.Cut(part, ",")
-		if found && version == "v1" && hmac.Equal([]byte(sig), expected) {
-			ok = true
+	if pk, isPublic := strings.CutPrefix(secret, "whpk_"); isPublic {
+		pub, err := base64.StdEncoding.DecodeString(pk)
+		if err != nil || len(pub) != ed25519.PublicKeySize {
+			return ErrWebhookSecret
+		}
+		for _, part := range strings.Split(sigs, " ") {
+			version, sig, found := strings.Cut(part, ",")
+			if !found || version != "v1a" {
+				continue
+			}
+			raw, err := base64.StdEncoding.DecodeString(sig)
+			if err == nil && len(raw) == ed25519.SignatureSize && ed25519.Verify(pub, signed, raw) {
+				ok = true
+				break
+			}
+		}
+	} else {
+		key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
+		if err != nil || len(key) == 0 {
+			return ErrWebhookSecret
+		}
+		m := hmac.New(sha256.New, key)
+		m.Write(signed)
+		expected := []byte(base64.StdEncoding.EncodeToString(m.Sum(nil)))
+		for _, part := range strings.Split(sigs, " ") {
+			version, sig, found := strings.Cut(part, ",")
+			if found && version == "v1" && hmac.Equal([]byte(sig), expected) {
+				ok = true
+			}
 		}
 	}
 	if !ok {

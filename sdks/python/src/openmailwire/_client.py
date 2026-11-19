@@ -103,6 +103,14 @@ def _to_error(status: int, headers: Any, raw: bytes) -> OpenMailWireError:
     return OpenMailWireError(status, "http_error", text[:500] or f"HTTP {status}", retry_after)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses redirects: the request then fails with the 3xx answer, so the
+    API key is never sent to another address."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
 class _Resource:
     def __init__(self, client: "OpenMailWire") -> None:
         self._client = client
@@ -279,7 +287,7 @@ class OpenMailWire:
         self._api_key = key
         self.base_url = (base_url or os.environ.get("OMW_API_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
-        self._opener = opener or urllib.request.build_opener()
+        self._opener = opener or urllib.request.build_opener(_NoRedirect)
 
         self.emails = Emails(self)
         self.domains = Domains(self)
@@ -307,7 +315,6 @@ class OpenMailWire:
             if q:
                 url += "?" + urllib.parse.urlencode(q)
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
             "Accept": "*/*" if binary else "application/json",
             "User-Agent": USER_AGENT,
         }
@@ -319,6 +326,8 @@ class OpenMailWire:
             headers["Idempotency-Key"] = idempotency_key
 
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # Never forwarded on a redirect, even by an opener that follows them.
+        req.add_unredirected_header("Authorization", f"Bearer {self._api_key}")
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 status = resp.status
@@ -330,6 +339,15 @@ class OpenMailWire:
                 err_body = b""
             finally:
                 e.close()
+            if 300 <= e.code < 400:
+                location = e.headers.get("Location", "") if e.headers is not None else ""
+                raise OpenMailWireError(
+                    e.code,
+                    "redirect_refused",
+                    f"{method} {self.base_url}{path} answered {e.code}, a redirect to {location or 'another address'}. "
+                    "Redirects are not followed, so the API key never goes elsewhere: "
+                    "set base_url to the address the API answers at.",
+                ) from None
             raise _to_error(e.code, e.headers, err_body) from None
         except (urllib.error.URLError, OSError) as e:
             reason = getattr(e, "reason", None) or e

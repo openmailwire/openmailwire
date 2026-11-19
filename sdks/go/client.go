@@ -43,7 +43,9 @@ type Config struct {
 	// BaseURL defaults to the OMW_API_URL environment variable, then
 	// DefaultBaseURL.
 	BaseURL string
-	// HTTPClient defaults to a client with a 30 s timeout.
+	// HTTPClient defaults to a client with a 30 s timeout. Whichever client
+	// is used, redirects are not followed, so the API key never goes to
+	// another address: a redirect answers an *Error named "redirect_refused".
 	HTTPClient *http.Client
 	// PollInterval is how often WaitForDelivery and WaitForReply ask the
 	// server. Default 1 s.
@@ -93,6 +95,10 @@ func New(cfg Config) (*Client, error) {
 	if c.http == nil {
 		c.http = &http.Client{Timeout: 30 * time.Second}
 	}
+	// A copy, so the caller's client is left as it was.
+	hc := *c.http
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	c.http = &hc
 	if c.pollInterval <= 0 {
 		c.pollInterval = time.Second
 	}
@@ -160,6 +166,16 @@ func parseRetryAfter(v string) time.Duration {
 
 func apiError(resp *http.Response, data []byte) error {
 	e := &Error{StatusCode: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		to := resp.Header.Get("Location")
+		if to == "" {
+			to = "another address"
+		}
+		e.Name = "redirect_refused"
+		e.Message = fmt.Sprintf("%s %s answered %d, a redirect to %s. Redirects are not followed, so the API key never goes "+
+			"elsewhere: set BaseURL to the address the API answers at", resp.Request.Method, resp.Request.URL.Redacted(), resp.StatusCode, to)
+		return e
+	}
 	var body struct {
 		Name    string `json:"name"`
 		Message string `json:"message"`

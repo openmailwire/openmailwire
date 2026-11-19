@@ -117,4 +117,46 @@ final class WebhookTest extends TestCase
         $this->assertRefused('/timestamp/', self::secret(), ['svix-timestamp' => 'soon'] + self::svixHeaders(), self::BODY);
         $this->assertRefused('/signing secret/', 'whsec_***', self::svixHeaders(), self::BODY);
     }
+
+    // Ed25519 ("v1a"). The request vector is pinned on the server side by
+    // internal/webhook TestSDKVector (seed 00 01 … 1f); every SDK checks it.
+    private const V1A_PUBLIC_KEY = 'whpk_A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=';
+    private const V1A_ID = 'msg_2Lh9KQHvQbLvjGF3s3hQqZ1u';
+    private const V1A_TS = '1700000000';
+    private const V1A_BODY = '{"type":"email.delivered","data":{"email_id":"e1"}}';
+    private const V1A_SIG = 'v1a,De0zbXw3fa+WDUWMYmuFVJsBTTtbEkQJi1dS49Vm48H2mguOCtQ8embnNXP20I+H5cLV4SkJSc/+h7BGhrm2Dw==';
+
+    /** @return array<string, string> */
+    private static function v1aHeaders(string $sig = self::V1A_SIG): array
+    {
+        return ['webhook-id' => self::V1A_ID, 'webhook-timestamp' => self::V1A_TS, 'webhook-signature' => $sig];
+    }
+
+    public function testV1aPublicKey(): void
+    {
+        if (!function_exists('sodium_crypto_sign_verify_detached')) {
+            $this->markTestSkipped('the sodium extension is not loaded');
+        }
+        $event = Webhook::verify(self::V1A_PUBLIC_KEY, self::v1aHeaders(), self::V1A_BODY, self::FOREVER);
+        $this->assertSame('e1', $event['data']['email_id']);
+        // Next to v1 signatures and during a rotation (two v1a signatures).
+        $other = 'v1a,' . base64_encode(str_repeat("\0", 64));
+        $mixed = self::v1aHeaders('v1,AAAA ' . $other . ' ' . self::V1A_SIG);
+        $this->assertSame('e1', Webhook::verify(self::V1A_PUBLIC_KEY, $mixed, self::V1A_BODY, self::FOREVER)['data']['email_id']);
+    }
+
+    public function testV1aRefusals(): void
+    {
+        if (!function_exists('sodium_crypto_sign_verify_detached')) {
+            $this->markTestSkipped('the sodium extension is not loaded');
+        }
+        $changed = str_replace('e1', 'e2', self::V1A_BODY);
+        $this->assertRefused('/no webhook signature matches/', self::V1A_PUBLIC_KEY, self::v1aHeaders(), $changed, self::FOREVER);
+        // A v1a signature never satisfies an HMAC secret, nor the reverse.
+        $this->assertRefused('/no webhook signature matches/', self::secret(), self::v1aHeaders(), self::V1A_BODY, self::FOREVER);
+        $relabelled = self::v1aHeaders('v1,' . substr(self::V1A_SIG, 4));
+        $this->assertRefused('/no webhook signature matches/', self::V1A_PUBLIC_KEY, $relabelled, self::V1A_BODY, self::FOREVER);
+        $this->assertRefused('/public key/', 'whpk_AAAA', self::v1aHeaders(), self::V1A_BODY, self::FOREVER);
+        $this->assertRefused('/too old/', self::V1A_PUBLIC_KEY, self::v1aHeaders(), self::V1A_BODY);
+    }
 }

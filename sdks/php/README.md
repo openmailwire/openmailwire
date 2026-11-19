@@ -160,7 +160,7 @@ Network failures and timeouts throw it too, with `statusCode` 0 and `name` `conn
 
 ## Verifying webhooks
 
-`Webhook::verify($secret, $headers, $rawBody, $tolerance = 300)`, or the shorthand function `OpenMailWire\verifyWebhook()`, checks the signature and the timestamp and returns the decoded event. It throws `WebhookVerificationException` if any check fails.
+`Webhook::verify($secret, $headers, $rawBody, $tolerance = 300)`, or the shorthand function `OpenMailWire\verifyWebhook()`, checks the signature and the timestamp and returns the decoded event. It throws `WebhookVerificationException` if any check fails. `$secret` is the webhook's `whsec_…` signing secret, or, for a webhook created with `asymmetric_signing`, its `whpk_…` public key (Ed25519 `v1a` signatures; needs the sodium extension, bundled with PHP). During a secret rotation requests carry both signatures, so either secret verifies.
 
 - Accepts both header families: `svix-*` (as Resend sends them) and `webhook-*` ([Standard Webhooks](https://www.standardwebhooks.com)), in any case.
 - `$headers` may be `getallheaders()`, a PSR-7 `getHeaders()` array, Symfony's `$request->headers->all()` or `$_SERVER`.

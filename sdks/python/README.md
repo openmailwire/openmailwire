@@ -168,7 +168,7 @@ Network failures and timeouts raise `OpenMailWireError` too, with `status_code =
 
 ## Verifying webhooks
 
-`verify_webhook(secret, headers, raw_body, tolerance=300)` checks the signature and the timestamp, and returns the parsed event. It raises `WebhookVerificationError` if any check fails.
+`verify_webhook(secret, headers, raw_body, tolerance=300)` checks the signature and the timestamp, and returns the parsed event. It raises `WebhookVerificationError` if any check fails. `secret` is the webhook's `whsec_…` signing secret, or, for a webhook created with `asymmetric_signing`, its `whpk_…` public key (Ed25519 `v1a` signatures, verified in pure Python). During a secret rotation requests carry both signatures, so either secret verifies.
 
 - Accepts both header families: `svix-*` (as Resend sends them) and `webhook-*` ([Standard Webhooks](https://www.standardwebhooks.com)), in any case.
 - Accepts any one of several space-separated `v1,` signatures.

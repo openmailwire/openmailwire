@@ -104,7 +104,7 @@ final class Client
         $options = [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_FOLLOWLOCATION => false, // never send the key to a redirect target
             CURLOPT_TIMEOUT_MS => (int) ($this->timeout * 1000),
             CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$responseHeaders): int {
                 if (str_starts_with($line, 'HTTP/')) {
@@ -138,6 +138,17 @@ final class Client
         }
         $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
 
+        if ($status >= 300 && $status < 400) {
+            // Redirects are never followed (CURLOPT_FOLLOWLOCATION is off), so
+            // the API key never goes to another address.
+            $location = $responseHeaders['location'] ?? 'another address';
+            throw new OpenMailWireException(
+                $status,
+                'redirect_refused',
+                "$method {$this->baseUrl}$path answered $status, a redirect to $location. Redirects are not followed, "
+                . 'so the API key never goes elsewhere: set the base URL to the address the API answers at.',
+            );
+        }
         if ($status < 200 || $status > 299) {
             throw self::toException($status, $responseHeaders, $raw);
         }

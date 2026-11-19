@@ -19,6 +19,9 @@
         "ext-curl": "*",
         "ext-json": "*"
     },
+    "suggest": {
+        "ext-sodium": "Verifies Ed25519 (v1a) webhook signatures with a whpk_ public key"
+    },
     "require-dev": {
         "phpunit/phpunit": "^10.5 || ^11.0"
     },

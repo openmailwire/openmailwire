@@ -295,6 +295,25 @@ test("a non-JSON error body still gives a typed error", async () => {
   });
 });
 
+test("redirects are refused, so the API key never goes elsewhere", async () => {
+  // R4#10: the Python SDK forwarded Authorization on redirects; check this one.
+  const other = await startMock(() => ({ body: { object: "list", data: [] } }));
+  try {
+    const omw = await client(() => ({ status: 307, body: "", headers: { location: other.url + "/domains" } }));
+    await assert.rejects(omw.domains.list(), (err) => {
+      assert.ok(err instanceof OpenMailWireError);
+      assert.equal(err.statusCode, 307);
+      assert.equal(err.name, "redirect_refused");
+      assert.match(err.message, new RegExp(other.url.replace(/[.]/g, "\\.")));
+      return true;
+    });
+    assert.equal(other.requests.length, 0);
+    assert.equal(mock.requests[0].headers.authorization, `Bearer ${KEY}`);
+  } finally {
+    await other.close();
+  }
+});
+
 test("an unreachable server gives connection_error", async () => {
   mock = await startMock(() => ({ body: {} }));
   const url = mock.url;
