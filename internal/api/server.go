@@ -65,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	var root http.Handler
 	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))
 	s.inboxRoutes(mux, func() http.Handler { return root })
+	s.platformRoutes(mux) // lane E: webhook secret rotation, insights (platform.go)
 	mux.Handle("GET "+dashboard.Prefix, dashboard.Handler())
 	mux.Handle("GET "+dashboard.Prefix+"/", dashboard.Handler())
 

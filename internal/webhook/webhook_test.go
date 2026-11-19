@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -104,7 +105,7 @@ func TestEndpointRules(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
-	if _, err := NewHTTPClient(false).Get(srv.URL); err == nil || !strings.Contains(err.Error(), "private or local") {
+	if _, err := NewHTTPClient(false).Get(srv.URL); !errors.Is(err, errBlocked) {
 		t.Fatalf("loopback endpoint was not blocked: %v", err)
 	}
 	if _, err := NewHTTPClient(true).Get(srv.URL); err != nil {

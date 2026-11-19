@@ -2,6 +2,7 @@
 package secret
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -13,36 +14,191 @@ import (
 	"fmt"
 )
 
-// Sealer encrypts with AES-256-GCM. Sealed values are nonce||ciphertext.
-type Sealer struct{ aead cipher.AEAD }
+// Sealed values come in two formats:
+//
+//   - v1 (since v0.6): "omw\x01" || key id (4 bytes) || nonce (12) || ciphertext.
+//     The first 8 bytes are authenticated as additional data, so a value
+//     cannot be relabelled with another key id.
+//   - legacy (v0.5 and earlier): nonce (12) || ciphertext, under the one key
+//     there was.
+//
+// Open reads both, so values sealed before an upgrade stay readable;
+// `openmailwire rotate-secrets` rewrites them in the v1 format.
+var magic = []byte{'o', 'm', 'w', 1}
 
-func NewSealer(key []byte) (*Sealer, error) {
-	if len(key) != 32 {
-		return nil, errors.New("secret: key must be 32 bytes")
+const (
+	headerLen = 8 // magic + key id
+	idLen     = 4
+)
+
+type sealKey struct {
+	id   [idLen]byte
+	aead cipher.AEAD
+}
+
+// Sealer encrypts with AES-256-GCM under a keyring. The first key seals new
+// values; every key opens.
+type Sealer struct{ keys []sealKey }
+
+// NewSealer returns a Sealer with a single key.
+func NewSealer(key []byte) (*Sealer, error) { return NewKeyring([][]byte{key}) }
+
+// NewKeyring returns a Sealer that seals with keys[0] and opens values
+// sealed with any of keys.
+func NewKeyring(keys [][]byte) (*Sealer, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("secret: no key")
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
+	s := &Sealer{}
+	seen := map[[idLen]byte]bool{}
+	for _, key := range keys {
+		if len(key) != 32 {
+			return nil, errors.New("secret: key must be 32 bytes")
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		aead, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, err
+		}
+		var id [idLen]byte
+		copy(id[:], keyID(key))
+		if seen[id] {
+			return nil, fmt.Errorf("secret: key %x is listed twice", id)
+		}
+		seen[id] = true
+		s.keys = append(s.keys, sealKey{id: id, aead: aead})
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
+	return s, nil
+}
+
+func keyID(key []byte) []byte { return Derive(key, "openmailwire/key-id")[:idLen] }
+
+// KeyID returns the short public id of a key, as stored in sealed values
+// and shown in logs: 8 hex characters.
+func KeyID(key []byte) string { return hex.EncodeToString(keyID(key)) }
+
+// KeyCheck returns a value that proves a key without revealing it. The
+// control plane stores it and compares it at start.
+func KeyCheck(key []byte) []byte { return Derive(key, "openmailwire/key-check") }
+
+// PrimaryID is the id of the key that seals new values.
+func (s *Sealer) PrimaryID() string { return hex.EncodeToString(s.keys[0].id[:]) }
+
+// IDs lists the ids of every key, the sealing key first.
+func (s *Sealer) IDs() []string {
+	out := make([]string, len(s.keys))
+	for i, k := range s.keys {
+		out[i] = hex.EncodeToString(k.id[:])
 	}
-	return &Sealer{aead: aead}, nil
+	return out
+}
+
+// PrimaryHeader is the prefix every value sealed by this Sealer starts
+// with. Values without it need resealing after a rotation.
+func (s *Sealer) PrimaryHeader() []byte {
+	return append(append([]byte{}, magic...), s.keys[0].id[:]...)
 }
 
 func (s *Sealer) Seal(plain []byte) []byte {
-	nonce := make([]byte, s.aead.NonceSize())
+	k := s.keys[0]
+	out := make([]byte, headerLen+k.aead.NonceSize(), headerLen+k.aead.NonceSize()+len(plain)+k.aead.Overhead())
+	copy(out, magic)
+	copy(out[len(magic):], k.id[:])
+	nonce := out[headerLen:]
 	rand.Read(nonce)
-	return s.aead.Seal(nonce, nonce, plain, nil)
+	return k.aead.Seal(out, nonce, plain, out[:headerLen])
 }
 
+// Open decrypts a value sealed with any key of the ring, in either format.
 func (s *Sealer) Open(sealed []byte) ([]byte, error) {
-	n := s.aead.NonceSize()
-	if len(sealed) < n {
-		return nil, errors.New("secret: sealed value too short")
+	if id, ok := v1ID(sealed); ok {
+		for _, k := range s.keys {
+			if k.id != id {
+				continue
+			}
+			n := k.aead.NonceSize()
+			if len(sealed) >= headerLen+n {
+				if plain, err := k.aead.Open(nil, sealed[headerLen:headerLen+n], sealed[headerLen+n:], sealed[:headerLen]); err == nil {
+					return plain, nil
+				}
+			}
+		}
+		// A legacy value whose random nonce happens to start with the
+		// magic bytes is still tried below.
+		if plain, err := s.openLegacy(sealed); err == nil {
+			return plain, nil
+		}
+		if !s.has(id) {
+			return nil, fmt.Errorf("secret: value is sealed with key %x, which is not configured; add that key to OMW_SECRET_KEYS", id)
+		}
+		return nil, errors.New("secret: sealed value is corrupt")
 	}
-	return s.aead.Open(nil, sealed[:n], sealed[n:], nil)
+	plain, err := s.openLegacy(sealed)
+	if err != nil {
+		return nil, err
+	}
+	return plain, nil
+}
+
+func (s *Sealer) openLegacy(sealed []byte) ([]byte, error) {
+	for _, k := range s.keys {
+		n := k.aead.NonceSize()
+		if len(sealed) < n {
+			return nil, errors.New("secret: sealed value too short")
+		}
+		if plain, err := k.aead.Open(nil, sealed[:n], sealed[n:], nil); err == nil {
+			return plain, nil
+		}
+	}
+	return nil, errors.New("secret: no configured key opens this value (is OMW_SECRET_KEYS missing the key it was sealed with?)")
+}
+
+func (s *Sealer) has(id [idLen]byte) bool {
+	for _, k := range s.keys {
+		if k.id == id {
+			return true
+		}
+	}
+	return false
+}
+
+func v1ID(sealed []byte) ([idLen]byte, bool) {
+	var id [idLen]byte
+	if len(sealed) < headerLen || !bytes.Equal(sealed[:len(magic)], magic) {
+		return id, false
+	}
+	copy(id[:], sealed[len(magic):headerLen])
+	return id, true
+}
+
+// OpenedBy returns the id of the key that opens sealed, or "" when none
+// does.
+func (s *Sealer) OpenedBy(sealed []byte) string {
+	for _, k := range s.keys {
+		one := &Sealer{keys: []sealKey{k}}
+		if _, err := one.Open(sealed); err == nil {
+			return hex.EncodeToString(k.id[:])
+		}
+	}
+	return ""
+}
+
+// NeedsReseal reports whether sealed is not yet in the v1 format under the
+// sealing key.
+func (s *Sealer) NeedsReseal(sealed []byte) bool {
+	return !bytes.HasPrefix(sealed, s.PrimaryHeader())
+}
+
+// Reseal opens sealed with any key and seals it again with the sealing key.
+func (s *Sealer) Reseal(sealed []byte) ([]byte, error) {
+	plain, err := s.Open(sealed)
+	if err != nil {
+		return nil, err
+	}
+	return s.Seal(plain), nil
 }
 
 // NewKey returns a fresh base64 key for OMW_SECRET_KEY.

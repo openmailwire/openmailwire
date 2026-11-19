@@ -48,6 +48,10 @@
       "description": "Signed HTTP callbacks for delivery and inbox events."
     },
     {
+      "name": "Insights",
+      "description": "How receivers treat your mail, per mailbox provider and sending IP."
+    },
+    {
       "name": "API keys",
       "description": "Keys for apps and agents, with permissions and sending policies."
     },
@@ -1246,7 +1250,7 @@
           "Webhooks"
         ],
         "summary": "Register a webhook",
-        "description": "Registers an https endpoint for some or all event types and returns its signing secret, once. Endpoints must resolve to public addresses (checked when connecting) and redirects are not followed.\n\nNeeds a `full_access` key.",
+        "description": "Registers an https endpoint for some or all event types and returns its signing secret, once. With `asymmetric_signing`, requests are also signed with Ed25519 and the answer carries the `public_key`. Endpoints must resolve to public addresses (checked when connecting) and redirects are not followed. A project has at most 10 webhooks (`OMW_WEBHOOKS_PER_PROJECT`).\n\nNeeds a `full_access` key.",
         "security": [
           {
             "apiKey": [
@@ -1313,6 +1317,26 @@
           },
           "422": {
             "$ref": "#/components/responses/ValidationError"
+          },
+          "409": {
+            "description": "The project already has as many webhooks as it may.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "webhook_limit_reached": {
+                    "summary": "webhook_limit_reached",
+                    "value": {
+                      "statusCode": 409,
+                      "name": "webhook_limit_reached",
+                      "message": "this project already has 10 webhooks, the most allowed (OMW_WEBHOOKS_PER_PROJECT). Delete one with DELETE /webhooks/{id}, or send several event types to one endpoint"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -1383,7 +1407,7 @@
           "Webhooks"
         ],
         "summary": "Get a webhook",
-        "description": "One webhook with its 20 most recent deliveries.\n\nNeeds a `full_access` key.",
+        "description": "One webhook with its 20 most recent deliveries, its Ed25519 `public_key` and its circuit breaker state (`consecutive_failures`, `paused_until`). `last_error` is a generic cause; details stay in the operator's log.\n\nNeeds a `full_access` key.",
         "security": [
           {
             "apiKey": [
@@ -1484,6 +1508,193 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/webhooks/{id}/rotate-secret": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/WebhookId"
+        }
+      ],
+      "post": {
+        "operationId": "rotateWebhookSecret",
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Rotate a webhook's signing secret",
+        "description": "Makes a new signing secret (and Ed25519 key, when the webhook has one) and returns the secret once. Until `previous_secret_expires_at` every request carries signatures by both the new and the previous secret, so the receiver can switch at any moment in between.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateWebhookSecretRequest"
+              },
+              "examples": {
+                "day": {
+                  "summary": "One day of overlap",
+                  "value": {
+                    "overlap_seconds": 86400
+                  }
+                },
+                "now": {
+                  "summary": "After a leak: no overlap",
+                  "value": {
+                    "overlap_seconds": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rotated. Store `signing_secret` now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Webhook"
+                },
+                "examples": {
+                  "rotated": {
+                    "summary": "Rotated",
+                    "value": {
+                      "object": "webhook",
+                      "id": "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f",
+                      "endpoint": "https://hooks.acme.com/openmailwire",
+                      "events": [
+                        "email.delivered",
+                        "email.bounced"
+                      ],
+                      "created_at": "2026-11-18T10:00:00Z",
+                      "signing_secret": "whsec_c2VjcmV0LXJvdGF0ZWQtMjAyNi0xMS0yMA==",
+                      "asymmetric_signing": true,
+                      "public_key": "whpk_A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+                      "previous_public_key": "whpk_1aqvdVYOHHZ8C6DaVx3MjjhubRP9UpThCdg5U3VHYdk=",
+                      "previous_secret_expires_at": "2026-11-21T10:00:00Z",
+                      "secret_rotated_at": "2026-11-20T10:00:00Z",
+                      "consecutive_failures": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/insights": {
+      "get": {
+        "operationId": "getInsights",
+        "tags": [
+          "Insights"
+        ],
+        "summary": "Delivery insights",
+        "description": "Acceptance, deferral and bounce rates and p50/p95 time to acceptance, per mailbox provider and per sending IP, for the last 24 hours, 7 days and 30 days. Computed from the attempts of the project's emails, counted by when each email was sent; at most the newest 100,000 emails of 30 days are read.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Insights.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Insights"
+                },
+                "examples": {
+                  "insights": {
+                    "summary": "One window shown",
+                    "value": {
+                      "object": "insights",
+                      "generated_at": "2026-11-20T10:00:00Z",
+                      "window_basis": "sent_at",
+                      "provider_grouping": "mx_host_suffix",
+                      "emails_considered": 1840,
+                      "truncated": false,
+                      "windows": [
+                        {
+                          "window": "24h",
+                          "total": {
+                            "attempts": 412,
+                            "accepted": 398,
+                            "deferred": 11,
+                            "bounced": 3,
+                            "unknown": 0,
+                            "acceptance_rate": 0.966,
+                            "deferral_rate": 0.027,
+                            "bounce_rate": 0.007,
+                            "time_to_acceptance_p50_seconds": 2.1,
+                            "time_to_acceptance_p95_seconds": 64.8
+                          },
+                          "by_provider": [
+                            {
+                              "provider": "google",
+                              "attempts": 210,
+                              "accepted": 205,
+                              "deferred": 4,
+                              "bounced": 1,
+                              "unknown": 0,
+                              "acceptance_rate": 0.976,
+                              "deferral_rate": 0.019,
+                              "bounce_rate": 0.005,
+                              "time_to_acceptance_p50_seconds": 1.8,
+                              "time_to_acceptance_p95_seconds": 31.0
+                            }
+                          ],
+                          "by_sending_ip": [
+                            {
+                              "sending_ip": "203.0.113.7",
+                              "attempts": 412,
+                              "accepted": 398,
+                              "deferred": 11,
+                              "bounced": 3,
+                              "unknown": 0,
+                              "acceptance_rate": 0.966,
+                              "deferral_rate": 0.027,
+                              "bounce_rate": 0.007,
+                              "time_to_acceptance_p50_seconds": 2.1,
+                              "time_to_acceptance_p95_seconds": 64.8
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
           }
         }
       }
@@ -4069,6 +4280,11 @@
               "$ref": "#/components/schemas/WebhookEventType"
             },
             "description": "Leave out (or pass `[]`) to receive every type."
+          },
+          "asymmetric_signing": {
+            "type": "boolean",
+            "default": false,
+            "description": "Also sign every request with Ed25519 (Standard Webhooks `v1a`). Receivers then verify with `public_key` and hold no secret that could sign."
           }
         },
         "additionalProperties": false
@@ -4163,7 +4379,38 @@
           },
           "signing_secret": {
             "type": "string",
-            "description": "`whsec_…`. Returned once, by `POST /webhooks`. Store it to verify signatures."
+            "description": "`whsec_…`. Returned once, by `POST /webhooks` and `POST /webhooks/{id}/rotate-secret`. Store it to verify signatures."
+          },
+          "asymmetric_signing": {
+            "type": "boolean",
+            "description": "Whether requests are also signed with Ed25519 (`v1a`)."
+          },
+          "public_key": {
+            "type": "string",
+            "description": "`whpk_…`: the Ed25519 public key that verifies `v1a` signatures. Only with `asymmetric_signing`."
+          },
+          "previous_public_key": {
+            "type": "string",
+            "description": "During a rotation's overlap: the previous public key, which still signs."
+          },
+          "previous_secret_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "During a rotation's overlap: until when the previous secret (and key) still sign. Each request carries both signatures until then."
+          },
+          "secret_rotated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the secret was last rotated."
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "description": "Failed attempts in a row. At 5 the endpoint's circuit breaker opens."
+          },
+          "paused_until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "While the circuit breaker is open: the endpoint gets no requests until then, and then one at a time until one succeeds."
           },
           "recent_deliveries": {
             "type": "array",
@@ -4924,6 +5171,171 @@
             "description": "Received messages that answer the email, oldest first.",
             "items": {
               "$ref": "#/components/schemas/MessageSummary"
+            }
+          }
+        }
+      },
+      "RotateWebhookSecretRequest": {
+        "type": "object",
+        "properties": {
+          "overlap_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 604800,
+            "default": 86400,
+            "description": "How long the previous secret (and Ed25519 key) keep signing next to the new ones. 0 stops them at once, e.g. after a leak."
+          }
+        },
+        "additionalProperties": false
+      },
+      "InsightStats": {
+        "type": "object",
+        "required": [
+          "attempts",
+          "accepted",
+          "deferred",
+          "bounced",
+          "unknown"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer"
+          },
+          "accepted": {
+            "type": "integer"
+          },
+          "deferred": {
+            "type": "integer"
+          },
+          "bounced": {
+            "type": "integer"
+          },
+          "unknown": {
+            "type": "integer"
+          },
+          "acceptance_rate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "accepted / attempts"
+          },
+          "deferral_rate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "deferred / attempts"
+          },
+          "bounce_rate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "bounced / attempts"
+          },
+          "time_to_acceptance_p50_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Median time from queued (or scheduled) to the receiver's acceptance."
+          },
+          "time_to_acceptance_p95_seconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      },
+      "InsightGroup": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/InsightStats"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string",
+                "description": "Mailbox provider, recognised by MX host: `google`, `microsoft`, `yahoo`, `apple`, `zoho`, `proton`, `fastmail`, … or `other`, `unknown`."
+              },
+              "sending_ip": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "InsightWindow": {
+        "type": "object",
+        "required": [
+          "window",
+          "total",
+          "by_provider",
+          "by_sending_ip"
+        ],
+        "properties": {
+          "window": {
+            "enum": [
+              "24h",
+              "7d",
+              "30d"
+            ]
+          },
+          "total": {
+            "$ref": "#/components/schemas/InsightStats"
+          },
+          "by_provider": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InsightGroup"
+            }
+          },
+          "by_sending_ip": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InsightGroup"
+            }
+          }
+        }
+      },
+      "Insights": {
+        "type": "object",
+        "required": [
+          "object",
+          "generated_at",
+          "windows",
+          "emails_considered",
+          "truncated"
+        ],
+        "properties": {
+          "object": {
+            "const": "insights"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_basis": {
+            "const": "sent_at",
+            "description": "Emails count in a window by when they were sent."
+          },
+          "provider_grouping": {
+            "const": "mx_host_suffix"
+          },
+          "emails_considered": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when more than 100,000 emails were sent in 30 days: the longer windows then cover only the newest 100,000."
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InsightWindow"
             }
           }
         }
