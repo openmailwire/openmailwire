@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
+	"os"
 	"time"
 
 	"github.com/openmailwire/openmailwire/internal/config"
@@ -12,7 +14,31 @@ import (
 
 // runSubmission serves SMTP submission for apps that cannot call the HTTP
 // API. It keeps no state: every message goes to the control plane.
-func runSubmission(ctx context.Context, log *slog.Logger) error {
+//
+// --dev-tls makes a self-signed certificate for local development when
+// OMW_TLS_CERT is not set: clients must then skip certificate checks.
+func runSubmission(ctx context.Context, log *slog.Logger, args []string) error {
+	switch {
+	case len(args) == 1 && args[0] == "--dev-tls":
+		if os.Getenv("OMW_TLS_CERT") != "" || os.Getenv("OMW_TLS_KEY") != "" {
+			return errors.New("--dev-tls makes its own certificate; unset OMW_TLS_CERT and OMW_TLS_KEY, or drop --dev-tls")
+		}
+		dir, err := os.MkdirTemp("", "openmailwire-dev-tls-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(dir)
+		host, _ := os.Hostname()
+		cert, key, err := writeDevCert(dir, os.Getenv("OMW_SUBMISSION_HOSTNAME"), host)
+		if err != nil {
+			return err
+		}
+		os.Setenv("OMW_TLS_CERT", cert)
+		os.Setenv("OMW_TLS_KEY", key)
+		log.Warn("--dev-tls: serving a self-signed certificate; clients must skip certificate verification. Development only, never in production")
+	case len(args) != 0:
+		return errors.New("usage: openmailwire submission [--dev-tls]")
+	}
 	cfg, err := config.LoadSubmission()
 	if err != nil {
 		return err
