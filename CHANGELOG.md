@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Dashboard: send, receive and run everything from the browser
+- **Overview** is the new home page: sending rates for 24 hours and 7 days with a daily trend, the queue and the age of its oldest recipient, held emails, active pauses, domains needing attention, receiving, workers (state, self-check, warm-up) and recent emails, refreshed live while the tab is visible. A new project gets a setup checklist for sending and for receiving.
+- **Compose**: From on a verified domain, address chips for To, Cc, Bcc and Reply-To, text and HTML with a live preview in a sandboxed frame, attachments, stream, send and give-up times, an automatic idempotency key, and Check before Send.
+- **Mail**: every readable inbox in one live list with filters by inbox, sender verdict, held and suspicious, new-since-last-visit counts, and a thread view that includes your sent replies; reply, release and download there.
+- New pages: **Held** (approve or reject with a note), **Suppressions** (filter, add, remove, CSV export), **Pauses** (resume), **Settings** (per-recipient cap, circuit breaker), **Insights** (per provider and sending IP), **Audit log** (with chain verification).
+- Domains: DKIM keys with the two-step rotation and the Ed25519 switch, report addresses, the DMARC and TLS-RPT summary, the claim expiry, the DMARC requirement, and **Set up DNS with Cloudflare** (preview, apply, remember the token on the server; shows "not available" until the server supports it).
+- Inboxes and messages: the sender verdict with SPF, DKIM and DMARC details, warnings for text aimed at agents, Reply-To mismatches and duplicate Message-IDs, sender-written text marked as such, held mail and Release, the per-inbox `hold_unauthenticated` switch, and reply recipients and warnings.
+- Webhooks: Ed25519 signing, public keys, the circuit breaker state and secret rotation with an overlap. API keys: allowed IPs, expiry, readable inboxes, approval rules and `can_approve`, on create and in a new edit page.
+- Emails: search and filters (text, status, recipient domain, dates), Check and stream on the test form, a progress line per recipient (queued, attempts, final), and approve or reject on held emails.
+- Throughout: keyboard shortcuts (`/`, `?`, `g` then a letter), confirmation dialogs for destructive actions, notices for finished actions, loading placeholders, empty states that say what to do next, status shown by text and a symbol rather than colour alone, and a grouped side navigation that becomes a menu on small screens.
+- The security rules are unchanged and tested: strict CSP, no HTML sinks, API data as text only, the key in `sessionStorage` only. `localStorage` holds only non-secret settings; HTML is rendered only for Compose's preview, in a frame with no permissions; a Cloudflare token never reaches storage or a URL.
+
+### API
+- `GET /overview` (full access): queue counts and the oldest waiting recipient, sending rates for 24 hours and 7 days with daily counts, held emails, active pauses, domain health, receiving, and workers with their self-check and warm-up.
+- `GET /emails?thread_id=<id>` lists the emails of one conversation (the email and the replies sent in its thread), and echoes `thread_id`.
+- Migration `0011` adds a partial index for counting held inbound messages.
+
 ## v0.6.0: security hardening, deliverability, agent safety
 
 This release fixes every problem found in an independent review of v0.5, each with a regression test, and adds the safety and deliverability features below. Read **Upgrading** before you deploy it.
