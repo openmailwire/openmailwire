@@ -145,7 +145,7 @@ const emailColumns = [
   { label: 'Subject', class: 'col-main', cell: (e) => link(route('emails', e.id), e.subject || '(no subject)') },
   { label: 'To', class: 'col-addr', cell: (e) => mono(L.summarizeAddresses(e.to)) },
   { label: 'From', class: 'col-addr', cell: (e) => mono(e.from || '—') },
-  { label: 'Sent', class: 'col-time', cell: (e) => (e.scheduled_at ? h('span', {}, when(e.created_at), muted(' · for '), exact(e.scheduled_at)) : when(e.created_at)) },
+  { label: 'Sent', class: 'col-time', cell: (e) => (e.scheduled_at ? h('span', { class: 'status-cell' }, when(e.created_at), h('span', { class: 'small muted' }, 'for ', exact(e.scheduled_at))) : when(e.created_at)) },
 ];
 
 const EMAIL_STATUSES = [
