@@ -95,6 +95,11 @@ var publicRoutes = []route{
 	{"PATCH", "/inboxes/{id}", full},
 	{"POST", "/messages/{id}/release", full},
 	{"GET", "/domains/{id}/reports", full},
+
+	// Lane G: automatic DNS setup with Cloudflare.
+	{"POST", "/domains/{id}/dns/auto", full},
+	{"GET", "/domains/{id}/dns/auto", full},
+	{"DELETE", "/domains/{id}/dns/auto", full},
 }
 
 var httpMethods = []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"}
@@ -386,6 +391,11 @@ var requiredErrors = map[string]int{
 	"not_found":                404,
 	"missing_api_key":          401,
 	"invalid_api_key":          401,
+	// Lane G.
+	"dns_provider_not_connected": 409,
+	"dns_provider_auth_failed":   422,
+	"dns_zone_not_found":         422,
+	"dns_provider_unavailable":   503,
 }
 
 func TestOpenAPIErrors(t *testing.T) {

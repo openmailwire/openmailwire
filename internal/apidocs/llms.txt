@@ -78,6 +78,7 @@ Domains:
 - `POST /domains/{id}/dkim/rotate`: rotate the DKIM key: the first call gives a new record to publish, the next call (once it is published) switches signing to it. The old record stays needed until its `retire_at`. Full access.
 - `POST /domains/{id}/dkim/ed25519`: `{"enabled": true}` adds an Ed25519 signature next to RSA, in the same two steps; `false` removes it. Full access.
 - `GET /domains/{id}/reports`: DMARC aggregate and TLS-RPT reports received at the domain's `report_addresses`: pass rates by source and reporter, unknown senders, TLS failures. `?days=30`. Full access.
+- `POST /domains/{id}/dns/auto`: publish the domain's DNS records at Cloudflare: `{"provider": "cloudflare", "api_token"?, "zone_id"?, "dry_run"?, "remember"?}`. Idempotent; never replaces the domain's own MX or DMARC; returns `changes` (create, update, unchanged, skip, delete), `warnings` for the user and the checked `domain`. Without `api_token` it uses the token a person remembered. `GET /domains/{id}/dns/auto` shows whether one is remembered and the last run; `DELETE /domains/{id}/dns/auto` forgets it. Full access. Never ask a user for a DNS provider token.
 
 Webhooks (full access):
 - `POST /webhooks`: register `{"endpoint": "https://…", "events": [...], "asymmetric_signing": false}`. Returns `signing_secret` (`whsec_…`) once; with `asymmetric_signing`, also `public_key` (`whpk_…`, Ed25519). At most 10 per project (`409 webhook_limit_reached`).
@@ -151,6 +152,7 @@ Every error is `{"statusCode": 422, "name": "validation_error", "message": "…"
 - `domain_exists` (409): this project already has the domain; find it with `GET /domains`.
 - `domain_verified_elsewhere` (409): another project verified this domain first. Only one project can have it verified.
 - `dkim_record_not_found` (409): the new DKIM key's TXT record is not in DNS yet. Publish the record the message names, wait, and call again; do not loop.
+- `dns_provider_not_connected` (409): no Cloudflare token is remembered for the domain. Ask a person to connect Cloudflare in the dashboard; never ask for the token yourself. `dns_provider_auth_failed` (422) and `dns_zone_not_found` (422): the token lacks Zone > DNS > Edit for the domain's zone, or sees no zone holding it; a person must fix the token or the zone. `dns_provider_unavailable` (503): Cloudflare failed or kept rate-limiting; wait `Retry-After`, then repeat the call (it is safe to repeat).
 - `payload_too_large` (413): the body is over 20 MB. Attachments: at most 10 MB decoded and 20 files.
 - `validation_error` (422): fix the field the message names. Never retry unchanged.
 - `rate_limit_exceeded` (429): the key's hourly or daily cap, or too many requests per second. Wait `Retry-After` seconds, then retry with the same `Idempotency-Key`. If the wait is long, tell the user.
@@ -237,6 +239,7 @@ Tools:
 - `approve_email` and `reject_email`: decide on a held email. Offered only to keys allowed to approve; marked destructive.
 - `list_suppressions`: suppressed addresses. `add_suppression` (full access): stop mailing someone who asked.
 - `list_pauses`: circuit-breaker pauses.
+- `setup_domain_dns` (full access): publish a domain's DNS records at Cloudflare with the token a person connected for it, then verify it. Run it with `dry_run` first. Marked destructive.
 
 ## Docs
 
