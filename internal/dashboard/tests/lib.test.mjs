@@ -592,3 +592,221 @@ test('lookups ignore prototype names from the API', () => {
     assert.equal(typeof L.holdReasonLabel(k), 'string', k);
   }
 });
+
+// ---- overview, compose, mail, shortcuts, DNS automation ----
+
+test('keyboard shortcuts', () => {
+  assert.equal(L.shortcutRoute('g', 'o'), '#/overview');
+  assert.equal(L.shortcutRoute('g', 'E'), '#/emails');
+  assert.equal(L.shortcutRoute('g', 'd'), '#/domains');
+  assert.equal(L.shortcutRoute('g', 'h'), '#/held');
+  assert.equal(L.shortcutRoute('g', 'i'), '#/insights');
+  assert.equal(L.shortcutRoute('g', 'c'), '#/compose');
+  assert.equal(L.shortcutRoute('g', 'm'), '#/mail');
+  assert.equal(L.shortcutRoute('g', 'z'), '');
+  assert.equal(L.shortcutRoute('x', 'o'), '');
+  const keys = L.SHORTCUTS.map(([k]) => k);
+  assert.equal(new Set(keys).size, keys.length, 'no key is used twice');
+  for (const [, page] of L.SHORTCUTS) assert.notEqual(L.parseRoute(`#/${page}`).page, 'notfound', page);
+  assert.ok(L.isTyping({ tagName: 'INPUT' }));
+  assert.ok(L.isTyping({ tagName: 'textarea' }));
+  assert.ok(L.isTyping({ tagName: 'DIV', isContentEditable: true }));
+  assert.ok(!L.isTyping({ tagName: 'BUTTON' }));
+  assert.ok(!L.isTyping(null));
+});
+
+test('filterEmails', () => {
+  const now = Date.parse('2026-11-20T12:00:00Z');
+  const rows = [
+    { id: 'a1', subject: 'Invoice 42', from: 'billing@acme.com', to: ['Jane <jane@Example.org>'], created_at: '2026-11-20T09:00:00Z', last_event: 'delivered' },
+    { id: 'b2', subject: 'Welcome', from: 'hello@acme.com', to: ['bob@mail.example.org', 'x@other.net'], created_at: '2026-11-18T09:00:00Z', last_event: 'bounced' },
+    { id: 'c3', subject: 'Later', from: 'hello@acme.com', to: ['z@other.net'], created_at: '2026-11-19T09:00:00Z', last_event: 'queued', scheduled_at: '2026-11-21T09:00:00Z' },
+  ];
+  const ids = (f) => L.filterEmails(rows, f, now).map((e) => e.id);
+  assert.deepEqual(ids({}), ['a1', 'b2', 'c3']);
+  assert.deepEqual(ids({ q: 'invoice' }), ['a1']);
+  assert.deepEqual(ids({ q: 'JANE' }), ['a1']);
+  assert.deepEqual(ids({ q: 'b2' }), ['b2']);
+  assert.deepEqual(ids({ status: 'bounced' }), ['b2']);
+  assert.deepEqual(ids({ status: 'scheduled' }), ['c3']);
+  assert.deepEqual(ids({ domain: 'example.org' }), ['a1', 'b2'], 'subdomains of a domain match it');
+  assert.deepEqual(ids({ domain: '@other.net' }), ['b2', 'c3']);
+  assert.deepEqual(ids({ domain: 'ample.org' }), []);
+  const local = (d) => { const t = new Date(d); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`; };
+  assert.deepEqual(ids({ since: local('2026-11-20T09:00:00Z') }), ['a1']);
+  assert.deepEqual(ids({ until: local('2026-11-18T09:00:00Z') }), ['b2']);
+  assert.equal(L.emailStatus({ last_event: 'held' }, now), 'held');
+  assert.equal(L.emailStatus({}, now), 'queued');
+});
+
+test('recipientSteps: queued, attempts, final', () => {
+  const groups = L.buildTimeline({
+    recipients: [{ email: 'a@x.com', status: 'delivered' }, { email: 'b@y.com', status: 'held' }],
+    attempts: [
+      { id: 'a1', recipient: 'a@x.com', started_at: '2026-11-18T10:00:01Z', finished_at: '2026-11-18T10:00:02Z', outcome: 'deferred' },
+      { id: 'a2', recipient: 'a@x.com', started_at: '2026-11-18T10:10:01Z', finished_at: '2026-11-18T10:10:02Z', outcome: 'delivered' },
+    ],
+    events: [
+      { type: 'queued', recipient: 'a@x.com', created_at: '2026-11-18T10:00:00Z' },
+      { type: 'held', recipient: 'b@y.com', created_at: '2026-11-18T10:00:00Z' },
+    ],
+  });
+  assert.deepEqual(L.recipientSteps(groups[0]).map((x) => [x.kind, x.label, x.tone]), [
+    ['start', 'Queued', 'info'],
+    ['attempt', 'Attempt 1: deferred', 'warn'],
+    ['attempt', 'Attempt 2: delivered', 'ok'],
+    ['final', 'Delivered', 'ok'],
+  ]);
+  assert.deepEqual(L.recipientSteps(groups[1]).map((x) => x.label), ['Held', 'Waiting for approval']);
+  assert.deepEqual(L.recipientSteps({ status: 'sending', entries: [] }).map((x) => x.label), ['Queued', 'Sending now']);
+});
+
+test('overview helpers', () => {
+  assert.equal(L.formatAge(42), '42 s');
+  assert.equal(L.formatAge(720), '12 min');
+  assert.equal(L.formatAge(3 * 3600 + 300), '3 h 5 min');
+  assert.equal(L.formatAge(7200), '2 h');
+  assert.equal(L.formatAge(2 * 86400 + 4 * 3600), '2 d 4 h');
+  assert.equal(L.formatAge(null), '—');
+  const bars = L.dailyBars([
+    { day: '2026-11-19', recipients: 10, delivered: 8, bounced: 1, complained: 0 },
+    { day: '2026-11-20', recipients: 40, delivered: 40, bounced: 0, complained: 1 },
+  ]);
+  assert.deepEqual(bars.map((b) => [b.label, b.height, b.deliveredHeight, b.bouncedHeight]), [['Thu', 25, 20, 2.5], ['Fri', 100, 100, 0]]);
+  assert.deepEqual(L.dailyBars([{ day: '2026-11-20', recipients: 0 }])[0].height, 0);
+  assert.deepEqual(L.dailyBars(null), []);
+  assert.deepEqual(L.workerState({ online: true }), { tone: 'ok', label: 'Online' });
+  assert.deepEqual(L.workerState({ online: true, draining: true }), { tone: 'warn', label: 'Draining' });
+  assert.deepEqual(L.workerState({ online: false, last_seen_at: '2026-11-20T00:00:00Z' }), { tone: 'bad', label: 'Offline' });
+  assert.deepEqual(L.workerState({}), { tone: 'muted', label: 'Never seen' });
+  assert.equal(L.warmupText(null), '—');
+  assert.equal(L.warmupText({ enabled: false, warm: true }), 'Off');
+  assert.equal(L.warmupText({ started: true, warm: true }), 'Warm');
+  assert.equal(L.warmupText({ started: false, warm: false }), 'Not started');
+  assert.equal(L.warmupText({ started: true, warm: false, day: 3, remaining: 1500, cap: 2000 }), 'Day 3, 1,500 of 2,000 left today');
+  assert.equal(L.warmupShare({ started: true, day: 3, remaining: 1500, cap: 2000 }), 0.25);
+  assert.equal(L.warmupShare({ warm: true }), null);
+  assert.deepEqual(L.domainsNeedingAttention([{ name: 'a', problems: [] }, { name: 'b', problems: ['Not verified'] }]).map((d) => d.name), ['b']);
+});
+
+test('setupSteps walks a new project through sending and receiving', () => {
+  const rec = (record, status, required = true) => ({ record, status, required, type: 'TXT', name: `${record}.x`, value: 'v' });
+  let s = L.setupSteps({ domains: [], keys: [{ permission: 'full_access' }], emailCount: 0, receiving: { enabled: true }, inboxes: [], messageCount: 0 });
+  assert.equal(s.next, 'domain');
+  assert.equal(s.done, false);
+  assert.equal(s.total, 8);
+  assert.equal(s.finished, 0);
+  const pending = { id: 'd1', name: 'acme.com', status: 'pending', records: [rec('DKIM', 'verified'), rec('SPF', 'missing'), rec('INBOUND', 'missing', false)] };
+  s = L.setupSteps({ domains: [pending], keys: [{}], emailCount: 0, receiving: { enabled: true }, inboxes: [], messageCount: 0 });
+  assert.equal(s.next, 'dns');
+  assert.equal(s.send[1].domain.id, 'd1');
+  assert.equal(s.send[1].route, '#/domains/d1');
+  assert.equal(s.receive[0].record.record, 'INBOUND');
+  const verified = { ...pending, status: 'verified', records: [rec('DKIM', 'verified'), rec('SPF', 'verified'), rec('INBOUND', 'verified', false)] };
+  s = L.setupSteps({ domains: [verified], keys: [{ permission: 'full_access' }, { permission: 'sending_access' }], emailCount: 1, receiving: { enabled: true }, inboxes: [{ id: 'i1', address: 'a@acme.com' }], messageCount: 1 });
+  assert.equal(s.done, true);
+  assert.equal(s.finished, 8);
+  // A server that does not receive mail: the MX step is blocked, not counted.
+  s = L.setupSteps({ domains: [verified], keys: [{}, {}], emailCount: 1, receiving: { enabled: false }, inboxes: [], messageCount: 0 });
+  assert.equal(s.receiveOn, false);
+  assert.equal(s.receive[0].blocked, true);
+  assert.equal(s.total, 7);
+  assert.equal(s.next, 'inbox');
+  // Keys unknown (a sending-only key cannot list them): not blocking.
+  s = L.setupSteps({ domains: [verified], keys: null, emailCount: 1, receiving: { enabled: false }, inboxes: [{}], messageCount: 1 });
+  assert.equal(s.send[3].unknown, true);
+  assert.equal(s.done, true);
+});
+
+test('compose: addresses and From', () => {
+  assert.ok(L.isAddress('jane@example.org'));
+  assert.ok(L.isAddress(' a.b+c@sub.example.co.uk '));
+  for (const bad of ['jane', 'jane@', '@x.com', 'a b@x.com', 'jane@localhost', 'Jane <jane@x.com>', 'a@b@c.com', '']) assert.ok(!L.isAddress(bad), bad);
+  assert.deepEqual(L.splitAddresses('a@x.com, b@y.com;c@z.com\n <d@w.com> '), ['a@x.com', 'b@y.com', 'c@z.com', 'd@w.com']);
+  assert.equal(L.formatFrom({ local: 'hello', domain: 'acme.com' }), 'hello@acme.com');
+  assert.equal(L.formatFrom({ name: 'Acme Support', local: 'hello', domain: 'acme.com' }), 'Acme Support <hello@acme.com>');
+  assert.equal(L.formatFrom({ name: 'Acme, Inc. "HQ"', local: 'hi', domain: 'acme.com' }), '"Acme, Inc. \\"HQ\\"" <hi@acme.com>');
+  assert.equal(L.formatFrom({ name: 'Evil\r\nBcc: x@y.com', local: 'hi', domain: 'acme.com' }), '"Evil Bcc: x@y.com" <hi@acme.com>');
+  assert.throws(() => L.formatFrom({ local: 'hi' }), /verified domain/);
+  for (const bad of ['', 'a b', '.hi', 'hi.', 'a..b', 'x'.repeat(65), 'a@b']) {
+    assert.throws(() => L.formatFrom({ local: bad, domain: 'acme.com' }), /before @/, bad);
+  }
+});
+
+test('compose: buildCompose', () => {
+  const now = Date.parse('2026-11-20T10:00:00Z');
+  const base = { from: { local: 'hi', domain: 'acme.com' }, to: ['jane@example.org'], subject: 'Hello', text: 'Body' };
+  assert.deepEqual(L.buildCompose(base, now), { from: 'hi@acme.com', to: ['jane@example.org'], subject: 'Hello', text: 'Body' });
+  const full = L.buildCompose({
+    ...base, cc: 'c@x.com', bcc: ['b@x.com'], reply_to: ['r@x.com'], html: '<p>Hi</p>', stream: 'transactional',
+    scheduledAt: '2026-11-21T10:00:00Z', expiresAt: '2026-11-22T10:00:00Z', retryUncertain: false,
+    attachments: [{ filename: '../report.pdf', size: 3, content: 'AAEC', content_type: 'application/pdf' }],
+  }, now);
+  assert.deepEqual(full.cc, ['c@x.com']);
+  assert.deepEqual(full.reply_to, ['r@x.com']);
+  assert.equal(full.html, '<p>Hi</p>');
+  assert.equal(full.scheduled_at, '2026-11-21T10:00:00.000Z');
+  assert.equal(full.expires_at, '2026-11-22T10:00:00.000Z');
+  assert.equal(full.retry_uncertain, false);
+  assert.deepEqual(full.attachments, [{ filename: '_report.pdf', content: 'AAEC', content_type: 'application/pdf' }]);
+  assert.equal(L.buildCompose({ ...base, stream: 'broadcast' }, now).stream, 'broadcast');
+  const fails = [
+    [{ to: [] }, /at least one recipient/],
+    [{ to: ['nope'] }, /To: "nope" is not an email address/],
+    [{ cc: ['x'] }, /Cc: "x"/],
+    [{ subject: ' ' }, /subject/],
+    [{ text: '', html: '' }, /text or HTML body/],
+    [{ stream: 'broadcast', cc: ['c@x.com'] }, /exactly one recipient/],
+    [{ to: Array.from({ length: 51 }, (_, i) => `u${i}@x.com`) }, /at most 50 recipients/],
+    [{ scheduledAt: '2026-11-19T10:00:00Z' }, /Send at: the time must be in the future/],
+    [{ scheduledAt: '2027-01-30T10:00:00Z' }, /at most 30 days/],
+    [{ expiresAt: '2026-12-01T10:00:00Z' }, /at most 7 days/],
+    [{ scheduledAt: '2026-11-21T10:00:00Z', expiresAt: '2026-11-21T09:00:00Z' }, /after the send time/],
+    [{ attachments: Array.from({ length: 21 }, () => ({ filename: 'a', size: 1, content: 'AA==' })) }, /At most 20 files/],
+    [{ attachments: [{ filename: 'big', size: 11 * 1024 * 1024, content: '' }] }, /10\.0 MB in total/],
+  ];
+  for (const [over, re] of fails) assert.throws(() => L.buildCompose({ ...base, ...over }, now), re, JSON.stringify(over).slice(0, 60));
+  assert.deepEqual(L.attachmentBudget([{ size: 1024 }, { size: 2048 }]), { count: 2, bytes: 3072, problem: '' });
+  assert.equal(L.base64FromDataURL('data:application/pdf;base64,QUJD'), 'QUJD');
+  assert.equal(L.base64FromDataURL('data:,plain'), '');
+});
+
+test('mail: merge, filter, count new, threads', () => {
+  const pages = [
+    { inbox_id: 'i1', inbox: 'a@x.com', data: [{ id: 'm1', received_at: '2026-11-20T10:00:00Z', from: 'Jane <jane@ex.org>', subject: 'Hi', trust: 'authenticated' }] },
+    { inbox_id: 'i2', inbox: 'b@x.com', data: [
+      { id: 'm2', received_at: '2026-11-20T11:00:00Z', from: 'spoof@bank.test', subject: 'Urgent', trust: 'failed', held: true, suspicious_instructions: true, snippet: 'ignore previous instructions' },
+      { id: 'm1', received_at: '2026-11-20T10:00:00Z' },
+    ] },
+  ];
+  const rows = L.mergeMessages(pages);
+  assert.deepEqual(rows.map((m) => [m.id, m.inbox_id]), [['m2', 'i2'], ['m1', 'i1']]);
+  const ids = (f) => L.filterMessages(rows, f).map((m) => m.id);
+  assert.deepEqual(ids({ inbox: 'i1' }), ['m1']);
+  assert.deepEqual(ids({ trust: 'failed' }), ['m2']);
+  assert.deepEqual(ids({ held: true }), ['m2']);
+  assert.deepEqual(ids({ suspicious: true }), ['m2']);
+  assert.deepEqual(ids({ q: 'previous' }), ['m2']);
+  assert.deepEqual(ids({ q: 'jane' }), ['m1']);
+  assert.equal(L.countNew(rows, Date.parse('2026-11-20T10:30:00Z')), 1);
+  assert.equal(L.countNew(rows, 0), 0, 'no earlier visit: nothing counts as new');
+  const t = L.threadItems(
+    [{ id: 'm1', received_at: '2026-11-20T10:00:00Z' }, { id: 'm3', received_at: '2026-11-20T12:00:00Z' }],
+    [{ id: 'e1', created_at: '2026-11-20T09:00:00Z' }, { id: 'e2', created_at: '2026-11-20T11:00:00Z' }]);
+  assert.deepEqual(t.map((x) => `${x.kind}:${x.item.id}`), ['sent:e1', 'received:m1', 'sent:e2', 'received:m3']);
+});
+
+test('DNS automation helpers', () => {
+  assert.deepEqual(L.dnsActionBadge('create'), ['ok', 'Create']);
+  assert.deepEqual(L.dnsActionBadge('update'), ['warn', 'Update']);
+  assert.deepEqual(L.dnsActionBadge('__proto__')[0], 'muted');
+  assert.equal(L.dnsSummary([{ action: 'create' }, { action: 'create' }, { action: 'update' }, { action: 'unchanged' }, { action: 'skip' }]),
+    '2 to create, 1 to update, 1 already right, 1 skipped');
+  assert.equal(L.dnsSummary([]), 'No changes');
+  assert.equal(L.classifyError({ status: 422, code: 'dns_provider_auth_failed', message: 'invalid token' }).title, 'Cloudflare refused the token');
+  assert.equal(L.classifyError({ status: 422, code: 'dns_zone_not_found' }).title, 'No matching zone in Cloudflare');
+  const down = L.classifyError({ status: 503, code: 'dns_provider_unavailable', message: 'timeout' });
+  assert.equal(down.kind, 'server');
+  assert.equal(down.detail, 'timeout');
+  assert.equal(L.classifyError({ status: 404, code: 'not_found', message: 'no such endpoint' }, 'automatic DNS setup').kind, 'unavailable');
+});

@@ -88,7 +88,9 @@ test('the API key is only ever stored in sessionStorage', () => {
   const src = code(read('ui.js'));
   assert.match(src, /sessionStorage\.setItem\(KEY_STORAGE, key\)/);
   for (const file of scripts) {
-    assert.doesNotMatch(code(read(file)), /\b(sessionStorage|localStorage)\.setItem\((?!KEY_STORAGE, key\))/, `${file} stores something else`);
+    assert.doesNotMatch(code(read(file)), /\bsessionStorage\.setItem\((?!KEY_STORAGE, key\))/, `${file} stores something else`);
+    assert.doesNotMatch(code(read(file)), /localStorage\.setItem\((?!PREF_PREFIX \+ name, String\(value\)\))/, `${file} stores something else`);
+    assert.doesNotMatch(code(read(file)), /localStorage[^;]*KEY_STORAGE|KEY_STORAGE[^;]*localStorage/, `${file} puts the key in localStorage`);
   }
 });
 
@@ -155,7 +157,7 @@ test('styles.css loads nothing remote', () => {
 
 test('localStorage holds only prefixed, non-secret preferences', () => {
   const ui = code(read('ui.js'));
-  const uses = [...ui.matchAll(/localStorage\.(\w+)\(([^)]*)\)/g)].map((m) => `${m[1]}(${m[2]})`);
+  const uses = [...ui.matchAll(/localStorage\.(\w+)\(((?:[^()]|\([^()]*\))*)\)/g)].map((m) => `${m[1]}(${m[2]})`);
   assert.deepEqual(uses.sort(), [
     'getItem(PREF_PREFIX + name)', 'removeItem(PREF_PREFIX + name)', 'setItem(PREF_PREFIX + name, String(value))',
   ]);

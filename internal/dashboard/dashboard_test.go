@@ -79,6 +79,9 @@ func TestAssets(t *testing.T) {
 		"/dashboard/ui.js":         "text/javascript; charset=utf-8",
 		"/dashboard/ops.js":        "text/javascript; charset=utf-8",
 		"/dashboard/domains.js":    "text/javascript; charset=utf-8",
+		"/dashboard/home.js":       "text/javascript; charset=utf-8",
+		"/dashboard/compose.js":    "text/javascript; charset=utf-8",
+		"/dashboard/mail.js":       "text/javascript; charset=utf-8",
 		"/dashboard/styles.css":    "text/css; charset=utf-8",
 		"/dashboard/logo.svg":      "image/svg+xml",
 		"/dashboard/logo-dark.svg": "image/svg+xml",
@@ -161,7 +164,7 @@ func TestModulesServed(t *testing.T) {
 			t.Errorf("%s is embedded but no module imports it", name)
 		}
 	}
-	if len(seen) < 5 {
+	if len(seen) < 8 {
 		t.Errorf("only %d modules reachable: %v", len(seen), seen)
 	}
 }
