@@ -333,11 +333,11 @@ func TestTimeoutsAndTokenNeverShown(t *testing.T) {
 
 func TestTXTHelpers(t *testing.T) {
 	for in, want := range map[string]string{
-		`v=spf1 -all`:                       "v=spf1 -all",
-		`"v=spf1 -all"`:                     "v=spf1 -all",
-		`"v=DKIM1; p=AAA" "BBB"`:            "v=DKIM1; p=AAABBB",
-		`"a\"b" "c\\d"`:                     `a"bc\d`,
-		`"unterminated`:                     `"unterminated`,
+		`v=spf1 -all`:                        "v=spf1 -all",
+		`"v=spf1 -all"`:                      "v=spf1 -all",
+		`"v=DKIM1; p=AAA" "BBB"`:             "v=DKIM1; p=AAABBB",
+		`"a\"b" "c\\d"`:                      `a"bc\d`,
+		`"unterminated`:                      `"unterminated`,
 		`  plain text with "quotes" inside `: `plain text with "quotes" inside`,
 	} {
 		if got := dnsprovider.NormalizeTXT(in); got != want {

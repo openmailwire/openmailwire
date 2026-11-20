@@ -98,10 +98,10 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 func (c *Cloudflare) SetSleep(f func(ctx context.Context, d time.Duration) error) { c.sleep = f }
 
 // The client never prints its token, whatever logs or formats it.
-func (c *Cloudflare) String() string         { return "cloudflare(" + c.base + ")" }
-func (c *Cloudflare) GoString() string       { return c.String() }
-func (c *Cloudflare) LogValue() slog.Value   { return slog.StringValue(c.String()) }
-func (c *Cloudflare) Name() string           { return CloudflareName }
+func (c *Cloudflare) String() string               { return "cloudflare(" + c.base + ")" }
+func (c *Cloudflare) GoString() string             { return c.String() }
+func (c *Cloudflare) LogValue() slog.Value         { return slog.StringValue(c.String()) }
+func (c *Cloudflare) Name() string                 { return CloudflareName }
 func (c *Cloudflare) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
 type cfMessage struct {
