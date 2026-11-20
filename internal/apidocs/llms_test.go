@@ -13,6 +13,7 @@ var mcpTools = []string{
 	"list_domains", "add_domain", "verify_domain",
 	"list_inboxes", "list_messages", "read_message", "reply_to_message", "wait_for_reply",
 	"check_email", "list_held", "approve_email", "reject_email", "list_suppressions", "add_suppression", "list_pauses",
+	"setup_domain_dns",
 }
 
 var deliveryStatuses = []string{"queued", "sending", "deferred", "delivered", "bounced", "suppressed", "expired", "unknown", "canceled",

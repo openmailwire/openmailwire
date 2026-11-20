@@ -46,7 +46,8 @@ HTTP API, an MCP server, DKIM, and workers that deliver from your own IPs.
 Usage:
   openmailwire serve                          run the control plane (API, queue, scheduler)
   openmailwire worker                         run a delivery worker
-  openmailwire submission                     SMTP submission on 587/465 for apps that only speak SMTP
+  openmailwire submission [--dev-tls]         SMTP submission on 587/465 for apps that only speak SMTP
+                                              (--dev-tls: a self-signed certificate, development only)
   openmailwire inbound                        run an inbound SMTP node (inboxes, bounces, complaints)
   openmailwire migrate                        apply database migrations
   openmailwire keygen                         print a new OMW_SECRET_KEY
@@ -65,8 +66,15 @@ Usage:
                                               treat the worker's IP as warm (no warm-up caps), or start over
   openmailwire domains force-verify <domain> [project-id]
                                               mark a domain verified without DNS (development only)
+  openmailwire dns sync [--dry-run]           publish OMW_SPF_INCLUDE with the live workers' IPs at Cloudflare
+                                              (needs OMW_CLOUDFLARE_TOKEN; the control plane does it every 5 minutes)
   openmailwire mcp                            MCP server on stdio for AI agents (needs OMW_API_URL, OMW_API_KEY)
-  openmailwire dev-sink [addr]                local SMTP sink that prints what it receives (development only)
+  openmailwire dev-sink [addr]                local SMTP sink that prints what workers send it (default 127.0.0.1:1025;
+                                              development only)
+  openmailwire dev-deliver --to <addr> [--from <addr>] [--subject TEXT] [--text TEXT] [--attach FILE]
+                       [--in-reply-to MESSAGE-ID] [--inbound host:port]
+                                              send one test message to an inbound node (default 127.0.0.1:2525),
+                                              to try receiving without the internet (development only)
   openmailwire version
 
 Configuration is read from the environment; see README.md.
@@ -89,7 +97,7 @@ func main() {
 	case "worker":
 		err = runWorker(ctx, log)
 	case "submission":
-		err = runSubmission(ctx, log)
+		err = runSubmission(ctx, log, args)
 	case "inbound":
 		err = runInbound(ctx, log)
 	case "migrate":
@@ -111,6 +119,10 @@ func main() {
 		err = domainsCmd(ctx, args)
 	case "dev-sink":
 		err = devSink(ctx, args)
+	case "dev-deliver":
+		err = devDeliver(ctx, args, os.Stdout)
+	case "dns":
+		err = dnsCmd(ctx, args)
 	case "mcp":
 		err = runMCP(ctx)
 	case "version":
@@ -200,6 +212,9 @@ func serve(ctx context.Context, log *slog.Logger) error {
 		Log: log, UserAgent: "openmailwire-webhooks/" + version,
 	}
 	go dispatcher.Run(ctx, time.Second)
+	// Lane G: the operator's SPF include (OMW_CLOUDFLARE_TOKEN) and retired
+	// DKIM records of domains with a remembered DNS token.
+	go srv.RunDNSMaintenance(ctx, api.DNSMaintenanceInterval)
 
 	go func() {
 		<-ctx.Done()
@@ -664,9 +679,10 @@ func runMCP(ctx context.Context) error {
 }
 
 // devSink accepts SMTP on localhost and prints each message, for running a
-// worker locally with OMW_SMTP_OVERRIDE. It is not a mail server.
+// worker locally with OMW_SMTP_OVERRIDE. It is not a mail server. Its port
+// is Mailpit's (1025); 2525 is where a local inbound node listens.
 func devSink(ctx context.Context, args []string) error {
-	addr := "127.0.0.1:2525"
+	addr := "127.0.0.1:1025"
 	if len(args) > 0 {
 		addr = args[0]
 	}

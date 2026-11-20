@@ -171,6 +171,18 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	d, pe := s.checkDomain(r, d)
+	if pe != nil {
+		pe.write(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.view(r.Context(), d))
+}
+
+// checkDomain checks d's records in live DNS, saves the result and returns
+// the domain as it is now (POST /domains/{id}/verify, and after automatic
+// DNS setup).
+func (s *Server) checkDomain(r *http.Request, d store.Domain) (store.Domain, *policyError) {
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	recs, verified := domains.Check(ctx, s.Resolver, s.spec(ctx, d))
@@ -190,22 +202,18 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		// The DNS records are in place, so the caller controls the domain,
 		// but another project verified the same name first.
 		if err := s.Store.SaveDomainCheck(r.Context(), d.ID, "pending", checks); err != nil {
-			s.internal(w, "save domain check", err)
-			return
+			return d, s.storeErr("save domain check", err)
 		}
-		writeError(w, http.StatusConflict, "domain_verified_elsewhere", fmt.Sprintf(
-			"another project has already verified %s, and a domain can be verified in only one project at a time; delete it from that project (or ask your OpenMailWire operator), then verify again", d.Name))
-		return
+		return d, &policyError{Status: http.StatusConflict, Name: "domain_verified_elsewhere", Message: fmt.Sprintf(
+			"another project has already verified %s, and a domain can be verified in only one project at a time; delete it from that project (or ask your OpenMailWire operator), then verify again", d.Name)}
 	}
 	if err != nil {
-		s.internal(w, "save domain check", err)
-		return
+		return d, s.storeErr("save domain check", err)
 	}
 	was := d.Status
 	d, err = s.Store.GetDomain(r.Context(), d.ProjectID, d.ID)
 	if err != nil {
-		s.internal(w, "reload domain", err)
-		return
+		return d, s.storeErr("reload domain", err)
 	}
 	if was != d.Status && (was == "verified" || d.Status == "verified") {
 		action := "domain.verified"
@@ -214,7 +222,16 @@ func (s *Server) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		}
 		s.audit(r, action, "domain", d.ID, map[string]any{"name": d.Name, "status": d.Status})
 	}
-	writeJSON(w, http.StatusOK, s.view(r.Context(), d))
+	return d, nil
+}
+
+// storeErr is s.internal's answer as a value.
+func (s *Server) storeErr(what string, err error) *policyError {
+	if unstorable(err) {
+		s.Log.Warn(what+": unstorable text refused", "err", err)
+		return errUnstorable
+	}
+	return s.internalErr(what, err)
 }
 
 func (s *Server) deleteDomain(w http.ResponseWriter, r *http.Request) {

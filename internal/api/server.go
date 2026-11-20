@@ -36,6 +36,7 @@ type Server struct {
 	limiter *keyLimiter // per-key request rate; nil when off
 	large   slots       // requests with bodies over largeBody
 	safety  safetyState // lane B: in-memory state (unsubscribe rate limit)
+	dns     dnsState    // lane G: per-domain run locks, operator SPF sync (dnsauto.go)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -76,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /internal/worker/lease", s.withWorker(s.lease))
 	mux.Handle("POST /internal/worker/report", s.withWorker(s.report))
 	s.dkimRoutes(mux) // lane C: DKIM rotation and Ed25519 (dkim.go)
+	s.dnsRoutes(mux)  // lane G: automatic DNS setup with Cloudflare (dnsauto.go)
 
 	var root http.Handler
 	mux.Handle("/mcp", s.mcpHandler(func() http.Handler { return root }))

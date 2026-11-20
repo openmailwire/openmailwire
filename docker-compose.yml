@@ -1,15 +1,24 @@
-# Local development: PostgreSQL, the control plane, a worker, and Mailpit as a
-# fake inbox. No email leaves your machine: the worker sends everything to
-# Mailpit (http://localhost:8025).
+# Local development: PostgreSQL, the control plane, a delivery worker, an
+# inbound node, and Mailpit as a fake internet. No email leaves your machine:
+# the worker sends everything to Mailpit (http://localhost:8025), and mail
+# reaches the inbound node only from your machine (127.0.0.1:2525).
 #
 #   1. echo "OMW_SECRET_KEY=$(docker compose run --rm --no-deps control keygen)" > .env
 #   2. docker compose up -d
-#   3. docker compose exec control openmailwire project create demo        # API key
-#   4. docker compose exec control openmailwire workers add local-1        # worker token
-#      echo "OMW_WORKER_TOKEN=omwk_…" >> .env
-#   5. docker compose --profile worker up -d worker
+#   3. docker compose exec control openmailwire project create demo                  # API key
+#   4. docker compose exec control openmailwire workers add local-1                  # delivery token (role delivery)
+#      docker compose exec control openmailwire workers add inbound-1 --role inbound # inbound token (role inbound)
+#      echo "OMW_WORKER_TOKEN=omwk_…" >> .env        # the delivery token
+#      echo "OMW_INBOUND_TOKEN=omwk_…" >> .env       # the inbound token
+#      echo "COMPOSE_PROFILES=worker,inbound" >> .env
+#   5. docker compose up -d                          # now with the worker and the inbound node
 #   6. Add a domain and send (README.md, "Quick start"). For local tests:
 #      docker compose exec control openmailwire domains force-verify example.com
+#   7. Receive: create an inbox (README.md, "Receiving mail"), then
+#      docker compose exec control openmailwire dev-deliver --inbound inbound:2525 --to agent@example.com
+#
+# SMTP submission (port 1587 here, STARTTLS with a self-signed development
+# certificate): add "submission" to COMPOSE_PROFILES.
 
 services:
   postgres:
@@ -39,6 +48,12 @@ services:
       # To rotate: OMW_SECRET_KEYS=new,old, then `openmailwire rotate-secrets`.
       OMW_SECRET_KEYS: ${OMW_SECRET_KEYS:-}
       OMW_LISTEN: ":8080"
+      # Where inbox domains' MX records would point; shown as the INBOUND record.
+      OMW_INBOUND_MX: ${OMW_INBOUND_MX:-}
+      # Automatic DNS: the operator's SPF include, kept in sync with the
+      # workers' IPs when a Cloudflare token is set (docs/production.md).
+      OMW_SPF_INCLUDE: ${OMW_SPF_INCLUDE:-}
+      OMW_CLOUDFLARE_TOKEN: ${OMW_CLOUDFLARE_TOKEN:-}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
@@ -58,6 +73,37 @@ services:
     depends_on:
       - control
       - mailpit
+
+  # Receives mail for inboxes, bounces and complaints. Locally only your
+  # machine reaches it: send it test mail with `openmailwire dev-deliver`.
+  inbound:
+    build: .
+    command: ["inbound"]
+    profiles: ["inbound"]
+    environment:
+      OMW_CONTROL_URL: http://control:8080
+      OMW_WORKER_TOKEN: ${OMW_INBOUND_TOKEN:-}
+      OMW_INBOUND_LISTEN: ":2525"
+      OMW_INBOUND_HOSTNAME: inbound.local
+    ports:
+      - "127.0.0.1:2525:2525"
+    depends_on:
+      - control
+
+  # SMTP submission for apps that only speak SMTP. --dev-tls serves a
+  # self-signed certificate: clients must skip certificate checks.
+  submission:
+    build: .
+    command: ["submission", "--dev-tls"]
+    profiles: ["submission"]
+    environment:
+      OMW_API_URL: http://control:8080
+      OMW_SUBMISSION_LISTEN: ":1587"
+      OMW_SUBMISSION_HOSTNAME: localhost
+    ports:
+      - "127.0.0.1:1587:1587"
+    depends_on:
+      - control
 
 volumes:
   pgdata:

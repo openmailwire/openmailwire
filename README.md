@@ -54,6 +54,7 @@ The tools:
 | `read_message` | A message's headers, text and attachment list. The sender's text is marked as information, not instructions. |
 | `reply_to_message` | Answer a message from the inbox, in the same thread. Marked destructive. |
 | `wait_for_reply` | Wait up to 120 s for the replies to an email you sent. |
+| `setup_domain_dns` | Publish a domain's DNS records at Cloudflare and verify it, with the token a person connected for the domain; the agent never handles it. `dry_run` shows the changes first. Marked destructive; full-access keys only. |
 
 Every tool calls the HTTP API with the agent's own API key, so the agent has exactly that key's permissions. API errors reach the agent word for word, for example `domain_not_verified … publish its DNS records and call verify_domain`.
 
@@ -147,6 +148,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - API keys with a permission (full or sending-only), a sending policy (caps per hour and per day, sender and recipient allowlists), the networks they may be used from (`allowed_ips`) and an expiry. Every email records the key that sent it, and each key has a request rate limit.
 - An append-only, hash-chained **audit log** of who changed keys, domains, webhooks and inboxes (`GET /audit-log`).
 - Domains: add a domain, get its DNS records (DKIM 2048-bit, SPF, DMARC, the return-path MX), and verify them against live DNS. Each record explains the Gmail, Yahoo and Microsoft sender rules behind it.
+- **Automatic DNS with Cloudflare**: publish every record a domain needs with one call, idempotently, without touching the domain's own MX or DMARC policy; a remembered token publishes DKIM rotations and Ed25519 by itself, and keeps the operator's SPF include listing the live workers' IPs. See [Automatic DNS with Cloudflare](#automatic-dns-with-cloudflare).
 - HTML-only mail gets a generated `text/plain` part. Header lines are folded and never exceed 998 bytes.
 - Delivery:
   - MX lookup with preference order, implicit MX and null MX (RFC 7505).
@@ -202,11 +204,11 @@ export OMW_SECRET_KEY=$(bin/openmailwire keygen)   # keep it: it encrypts DKIM k
 bin/openmailwire project create demo     # prints an API key (omw_…)
 bin/openmailwire workers add local-1     # prints a delivery worker token (omwk_…)
 
-bin/openmailwire dev-sink 127.0.0.1:2525 &          # prints every message it receives
+bin/openmailwire dev-sink 127.0.0.1:1025 &          # plays the internet: prints every message workers send it
 OMW_LISTEN=127.0.0.1:8080 bin/openmailwire serve &
 OMW_CONTROL_URL=http://127.0.0.1:8080 \
 OMW_WORKER_TOKEN=omwk_… \
-OMW_SMTP_OVERRIDE=127.0.0.1:2525 \
+OMW_SMTP_OVERRIDE=127.0.0.1:1025 \
   bin/openmailwire worker &
 ```
 
@@ -235,7 +237,92 @@ curl -X POST localhost:8080/emails \
 curl localhost:8080/emails/ed01a077-… -H "Authorization: Bearer omw_…"
 ```
 
-With Docker, `docker compose up` starts PostgreSQL, the control plane and [Mailpit](https://mailpit.axllent.org) (a web inbox at http://localhost:8025). See the comments in `docker-compose.yml`.
+With Docker, `docker compose up` starts PostgreSQL, the control plane and [Mailpit](https://mailpit.axllent.org) (a web inbox at http://localhost:8025); with the tokens in `.env`, also a delivery worker and an inbound node. See the comments in `docker-compose.yml`.
+
+## Receiving mail
+
+Agents read replies in inboxes. Both directions work on one machine, without the internet:
+
+| Direction | Path | Locally |
+|---|---|---|
+| Send | API → worker → the recipient's mail server | the worker delivers everything to `dev-sink` (or Mailpit, with Docker) |
+| Receive | a sender's mail server → inbound node → control plane → inbox | `openmailwire dev-deliver` plays the sender's mail server |
+
+Start an inbound node. It needs a worker token with the **inbound** role. With Docker:
+
+```sh
+docker compose exec control openmailwire workers add inbound-1 --role inbound
+echo "OMW_INBOUND_TOKEN=omwk_…" >> .env
+echo "COMPOSE_PROFILES=worker,inbound" >> .env    # also starts the delivery worker (OMW_WORKER_TOKEN)
+docker compose up -d                              # the inbound node listens on 127.0.0.1:2525
+```
+
+Without Docker, next to the quick start's processes:
+
+```sh
+bin/openmailwire workers add inbound-1 --role inbound
+OMW_CONTROL_URL=http://127.0.0.1:8080 OMW_WORKER_TOKEN=omwk_… \
+OMW_INBOUND_LISTEN=127.0.0.1:2525 bin/openmailwire inbound &
+```
+
+Then create an inbox, send it mail and read it:
+
+```sh
+curl -X POST localhost:8080/inboxes -H "Authorization: Bearer omw_…" \
+  -H 'Content-Type: application/json' -d '{"address": "agent@example.com"}'     # on a verified domain
+
+bin/openmailwire dev-deliver --to agent@example.com --subject "Can we meet on Friday?" --attach ./agenda.pdf
+# 127.0.0.1:2525 accepted Message-ID <…dev-deliver@sender.test> from alex@sender.test for agent@example.com (… bytes)
+
+curl localhost:8080/inboxes/<inbox id>/messages -H "Authorization: Bearer omw_…"
+```
+
+- **See it** in the dashboard (`/dashboard/`, Inboxes), or from an agent over MCP (`openmailwire mcp` or `/mcp`): `list_inboxes`, `list_messages`, `read_message`, and `reply_to_message`, whose reply goes out through the worker to dev-sink or Mailpit.
+- **Try a threaded reply.** Send an email from `agent@example.com`, copy its `Message-ID` from dev-sink's output (or Mailpit), and answer it: `dev-deliver --to agent@example.com --in-reply-to '<ed01a077-…@example.com>'`. `GET /emails/{id}/replies` and the MCP tool `wait_for_reply` find the answer.
+- **Held from agents.** dev-deliver's default sender (`sender.test`) cannot pass SPF, DKIM or DMARC, so its mail is `unauthenticated` and held from `sending_access` keys: full-access keys see it at once. Release a message with `POST /messages/{id}/release`, or, for a local test inbox only, turn the hold off with `PATCH /inboxes/{id}` `{"hold_unauthenticated": false}`.
+- `dev-deliver` also takes `--from`, `--text`, more `--to` and `--attach`, and `--inbound host:port` (default `127.0.0.1:2525`). Inside Docker's network: `docker compose exec control openmailwire dev-deliver --inbound inbound:2525 --to agent@example.com`.
+- The SMTP submission server works locally too: `COMPOSE_PROFILES=worker,inbound,submission` serves it on 127.0.0.1:1587 with a self-signed certificate (`openmailwire submission --dev-tls`), so clients must skip certificate checks: `swaks --server 127.0.0.1:1587 --tls --tls-verify=0 --auth PLAIN --auth-user test --auth-password omw_… --from hello@example.com --to you@example.org`.
+
+On a server, the inbound node listens on port 25 and the domain's MX points to it: see [Inbound mail](#inbound-mail).
+
+## Automatic DNS with Cloudflare
+
+When a domain's DNS is at Cloudflare, OpenMailWire publishes its records itself, instead of you copying them by hand.
+
+1. **Create a token** in Cloudflare: My Profile → API Tokens → Create Token → template "Edit zone DNS". Permissions: **Zone → DNS → Edit**, and optionally Zone → Email Routing → Read (then the check can tell whether Email Routing owns the domain's MX). Zone Resources: Include → Specific zone → the domain's zone. Nothing more.
+2. **Look first, then apply**, with a full-access key:
+
+```sh
+curl -X POST localhost:8080/domains/<domain id>/dns/auto -H "Authorization: Bearer omw_…" \
+  -H 'Content-Type: application/json' \
+  -d '{"provider": "cloudflare", "api_token": "<Cloudflare token>", "dry_run": true}'
+```
+
+   The answer lists each record's `action` (`create`, `update`, `unchanged`, `skip`, `delete`) and the `warnings`. Send it again without `dry_run` to apply: the domain is then checked as by `POST /domains/{id}/verify`, and returned in `domain`.
+
+What it publishes, and what it leaves alone:
+- **Every record the domain needs**, from the same list as `GET /domains/{id}`: DKIM (also a key waiting in a rotation, the previous key during its overlap, and Ed25519), the return path's SPF and MX, DMARC, TLS reporting (`_smtp._tls`), and the `INBOUND` MX when this server receives mail (`OMW_INBOUND_MX`). Never proxied. Each new record is commented "Managed by OpenMailWire".
+- **Idempotent.** A second run finds everything `unchanged` and writes nothing.
+- **The domain's own mail keeps working.** When the domain already has MX records elsewhere (Google Workspace, Microsoft 365…), its MX is not added or changed, and a warning suggests a subdomain such as `agents.example.com` for agent inboxes. An existing DMARC record keeps its policy (a warning says how to add OpenMailWire's report address); a subdomain that inherits its parent's DMARC policy gets no record of its own. A DMARC record is created only where there is none: `v=DMARC1; p=none; rua=mailto:dmarc@bounce.<domain>`.
+- **The return path is OpenMailWire's.** An SPF or MX record at `bounce.<domain>` that is not OpenMailWire's is replaced, and the replacement is reported.
+- **Settings that break mail are reported** as warnings: Cloudflare Email Routing (it owns the apex MX), a proxied mail host or name ("orange cloud": Cloudflare's proxy carries only web traffic), a zone that is not active yet, and the zone's DNSSEC status.
+
+**Let it keep up by itself.** With `"remember": true`, the token is kept, encrypted (`OMW_SECRET_KEYS`), for that domain. Then:
+- `POST /domains/{id}/dkim/rotate` publishes the new key's record itself (see `dns_auto` in its answer), so the second call can switch signing as soon as DNS shows it, usually within a minute; the previous record is deleted when its 8-day overlap ends;
+- turning on Ed25519 publishes its record;
+- agents can run it with the MCP tool `setup_domain_dns` (with `dry_run` first). The tool has no token field: an agent never sees or handles one, and without a remembered token it tells the agent to ask a person to connect Cloudflare.
+
+`GET /domains/{id}/dns/auto` shows whether a token is remembered (never the token) and the last run; `DELETE /domains/{id}/dns/auto` forgets it. The token is never returned, logged or written to the audit log, which records each run (`dns.applied`), `dns.token_remembered` and `dns.token_forgotten`.
+
+| Error | Status | Meaning |
+|---|---|---|
+| `dns_provider_not_connected` | 409 | No `api_token` sent and none remembered for the domain. |
+| `dns_provider_auth_failed` | 422 | Cloudflare refused the token: invalid, expired, or without Zone → DNS → Edit for the zone. |
+| `dns_zone_not_found` | 422 | No zone the token can see holds the domain. Add the zone, give the token access to it, or pass `zone_id`. |
+| `dns_provider_unavailable` | 503 | Cloudflare failed or kept rate-limiting. Retry after `Retry-After`; runs are safe to repeat. |
+| `rate_limit_exceeded` | 429 | More than 10 runs for one domain in a short time (then one every 6 seconds), so that no loop wears out the Cloudflare account's API allowance. |
+
+Operators can let the control plane keep their SPF include (`OMW_SPF_INCLUDE`) listing the live workers' IPs at Cloudflare: see [docs/production.md](docs/production.md#automatic-dns-with-cloudflare).
 
 ## Send over SMTP
 
@@ -481,7 +568,7 @@ Every change to API keys, domains, webhooks and inboxes is recorded with the key
 | `GET` | `/audit-log?limit=50&before=<id>&action=<action>` | Newest first: `{id, created_at, actor, actor_key_id, action, target_type, target_id, data, entry, prev_hash, hash}`. Full access only. |
 | `GET` | `/audit-log/verify` | Recomputes the chain: `{valid, entries, head_hash, first_invalid_id, problem}`. Full access only. |
 
-The log is append-only (the database refuses `UPDATE` and `DELETE` on it) and hash-chained per project: `hash` is SHA-256 of the previous entry's `hash` bytes (32 zero bytes for the first) followed by `entry`, the exact JSON text of the entry. Changing or removing an entry breaks the chain. Keep the `head_hash` from time to time: if it later disappears from the chain, entries were removed from its end. Actions: `api_key.created`, `api_key.updated`, `api_key.revoked`, `domain.created`, `domain.verified`, `domain.unverified`, `domain.deleted`, `domain.expired`, `webhook.created`, `webhook.deleted`, `inbox.created`, `inbox.deleted`.
+The log is append-only (the database refuses `UPDATE` and `DELETE` on it) and hash-chained per project: `hash` is SHA-256 of the previous entry's `hash` bytes (32 zero bytes for the first) followed by `entry`, the exact JSON text of the entry. Changing or removing an entry breaks the chain. Keep the `head_hash` from time to time: if it later disappears from the chain, entries were removed from its end. Actions: `api_key.created`, `api_key.updated`, `api_key.revoked`, `domain.created`, `domain.verified`, `domain.unverified`, `domain.deleted`, `domain.expired`, `webhook.created`, `webhook.deleted`, `inbox.created`, `inbox.deleted`, `dns.applied`, `dns.token_remembered`, `dns.token_forgotten`.
 
 An attempt's `tls` is one of:
 
@@ -508,6 +595,9 @@ Events also show what the control plane learned from an attempt: `throttled` (th
 | `POST` | `/domains/{id}/dkim/rotate` | Rotates the DKIM key in two steps: the first call creates a key under a new selector and answers `202` with the TXT record to publish (`DKIM_NEXT`); call again once it is published and signing switches to it (`200`). The previous record stays listed as `DKIM_PREVIOUS` until its `retire_at`, 8 days later, because mail queued before the switch carries its signature. `409 dkim_record_not_found` until the new record is in DNS. Full access. |
 | `POST` | `/domains/{id}/dkim/ed25519` | `{"enabled": true}`: an Ed25519 key (RFC 8463) in the same two steps (record `DKIM_ED25519`); then mail carries an Ed25519 signature next to the RSA one. `{"enabled": false}` removes it. Full access. |
 | `GET` | `/domains/{id}/reports` | DMARC aggregate and TLS reports the domain received (see [DMARC and TLS reports](#dmarc-and-tls-reports)). `?days=30` (1–180). Full-access keys only. |
+| `POST` | `/domains/{id}/dns/auto` | `{"provider": "cloudflare", "api_token"?, "zone_id"?, "dry_run"?, "remember"?}`: publishes the domain's records at Cloudflare and verifies it (see [Automatic DNS with Cloudflare](#automatic-dns-with-cloudflare)). Without `api_token`, uses the remembered token. Full access. |
+| `GET` | `/domains/{id}/dns/auto` | Whether a token is remembered (never the token), the zone, and the last run. Full access. |
+| `DELETE` | `/domains/{id}/dns/auto` | Forgets the remembered token; published records stay. Full access. |
 
 The records you publish:
 
@@ -767,17 +857,7 @@ OMW_TLS_CERT=/etc/ssl/mx.crt OMW_TLS_KEY=/etc/ssl/mx.key \
 
 Then point the MX records at it: the return-path domains through `OMW_BOUNCE_MX` and inbox domains through `OMW_INBOUND_MX` (see [docs/production.md](docs/production.md#6-inbound-mail-mx-bounces-and-complaints)).
 
-To try it locally with the [quick start](#quick-start-local-no-email-leaves-your-machine) setup:
-
-```sh
-bin/openmailwire workers add inbound-1 --role inbound       # inbound nodes use a worker token with the inbound role
-OMW_CONTROL_URL=http://127.0.0.1:8080 OMW_WORKER_TOKEN=omwk_… \
-OMW_INBOUND_LISTEN=127.0.0.1:2526 bin/openmailwire inbound &
-
-curl -X POST localhost:8080/inboxes -H "Authorization: Bearer omw_…" \
-  -H 'Content-Type: application/json' -d '{"address": "agent@example.com"}'
-swaks --server 127.0.0.1:2526 --from you@example.org --to agent@example.com   # any SMTP client works
-curl localhost:8080/inboxes/<inbox id>/messages -H "Authorization: Bearer omw_…"
+To try it locally, with `openmailwire dev-deliver` playing the sender's mail server, see [Receiving mail](#receiving-mail).
 
 ## SDKs
 
@@ -799,6 +879,7 @@ const { id } = await omw.emails.send(
   { idempotencyKey: "welcome-42" },
 );
 const email = await omw.waitForDelivery(id, 120_000); // every recipient final
+```
 
 ## Dashboard
 
@@ -834,7 +915,7 @@ Delivering mail yourself is mostly about IP reputation and DNS hygiene, not code
 
 1. Port 25 must be open outbound. Many clouds block it by default.
 2. Each worker needs a static IPv4, matching reverse DNS (PTR), and a clean blocklist history.
-3. Publish one SPF include listing your workers' IPs and set `OMW_SPF_INCLUDE`.
+3. Publish one SPF include listing your workers' IPs and set `OMW_SPF_INCLUDE`. With `OMW_CLOUDFLARE_TOKEN`, the control plane keeps it up to date at Cloudflare.
 4. Put TLS in front of the control plane, back up PostgreSQL, and back up `OMW_SECRET_KEY` (or `OMW_SECRET_KEYS`) apart from it. See [rotating keys](docs/production.md#rotating-secrets).
 5. Ramp volume up slowly and watch Google Postmaster Tools.
 
@@ -854,6 +935,8 @@ Control plane (`openmailwire serve`):
 | `OMW_TRUSTED_PROXIES` | none | Comma-separated addresses or CIDR prefixes of your reverse proxies. Their `X-Forwarded-For` gives the client's address for `allowed_ips`. |
 | `OMW_PUBLIC_URL` | none | Where recipients and mailbox providers reach the control plane, e.g. `https://mail.example.com`. Broadcast mail needs it for its one-click unsubscribe links (`/u/{token}`); without it, broadcast sends are refused. Use `https`: mailbox providers ignore one-click links over plain `http`. |
 | `OMW_SPF_INCLUDE` | none | e.g. `_spf.mail.example.net`. If unset, SPF records list the workers' IPs. |
+| `OMW_CLOUDFLARE_TOKEN` | none | The operator's Cloudflare API token, with Zone → DNS → Edit on the zone that holds `OMW_SPF_INCLUDE` (and nothing else). The control plane then keeps that TXT record listing the IPs delivery workers announced in the last 7 days (`v=spf1 ip4:… -all`), checking every 5 minutes and writing only when it changes. Never used for customers' domains. Needs `OMW_SPF_INCLUDE`. |
+| `OMW_CLOUDFLARE_API_BASE` | `https://api.cloudflare.com/client/v4` | Cloudflare's API, for automatic DNS. Only for tests (a local fake): plain `http` is accepted only to a loopback address. |
 | `OMW_BOUNCE_MX` | none | Host that receives bounces for the return-path domains: your inbound node. |
 | `OMW_INBOUND_MX` | none | Host that receives mail for inboxes. When set, every domain shows an optional `INBOUND` MX record. |
 | `OMW_FBL_ADDRESS` | none | Address you registered with feedback loops, e.g. `fbl@mail.example.net`. Its domain's MX must point to an inbound node. |
@@ -900,7 +983,7 @@ SMTP submission (`openmailwire submission`):
 | Variable | Default | |
 |---|---|---|
 | `OMW_API_URL` | `http://localhost:8080` | The control plane. Use `https://` when it runs on another machine. |
-| `OMW_TLS_CERT`, `OMW_TLS_KEY` | none (required) | PEM certificate chain and private key. Re-read when the files change, so renewals need no restart. |
+| `OMW_TLS_CERT`, `OMW_TLS_KEY` | none (required) | PEM certificate chain and private key. Re-read when the files change, so renewals need no restart. For local development only, `openmailwire submission --dev-tls` makes a self-signed certificate instead. |
 | `OMW_SUBMISSION_LISTEN` | `:587` | STARTTLS; clients must use it before `AUTH`. |
 | `OMW_SUBMISSION_TLS_LISTEN` | none | e.g. `:465`, for implicit TLS. |
 | `OMW_SUBMISSION_HOSTNAME` | hostname | Announced in the greeting. Use the name on the certificate. |
@@ -942,6 +1025,8 @@ Worker admin:
 - `openmailwire workers list`: each worker's role, kind (`direct` or `relay`), last heartbeat, self-check result, and its IP's warm-up (`day 3, google 120/200 left, …`, or `warm`);
 - `openmailwire workers drain <name>` (stop new jobs, finish current ones) and `openmailwire workers resume <name>`;
 - `openmailwire workers warm <name>` treats the worker's IP as warm (an IP that already has a sending history elsewhere); `--restart` starts its warm-up again.
+
+Operator SPF include (it reads `DATABASE_URL`, `OMW_SPF_INCLUDE` and `OMW_CLOUDFLARE_TOKEN`): `openmailwire dns sync [--dry-run]` publishes it once and prints the difference; the control plane does the same every 5 minutes.
 
 Key rotation (it reads `DATABASE_URL` and `OMW_SECRET_KEYS`): `openmailwire rotate-secrets [--batch N] [--pause 50ms]` re-encrypts every stored secret with the first key, online, in small transactions. It says when the old keys can be removed. See [docs/production.md](docs/production.md#rotating-secrets).
 
