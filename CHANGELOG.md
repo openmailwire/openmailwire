@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Automatic DNS with Cloudflare
+- **`POST /domains/{id}/dns/auto`** `{"provider": "cloudflare", "api_token", "zone_id"?, "dry_run"?, "remember"?}` publishes every record a domain needs at Cloudflare (API v4), then verifies the domain: DKIM (with a key waiting in a rotation, the previous key during its overlap, and Ed25519), the return path's SPF and MX, DMARC, TLS-RPT (`_smtp._tls`), and the `INBOUND` MX when `OMW_INBOUND_MX` is set.
+  - Idempotent (`unchanged`), never proxied, and a `dry_run` writes nothing. The answer lists each record's `action` (`create`, `update`, `unchanged`, `skip`, `delete`), `warnings`, the zone and the checked domain.
+  - It never replaces the owner's mail setup: a domain with MX records elsewhere keeps them (a warning suggests a subdomain such as `agents.example.com` for inboxes), and an existing or inherited DMARC policy is left alone. A DMARC record is created only where there is none (`p=none` with OpenMailWire's `rua`). The return path is OpenMailWire's: a foreign SPF or MX there is replaced, and reported.
+  - Warnings for Cloudflare Email Routing (it owns the apex MX; a 403 there is `unknown`), proxied names and mail hosts, an inactive zone, and DNSSEC.
+  - New errors: `dns_provider_auth_failed` (422), `dns_zone_not_found` (422), `dns_provider_unavailable` (503, with `Retry-After`), `dns_provider_not_connected` (409).
+- **`remember: true`** keeps the token, sealed with `OMW_SECRET_KEYS` (new table `dns_automation`, migration `0012`, resealed by `rotate-secrets`). Then `POST /domains/{id}/dkim/rotate` and `POST /domains/{id}/dkim/ed25519` publish their new record themselves (`dns_auto` in their answer), and the control plane deletes a rotated-out DKIM record once its overlap ends. `GET /domains/{id}/dns/auto` shows whether a token is remembered (never the token) and the last run; `DELETE` forgets it.
+- **MCP tool `setup_domain_dns`** (destructive, full access) runs it with the remembered token only: an agent never handles a DNS token, and without one it is told to ask a person to connect Cloudflare. It supports `dry_run`.
+- Audit log: `dns.applied`, `dns.token_remembered`, `dns.token_forgotten`. The token never appears in answers, logs or the audit log.
+- **Operator SPF include:** with `OMW_CLOUDFLARE_TOKEN` and `OMW_SPF_INCLUDE`, the control plane keeps that TXT record listing the IPs delivery workers announced within 7 days (`v=spf1 ip4:… ip6:… -all`), checking every 5 minutes and writing only when it changes. `openmailwire dns sync [--dry-run]` runs it once and prints the difference.
+- Cloudflare calls have strict timeouts, wait out a 429's `Retry-After` (at most 30 s, a few times) and retry only requests that are safe to repeat. `OMW_CLOUDFLARE_API_BASE` points them elsewhere (tests; `http` only to loopback).
+
+### Sending and receiving locally
+- `docker-compose.yml`: an `inbound` node (profile `inbound`, token `OMW_INBOUND_TOKEN` of role inbound, port 2525 on 127.0.0.1) and SMTP `submission` (profile `submission`, 127.0.0.1:1587) with a self-signed certificate.
+- `openmailwire submission --dev-tls` makes a self-signed certificate for local development.
+- `openmailwire dev-deliver --to <addr>` sends one realistic test message (optional attachments and `--in-reply-to`) to a local inbound node, to try receiving without the internet.
+- `openmailwire dev-sink` now listens on `127.0.0.1:1025` by default, leaving 2525 to a local inbound node. Pass the old address to keep it.
+
+### Upgrading
+- Migration `0012_dns_automation` creates one small table; it runs on start.
+
 ## v0.6.0: security hardening, deliverability, agent safety
 
 This release fixes every problem found in an independent review of v0.5, each with a regression test, and adds the safety and deliverability features below. Read **Upgrading** before you deploy it.
