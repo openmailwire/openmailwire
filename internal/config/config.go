@@ -62,6 +62,11 @@ type Control struct {
 	// complaint reports count even when they name the email only by its
 	// Message-ID (a report that carries the VERP address needs no
 	// signature). A signing domain matches an entry or a subdomain of it.
+	// OperatorProjects (OMW_OPERATOR_PROJECTS, comma-separated project ids)
+	// see the installation's workers in detail in GET /overview. Empty: the
+	// only project of a single-tenant install does; on a multi-tenant
+	// install every project sees them without names, addresses or versions.
+	OperatorProjects  []string
 	FBLTrustedDomains []string
 	// PostmasterInbox, when set, is an inbox address that receives mail
 	// for postmaster@ and abuse@ on every domain the inbound nodes serve.
@@ -173,6 +178,11 @@ func LoadControl() (Control, error) {
 	}
 	if c.Warmup, err = envBool("OMW_WARMUP", true); err != nil {
 		return c, err
+	}
+	for _, id := range strings.Split(os.Getenv("OMW_OPERATOR_PROJECTS"), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			c.OperatorProjects = append(c.OperatorProjects, id)
+		}
 	}
 	if c.FBLTrustedDomains, err = domainList("OMW_FBL_TRUSTED_DOMAINS", DefaultFBLTrustedDomains); err != nil {
 		return c, err

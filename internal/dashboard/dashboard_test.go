@@ -76,6 +76,12 @@ func TestAssets(t *testing.T) {
 	cases := map[string]string{
 		"/dashboard/app.js":        "text/javascript; charset=utf-8",
 		"/dashboard/lib.js":        "text/javascript; charset=utf-8",
+		"/dashboard/ui.js":         "text/javascript; charset=utf-8",
+		"/dashboard/ops.js":        "text/javascript; charset=utf-8",
+		"/dashboard/domains.js":    "text/javascript; charset=utf-8",
+		"/dashboard/home.js":       "text/javascript; charset=utf-8",
+		"/dashboard/compose.js":    "text/javascript; charset=utf-8",
+		"/dashboard/mail.js":       "text/javascript; charset=utf-8",
 		"/dashboard/styles.css":    "text/css; charset=utf-8",
 		"/dashboard/logo.svg":      "image/svg+xml",
 		"/dashboard/logo-dark.svg": "image/svg+xml",
@@ -130,5 +136,35 @@ func TestNotFoundAndMethods(t *testing.T) {
 	head := get(t, http.MethodHead, "/dashboard/", nil)
 	if head.StatusCode != http.StatusOK || body(t, head) != "" {
 		t.Errorf("HEAD: status %d", head.StatusCode)
+	}
+}
+
+// Every module app.js imports, directly or not, must be served: a missing
+// one would leave the page blank.
+func TestModulesServed(t *testing.T) {
+	importRE := regexp.MustCompile(`(?m)^\s*import\b[^'"]*['"]\./([\w-]+\.js)['"]`)
+	seen := map[string]bool{"app.js": true}
+	queue := []string{"app.js"}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		res := get(t, http.MethodGet, "/dashboard/"+name, nil)
+		if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "text/javascript; charset=utf-8" {
+			t.Fatalf("%s: status %d, %q", name, res.StatusCode, res.Header.Get("Content-Type"))
+		}
+		for _, m := range importRE.FindAllStringSubmatch(body(t, res), -1) {
+			if !seen[m[1]] {
+				seen[m[1]] = true
+				queue = append(queue, m[1])
+			}
+		}
+	}
+	for name := range assets {
+		if strings.HasSuffix(name, ".js") && !seen[name] {
+			t.Errorf("%s is embedded but no module imports it", name)
+		}
+	}
+	if len(seen) < 8 {
+		t.Errorf("only %d modules reachable: %v", len(seen), seen)
 	}
 }

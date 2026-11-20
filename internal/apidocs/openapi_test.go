@@ -56,6 +56,7 @@ var publicRoutes = []route{
 	{"DELETE", "/webhooks/{id}", full},
 	{"POST", "/webhooks/{id}/rotate-secret", full},
 	{"GET", "/insights", full},
+	{"GET", "/overview", full},
 
 	{"GET", "/api-keys", full},
 	{"POST", "/api-keys", full},

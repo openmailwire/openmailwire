@@ -186,7 +186,7 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - Signed webhooks, verifiable by handlers written for Resend, and optionally with Ed25519 (Standard Webhooks `v1a`) against a published public key. Secrets rotate with an overlap in which both signatures are sent. Webhooks are retried for about a day, fairly across projects and endpoints, with a circuit breaker per endpoint, and blocked from internal networks.
 - `GET /insights`: acceptance, deferral and bounce rates and time to acceptance, per mailbox provider and per sending IP, over 24 hours, 7 days and 30 days.
 - Message bodies, DKIM keys and webhook secrets are encrypted at rest (AES-256-GCM). Keys rotate online (`OMW_SECRET_KEYS`, `openmailwire rotate-secrets`), and the control plane refuses to start with a key that doesn't match the data. Bodies are purged after the retention window.
-- A web dashboard at `/dashboard/`: emails with per-recipient timelines, domains and their DNS records, webhooks, API keys and inboxes. No build step and no third-party requests.
+- A web dashboard at `/dashboard/` to send and receive, and to run the whole system: an overview with a setup checklist, Compose and Mail, approvals, suppressions, pauses, insights, the audit log, DKIM rotation and DNS setup with Cloudflare. No build step and no third-party requests.
 - `GET /openapi.json` (OpenAPI 3.1) and `GET /llms.txt` (a guide for models), served without a key.
 - One static binary, `openmailwire`, plays every role: `serve`, `worker`, `submission` or `inbound`.
 - SDKs for Node.js/TypeScript, Python, Go and PHP ([`sdks/`](sdks)), MIT licensed.
@@ -464,6 +464,8 @@ Returns `{"data": [{"id"}, …]}` in the same order. An `Idempotency-Key` on the
 ### `GET /emails`
 
 `GET /emails?limit=20&before=<email id>&api_key_id=<key id>` lists emails newest first: `{"object": "list", "data": [{id, from, to, subject, created_at, scheduled_at, last_event, api_key_id}], "has_more", "next_before"}`. Pass `next_before` as `before` to get the next page. `limit` is 1 to 100. A sending-only key lists only its own emails.
+
+`?thread_id=<id>` lists only the emails of one conversation: the email with that id, and the replies sent with `POST /messages/{id}/reply` in its thread (a received message's `thread_id`). The answer then echoes `"thread_id"`.
 ### `POST /emails/raw`
 
 Sends a complete RFC 5322 message that you built yourself, for example with your language's MIME library. Use it for structures `POST /emails` does not cover, or to move existing code that already writes MIME. The SMTP submission server uses it too.
@@ -685,6 +687,33 @@ Delivery:
 - Providers are recognised by the MX host each attempt talked to (`google`, `microsoft`, `yahoo`, `apple`, `zoho`, `proton`, `fastmail` and more; else `other`).
 - At most the newest 100,000 emails of the last 30 days are read; `truncated` says when the longer windows cover fewer.
 
+### Overview
+
+`GET /overview` (full access) is the state of the whole system in one cheap call, for dashboards and for an agent that checks on things:
+
+```json
+{"object": "overview", "generated_at": "2026-11-20T10:00:00Z",
+ "queue": {"queued": 4, "scheduled": 1, "sending": 0, "deferred": 2, "held": 3,
+           "oldest_queued_at": "2026-11-20T09:52:10Z", "oldest_age_seconds": 470},
+ "sending": {"truncated": false,
+   "windows": [{"window": "24h", "emails": 120, "recipients": 150, "delivered": 141, "bounced": 3, "complained": 0, "suppressed": 1,
+                "delivery_rate": 0.94, "bounce_rate": 0.02, "complaint_rate": 0}, {"window": "7d", …}],
+   "daily": [{"day": "2026-11-14", "recipients": 20, "delivered": 19, "bounced": 1, "complained": 0}, …]},
+ "held_emails": 3, "active_pauses": 0,
+ "domains": [{"id": "…", "name": "acme.com", "status": "verified", "claim_expires_at": null, "dmarc": "verified",
+              "inbound": "missing", "inboxes": 2, "dkim_rotation": "idle", "ed25519": "off", "auth_issues": 0,
+              "problems": ["Inbound MX record not found: its inboxes receive no mail"]}],
+ "receiving": {"enabled": true, "inbound_mx": "mx.mail.example.net", "inboxes": 2, "messages_24h": 14, "held_messages": 1},
+ "workers": [{"name": "w1", "kind": "direct", "role": "delivery", "ip": "203.0.113.7", "version": "0.6.0", "draining": false,
+              "last_seen_at": "…", "online": true, "self_check": {"ok": true, "problems": []},
+              "warmup": {"enabled": true, "started": true, "warm": false, "day": 3, "remaining": 1500, "cap": 2000, "providers": […]}}]}
+```
+
+- `queue` counts this project's recipients that are not final yet. `queued` is due now; mail waiting for its `scheduled_at` is `scheduled`. `oldest_age_seconds` is how long the oldest queued, deferred or sending recipient has waited.
+- `sending` counts the emails created in the last 24 hours and 7 days (at most the newest 100,000; `truncated` says when). Every rate is out of `recipients`, and is `null` when there were none. `daily` is the last 7 UTC days, oldest first.
+- `domains[].problems` says in words what needs doing; `dmarc` and `inbound` are the stored record statuses, `inbound` is `null` when the server does not receive mail (`OMW_INBOUND_MX` unset).
+- `workers` is server-wide. `online` means a heartbeat in the last 2 minutes. `warmup` is `null` for inbound nodes, relays and workers without an IP.
+
 ### Agent safety
 
 Every rule here is enforced by the server, on every path that sends: `POST /emails`, batches, `POST /emails/raw` (and so SMTP submission), inbox replies and MCP.
@@ -829,6 +858,17 @@ The return-path domain shares `example.com`'s organizational domain, so reporter
 - `tls`: successful and failed sessions per reporter and policy, and each failure (`result_type` such as `certificate-expired`, the sending and receiving hosts);
 - `reports`: the 50 most recent reports.
 
+## Receiving mail
+
+To give an agent an inbox that receives mail from the internet:
+
+1. **Run an inbound node.** `openmailwire inbound` on a host that accepts port 25, with a worker token of the inbound role (`openmailwire workers add inbound-1 --role inbound`). See [Inbound mail](#inbound-mail) below.
+2. **Tell the control plane about it.** Set `OMW_INBOUND_MX` to the node's host name. Each domain then lists an `INBOUND` MX record: publish it, and verify the domain (`POST /domains/{id}/verify`, or Verify on the domain's page in the dashboard).
+3. **Create an inbox** on the domain: `POST /inboxes` with `{"address": "agent@example.com"}`, or the dashboard's Inboxes page.
+4. **Send it a message**, from Gmail or any mail client, and read it with `GET /inboxes/{id}/messages`, the MCP tools, or the dashboard's Mail page. Unauthenticated mail is held from agent keys until a full-access key releases it.
+
+Agent keys (`sending_access`) read only the inboxes their policy's `inboxes` lists.
+
 ## Inbound mail
 
 `openmailwire inbound` is an SMTP server for mail from the internet. It is stateless: for every `RCPT TO` it asks the control plane whether the address exists, and it acknowledges a message only after the control plane has stored it. Unknown addresses are refused with `550 5.1.1` during the SMTP conversation, so OpenMailWire never sends bounces of its own (no backscatter). Inbound nodes authenticate with a worker token.
@@ -883,23 +923,36 @@ const email = await omw.waitForDelivery(id, 120_000); // every recipient final
 
 ## Dashboard
 
-Every control plane serves a web dashboard at **`/dashboard/`** (for example `http://localhost:8080/dashboard/`). Sign in by pasting an API key.
+Every control plane serves a web dashboard at **`/dashboard/`** (for example `http://localhost:8080/dashboard/`). Sign in by pasting an API key. It sends and receives mail, and runs the rest of the system.
 
 | Page | What you can do |
 |---|---|
-| Emails | List sent emails (newest first, "Load more"), open one by ID, and send a test email. An email shows each recipient's status and a timeline of every attempt (worker, source IP, MX host, TLS, the receiver's SMTP reply) and event. It refreshes itself every 5 s until every recipient has a final status. |
-| Domains | Add a domain, copy each DNS record, and verify it against live DNS. |
-| Webhooks | Create one (its signing secret is shown once, with a copy button), delete it, and see its 20 most recent deliveries. |
-| API keys | Create keys with full or sending-only access, hourly and daily caps, and recipient and sender allowlists. The token is shown once. Revoke keys. Needs a full-access key. |
-| Inboxes | Add inboxes, read messages, follow a thread, download attachments, and reply. |
+| Overview | The whole system at a glance, refreshed live: sent, delivered, bounce and complaint rates for 24 hours and 7 days with a daily trend, the queue and the age of its oldest recipient, held emails, active pauses, domains needing attention, receiving, workers (state, self-check, warm-up) and recent emails. Every tile links to its page. A new project gets a setup checklist for sending (domain, DNS records with copy buttons, verify, agent key, test email) and receiving (inbound MX record, inbox, first message); it can be hidden. Needs a full-access key (`GET /overview`). |
+| Compose | Write an email: From on a verified domain with a display name, To, Cc, Bcc and Reply-To as address chips, subject, text and HTML with a live preview, attachments (20 files, 10 MB), stream, send time, give-up time, and an automatic idempotency key. **Check** shows what Send would do (send, hold or refuse, with warnings) without sending. Send opens the email's timeline. |
+| Mail | Every inbox the key may read in one list, newest first, live: filter by inbox, sender verdict, held and suspicious, search, and see what is new since your last visit. A message opens as a thread with your sent replies in order; reply inline (the reply's recipients and warnings are shown), release held mail, download attachments. |
+| Held | Emails waiting for approval with the rules that held them and their text: approve or reject, with a note. A key cannot approve its own email; the page says so. |
+| Emails | Search and filter loaded emails by text, status, recipient domain and dates; open one by ID. An email shows each recipient's progress (queued, each attempt, final status) and a timeline of every attempt (worker, source IP, MX host, TLS, the receiver's SMTP reply), refreshed live while anything is in flight. Held emails can be approved or rejected there. |
+| Suppressions | Filter, page, add (address, stream, reason), remove, and export as CSV. |
+| Pauses | Circuit breakers in force and resumed, with the rate, the limit and the counts; resume one. |
+| Domains | Add a domain, copy each DNS record (DMARC is required), verify, and see when an unverified claim expires. **Set up DNS with Cloudflare** previews and writes the records with an API token, and can remember it (encrypted, on the server) for DKIM rotations. DKIM keys with the two-step rotation and the Ed25519 switch, the report addresses to publish, and the DMARC and TLS-RPT report summary. |
+| Inboxes | Add and delete inboxes, hold or show unauthenticated mail per inbox, read messages with the sender verdict (SPF, DKIM, DMARC), flags for text aimed at agents, and release held mail. |
+| Webhooks | Create one (optionally signed with Ed25519 too; the secret is shown once), see its public key and its circuit breaker, rotate its secret with an overlap, and see its 20 most recent deliveries. |
+| API keys | Create and edit keys: permission, hourly and daily caps, recipient and sender allowlists, approval rules, `can_approve`, readable inboxes, allowed IPs and expiry. The token is shown once. Revoke keys. |
+| Settings | The per-recipient daily cap and the circuit breaker limits. |
+| Insights | Acceptance, deferral and bounce rates and time to acceptance per mailbox provider and per sending IP, for 24 hours, 7 days and 30 days, as tables with small bars. |
+| Audit log | Every administrative change with its actor, and a button that verifies the hash chain. |
 
-When the server is older than a page (for example API keys before v0.4), the page says "Not available on this server version". When the key lacks the permission, it says "This key can't manage …".
+Keyboard: `/` searches the page, `?` lists the shortcuts, and `g` then a letter goes to a page (`g o` overview, `g c` compose, `g m` mail, `g e` emails, `g h` held, `g d` domains, `g i` insights, and more). Destructive actions ask in a dialog first, and finished actions show a short notice.
+
+When the server is older than a page, the page says "Not available on this server version". When the key lacks the permission, it says "This key can't manage …" or "can't see …".
 
 **How it keeps the key safe.** The browser holds an API key, so the dashboard is built to be boring to attack:
-- The key is kept in `sessionStorage` only: it is gone when the tab closes, and never sent anywhere but the same-origin API, as `Authorization: Bearer`. No cookies, so no CSRF.
+- The key is kept in `sessionStorage` only: it is gone when the tab closes, and never sent anywhere but the same-origin API, as `Authorization: Bearer`. No cookies, so no CSRF. `localStorage` holds only a few non-secret settings (a hidden checklist, when Mail was last read).
 - Every dashboard response carries `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`, plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. The page itself is `Cache-Control: no-store`.
 - There is no inline script or style, no framework, no CDN and no third-party request. The files are embedded in the binary (`internal/dashboard/static`).
-- Subjects, addresses, SMTP replies, webhook URLs and inbound mail are attacker-controlled. They are only ever inserted as text, never as HTML. Inbound HTML mail is shown as source, never rendered, and attachments always download. A test (`internal/dashboard/tests`) fails if `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` appears in the scripts.
+- Subjects, addresses, SMTP replies, webhook URLs, inbound mail and DMARC reports are attacker-controlled. They are only ever inserted as text, never as HTML, and what a sender wrote is visibly marked as sender-provided. Inbound HTML mail is shown as source, never rendered, and attachments always download. A test (`internal/dashboard/tests`) fails if `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` appears in the scripts.
+- The only HTML ever rendered is what you type in Compose, in an `<iframe sandbox="">` with no permissions: no scripts, no same origin, no forms. It also inherits the page's CSP, so it loads no remote images and applies no inline styles.
+- A Cloudflare token is typed into a password field, sent only in the body of one request, cleared afterwards, and never stored in the browser or put in a URL.
 
 Serve the control plane over HTTPS when the dashboard is used from another machine: the key travels with every request.
 
@@ -934,6 +987,7 @@ Control plane (`openmailwire serve`):
 | `OMW_MAX_LARGE_REQUESTS` | `4` | Requests with a body over 1 MB handled at once. More wait up to 30 seconds, then get `503 server_busy`. |
 | `OMW_TRUSTED_PROXIES` | none | Comma-separated addresses or CIDR prefixes of your reverse proxies. Their `X-Forwarded-For` gives the client's address for `allowed_ips`. |
 | `OMW_PUBLIC_URL` | none | Where recipients and mailbox providers reach the control plane, e.g. `https://mail.example.com`. Broadcast mail needs it for its one-click unsubscribe links (`/u/{token}`); without it, broadcast sends are refused. Use `https`: mailbox providers ignore one-click links over plain `http`. |
+| `OMW_OPERATOR_PROJECTS` | none | Comma-separated project ids that see the installation's workers in detail (names, addresses, versions, self-check problems) in `GET /overview`. When unset, the only project of a single-tenant install sees them; on a multi-tenant install every project sees worker health without those details. |
 | `OMW_SPF_INCLUDE` | none | e.g. `_spf.mail.example.net`. If unset, SPF records list the workers' IPs. |
 | `OMW_CLOUDFLARE_TOKEN` | none | The operator's Cloudflare API token, with Zone → DNS → Edit on the zone that holds `OMW_SPF_INCLUDE` (and nothing else). The control plane then keeps that TXT record listing the IPs delivery workers announced in the last 7 days (`v=spf1 ip4:… -all`), checking every 5 minutes and writing only when it changes. Never used for customers' domains. Needs `OMW_SPF_INCLUDE`. |
 | `OMW_CLOUDFLARE_API_BASE` | `https://api.cloudflare.com/client/v4` | Cloudflare's API, for automatic DNS. Only for tests (a local fake): plain `http` is accepted only to a loopback address. |

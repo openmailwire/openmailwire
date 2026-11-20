@@ -208,7 +208,10 @@ type ListEmailsQuery struct {
 	ProjectID string
 	APIKeyID  string // only emails queued by this key, when set
 	Before    string // an email id: only emails older than it
-	Limit     int
+	// ThreadID keeps the emails of one conversation: the email with that
+	// id, and the replies linked to the thread (email_threads).
+	ThreadID string
+	Limit    int
 }
 
 // ListEmails returns one page and whether more follow. ErrNotFound when
@@ -219,6 +222,11 @@ func (s *Store) ListEmails(ctx context.Context, q ListEmailsQuery) ([]EmailSumma
 	if q.APIKeyID != "" {
 		args = append(args, q.APIKeyID)
 		where += fmt.Sprintf(` AND e.api_key_id = $%d`, len(args))
+	}
+	if q.ThreadID != "" {
+		args = append(args, q.ThreadID)
+		where += fmt.Sprintf(` AND (e.id = $%d::uuid OR e.id IN (SELECT email_id FROM email_threads WHERE thread_id = $%d::uuid))`,
+			len(args), len(args))
 	}
 	if q.Before != "" {
 		var at time.Time

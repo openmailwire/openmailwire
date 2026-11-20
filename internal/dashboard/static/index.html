@@ -15,27 +15,65 @@
 
 <header class="topbar" id="topbar" hidden>
   <div class="topbar-inner">
-    <a class="brand" href="#/emails">
+    <a class="brand" href="#/overview">
       <img src="logo-dark.svg" alt="" width="28" height="28">
       <span>OpenMailWire</span>
     </a>
-    <nav class="nav" aria-label="Main">
-      <ul>
-        <li><a href="#/emails" data-nav="emails">Emails</a></li>
-        <li><a href="#/domains" data-nav="domains">Domains</a></li>
-        <li><a href="#/webhooks" data-nav="webhooks">Webhooks</a></li>
-        <li><a href="#/api-keys" data-nav="api-keys">API keys</a></li>
-        <li><a href="#/inboxes" data-nav="inboxes">Inboxes</a></li>
-      </ul>
-    </nav>
     <div class="session">
+      <button type="button" class="btn btn-ghost btn-icon" id="shortcuts-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
       <span class="key-chip mono" id="key-chip" title="The API key this tab is signed in with"></span>
       <button type="button" class="btn btn-ghost" id="sign-out">Sign out</button>
     </div>
+    <button type="button" class="btn btn-ghost menu-btn" id="menu-btn" aria-expanded="false" aria-controls="nav">
+      Menu <span class="nav-count nav-count-warn" data-held-count hidden></span>
+    </button>
   </div>
 </header>
 
-<main id="main" class="main" tabindex="-1" hidden></main>
+<div class="shell" id="shell" hidden>
+  <nav class="nav" id="nav" aria-label="Main">
+    <div class="nav-group">
+      <ul aria-label="Home">
+        <li><a href="#/overview" data-nav="overview">Overview</a></li>
+      </ul>
+    </div>
+    <div class="nav-group">
+      <p class="nav-label" id="nav-mail">Mail</p>
+      <ul aria-labelledby="nav-mail">
+        <li><a href="#/compose" data-nav="compose">Compose</a></li>
+        <li><a href="#/mail" data-nav="mail">Mail <span class="nav-count" data-mail-count hidden></span></a></li>
+        <li><a href="#/held" data-nav="held">Held <span class="nav-count nav-count-warn" data-held-count hidden></span></a></li>
+      </ul>
+    </div>
+    <div class="nav-group">
+      <p class="nav-label" id="nav-sending">Sending</p>
+      <ul aria-labelledby="nav-sending">
+        <li><a href="#/emails" data-nav="emails">Emails</a></li>
+        <li><a href="#/suppressions" data-nav="suppressions">Suppressions</a></li>
+        <li><a href="#/pauses" data-nav="pauses">Pauses</a></li>
+      </ul>
+    </div>
+    <div class="nav-group">
+      <p class="nav-label" id="nav-setup">Setup</p>
+      <ul aria-labelledby="nav-setup">
+        <li><a href="#/domains" data-nav="domains">Domains</a></li>
+        <li><a href="#/inboxes" data-nav="inboxes">Inboxes</a></li>
+        <li><a href="#/webhooks" data-nav="webhooks">Webhooks</a></li>
+        <li><a href="#/api-keys" data-nav="api-keys">API keys</a></li>
+        <li><a href="#/settings" data-nav="settings">Settings</a></li>
+      </ul>
+    </div>
+    <div class="nav-group">
+      <p class="nav-label" id="nav-watch">Monitoring</p>
+      <ul aria-labelledby="nav-watch">
+        <li><a href="#/insights" data-nav="insights">Insights</a></li>
+        <li><a href="#/audit-log" data-nav="audit-log">Audit log</a></li>
+      </ul>
+    </div>
+    <p class="nav-hint"><kbd>?</kbd> shortcuts</p>
+  </nav>
+  <main id="main" class="main" tabindex="-1"></main>
+</div>
 
 <section id="signin" class="signin" aria-labelledby="signin-title" hidden>
   <div class="signin-card">
@@ -64,6 +102,7 @@
 </footer>
 
 <div id="live" class="sr-only" aria-live="polite"></div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 <noscript><p class="noscript">The OpenMailWire dashboard needs JavaScript.</p></noscript>
 </body>
 </html>
