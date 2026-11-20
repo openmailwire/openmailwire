@@ -558,7 +558,11 @@ func (s *Server) listEmails(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	before, keyID := q.Get("before"), q.Get("api_key_id")
+	before, keyID, thread := q.Get("before"), q.Get("api_key_id"), q.Get("thread_id")
+	if thread != "" && !validID(thread) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "thread_id must be a thread id, as a message's thread_id")
+		return
+	}
 	if before != "" && !validID(before) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "before must be an email id, as next_before returns")
 		return
@@ -576,7 +580,7 @@ func (s *Server) listEmails(w http.ResponseWriter, r *http.Request) {
 		keyID = own
 	}
 	list, more, err := s.Store.ListEmails(r.Context(), store.ListEmailsQuery{
-		ProjectID: projectID(r), APIKeyID: keyID, Before: before, Limit: limit,
+		ProjectID: projectID(r), APIKeyID: keyID, Before: before, ThreadID: thread, Limit: limit,
 	})
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error",
@@ -591,7 +595,13 @@ func (s *Server) listEmails(w http.ResponseWriter, r *http.Request) {
 	if more {
 		next = &list[len(list)-1].ID
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": list, "has_more": more, "next_before": next})
+	out := map[string]any{"object": "list", "data": list, "has_more": more, "next_before": next}
+	if thread != "" {
+		// Echoed, so a client can tell the filter was applied: a server
+		// without it ignores the parameter and lists every email.
+		out["thread_id"] = thread
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // cancelEmail cancels the recipients of an email that have not been

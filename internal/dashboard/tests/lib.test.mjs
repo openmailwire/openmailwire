@@ -243,8 +243,10 @@ test('classifyError', () => {
 });
 
 test('parseRoute', () => {
-  assert.deepEqual(L.parseRoute(''), { page: 'emails', id: '' });
-  assert.deepEqual(L.parseRoute('#/'), { page: 'emails', id: '' });
+  assert.deepEqual(L.parseRoute(''), { page: 'overview', id: '' });
+  assert.deepEqual(L.parseRoute('#/'), { page: 'overview', id: '' });
+  assert.deepEqual(L.parseRoute('#/compose'), { page: 'compose', id: '' });
+  assert.deepEqual(L.parseRoute('#/mail'), { page: 'mail', id: '' });
   assert.deepEqual(L.parseRoute('#/domains'), { page: 'domains', id: '' });
   assert.deepEqual(L.parseRoute('#/emails/ed01a077-1c2b-4d3e-8f90-a1b2c3d4e5f6'), { page: 'emails', id: 'ed01a077-1c2b-4d3e-8f90-a1b2c3d4e5f6' });
   assert.deepEqual(L.parseRoute('#/api-keys/'), { page: 'api-keys', id: '' });
@@ -270,5 +272,323 @@ test('webhook event types include the server types', () => {
   const types = L.WEBHOOK_EVENTS.map(([t]) => t);
   for (const t of ['email.sent', 'email.delivered', 'email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.delivery_unknown']) {
     assert.ok(types.includes(t), t);
+  }
+});
+
+// ---- v0.6 ----
+
+test('held and rejected statuses', () => {
+  assert.equal(L.statusTone('held'), 'warn');
+  assert.equal(L.statusLabel('held'), 'Held for approval');
+  assert.equal(L.statusLabel('email.held'), 'Held for approval');
+  assert.equal(L.statusTone('rejected'), 'bad');
+  assert.ok(L.isFinal('rejected'));
+  assert.ok(!L.isFinal('held'));
+  const held = { recipients: [{ email: 'a@x.com', status: 'held' }, { email: 'b@y.com', status: 'delivered' }] };
+  assert.ok(L.isPending(held));
+  assert.ok(!L.isMoving(held), 'held mail waits for a person, so it is not polled');
+  assert.ok(L.isMoving({ recipients: [{ status: 'held' }, { status: 'deferred' }] }));
+  assert.deepEqual(L.heldRecipients(held), ['a@x.com']);
+  assert.deepEqual(L.heldRecipients({}), []);
+});
+
+test('parseRoute knows the v0.6 pages', () => {
+  for (const p of ['held', 'suppressions', 'pauses', 'settings', 'insights', 'audit-log']) {
+    assert.deepEqual(L.parseRoute(`#/${p}`), { page: p, id: '' }, p);
+  }
+  assert.deepEqual(L.parseRoute('#/api-keys/6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'), { page: 'api-keys', id: '6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d' });
+});
+
+test('classifyError: v0.6 refusals', () => {
+  const own = L.classifyError({ status: 403, code: 'cannot_approve_own_email', message: 'an API key cannot approve the emails it sent itself' });
+  assert.equal(own.kind, 'own');
+  assert.match(own.title, /your own email/);
+  assert.match(own.detail, /another key that has can_approve/);
+  const paused = L.classifyError({ status: 403, code: 'sending_paused', message: 'sending is paused for this key' });
+  assert.equal(paused.kind, 'paused');
+  assert.equal(paused.detail, 'sending is paused for this key');
+  assert.equal(L.classifyError({ status: 403, code: 'ip_not_allowed' }).title, 'Not allowed from this address');
+  assert.match(L.classifyError({ status: 401, code: 'api_key_expired' }).detail, /expired/);
+  assert.equal(L.classifyError({ status: 409, code: 'not_held', message: 'x' }).title, 'Already decided');
+  assert.equal(L.classifyError({ status: 409, code: 'dkim_record_not_found', message: 'x' }).title, 'The DNS record is not published yet');
+  assert.equal(L.classifyError({ status: 409, code: 'not_paused' }).title, 'Already resumed');
+  const see = L.classifyError({ status: 403, code: 'insufficient_permission' }, 'insights', 'see');
+  assert.equal(see.title, "This key can't see insights");
+  assert.match(see.detail, /to see insights/);
+});
+
+test('webhook events include the v0.6 types', () => {
+  const types = L.WEBHOOK_EVENTS.map(([t]) => t);
+  for (const t of ['email.held', 'email.approved', 'email.rejected', 'sending.paused']) assert.ok(types.includes(t), t);
+});
+
+test('formatRate', () => {
+  assert.equal(L.formatRate(0.966), '96.6%');
+  assert.equal(L.formatRate(1), '100%');
+  assert.equal(L.formatRate(0.05), '5%');
+  assert.equal(L.formatRate(0.075), '7.5%');
+  assert.equal(L.formatRate(0.001), '0.1%');
+  assert.equal(L.formatRate(0.0007), '0.07%');
+  assert.equal(L.formatRate(0.00123), '0.12%');
+  assert.equal(L.formatRate(0), '0%');
+  assert.equal(L.formatRate(null), '—');
+  assert.equal(L.formatRate(undefined), '—');
+  assert.equal(L.formatRate('x'), '—');
+});
+
+test('formatSeconds', () => {
+  assert.equal(L.formatSeconds(2.1), '2.1 s');
+  assert.equal(L.formatSeconds(0.35), '350 ms');
+  assert.equal(L.formatSeconds(64.8), '1 min 5 s');
+  assert.equal(L.formatSeconds(0), '0 ms');
+  assert.equal(L.formatSeconds(null), '—');
+});
+
+test('percent inputs', () => {
+  assert.equal(L.percentInput(0.05), '5');
+  assert.equal(L.percentInput(0.001), '0.1');
+  assert.equal(L.percentInput(0.0035), '0.35');
+  assert.equal(L.percentInput(null), '');
+  assert.equal(L.parsePercent('5', 'x'), 0.05);
+  assert.equal(L.parsePercent(' 0.1 %', 'x'), 0.001);
+  assert.equal(L.parsePercent('100', 'x'), 1);
+  assert.equal(L.parsePercent(L.percentInput(0.003), 'x'), 0.003);
+  for (const bad of ['0', '', '-1', '101', 'abc', '1e-3']) {
+    assert.throws(() => L.parsePercent(bad, 'Bounce rate'), /Bounce rate must be a percentage/, bad);
+  }
+});
+
+test('projectPatch sends only what changed', () => {
+  const cur = {
+    max_per_recipient_per_day: null,
+    circuit_breaker: { enabled: true, bounce_rate: 0.05, complaint_rate: 0.001, min_recipients: 50 },
+  };
+  const same = { maxPerRecipientPerDay: '', enabled: true, bounceRate: '5', complaintRate: '0.1', minRecipients: '50' };
+  assert.deepEqual(L.projectPatch(cur, same), {});
+  assert.deepEqual(L.projectPatch(cur, { ...same, maxPerRecipientPerDay: '3' }), { max_per_recipient_per_day: 3 });
+  assert.deepEqual(L.projectPatch({ ...cur, max_per_recipient_per_day: 3 }, same), { max_per_recipient_per_day: null });
+  assert.deepEqual(L.projectPatch(cur, { ...same, bounceRate: '3', enabled: false, minRecipients: '100' }),
+    { circuit_breaker: { enabled: false, bounce_rate: 0.03, min_recipients: 100 } });
+  assert.deepEqual(L.projectPatch(cur, { ...same, complaintRate: '0.05' }), { circuit_breaker: { complaint_rate: 0.0005 } });
+  assert.throws(() => L.projectPatch(cur, { ...same, maxPerRecipientPerDay: '0' }), /Emails per recipient per day must be a whole number from 1 to 10,000/);
+  assert.throws(() => L.projectPatch(cur, { ...same, maxPerRecipientPerDay: '10001' }), /per recipient/);
+  assert.throws(() => L.projectPatch(cur, { ...same, minRecipients: '' }), /Minimum recipients/);
+  assert.throws(() => L.projectPatch(cur, { ...same, bounceRate: '0' }), /Bounce rate/);
+});
+
+test('buildPolicy: approval, can_approve and inboxes', () => {
+  assert.deepEqual(L.buildPolicy({ requireApproval: {}, canApprove: false, inboxes: '' }), {});
+  assert.deepEqual(L.buildPolicy({
+    requireApproval: { always: false, firstContact: true, hasAttachments: true, hasLinks: false, recipientsOver: '10' },
+    canApprove: true,
+    inboxes: 'Support@Acme.com\n*@agents.acme.com',
+  }), {
+    require_approval: { first_contact: true, has_attachments: true, recipients_over: 10 },
+    can_approve: true,
+    inboxes: ['support@acme.com', '*@agents.acme.com'],
+  });
+  // 0 is a real value: hold every email with more than 0 recipients.
+  assert.deepEqual(L.buildPolicy({ requireApproval: { recipientsOver: '0' } }), { require_approval: { recipients_over: 0 } });
+  assert.throws(() => L.buildPolicy({ requireApproval: { recipientsOver: '1001' } }), /recipients are over must be a whole number from 0 to 1,000/);
+  assert.throws(() => L.buildPolicy({ requireApproval: { recipientsOver: '-1' } }), /recipients are over/);
+  assert.throws(() => L.buildPolicy({ inboxes: 'support' }), /Inboxes: "support" is not an address pattern/);
+});
+
+test('policyForm is the inverse of buildPolicy', () => {
+  const policy = {
+    max_per_hour: 100, allowed_recipients: ['*@acme.com', 'ops@example.org'],
+    require_approval: { always: true, recipients_over: 0 }, can_approve: true, inboxes: ['support@acme.com'],
+  };
+  const v = L.policyForm(policy);
+  assert.equal(v.maxPerHour, '100');
+  assert.equal(v.maxPerDay, '');
+  assert.equal(v.allowedRecipients, '*@acme.com\nops@example.org');
+  assert.deepEqual(v.requireApproval, { always: true, firstContact: false, hasAttachments: false, hasLinks: false, recipientsOver: '0' });
+  assert.equal(v.canApprove, true);
+  assert.deepEqual(L.buildPolicy(v), policy);
+  assert.deepEqual(L.buildPolicy(L.policyForm(null)), {});
+});
+
+test('policySummary: v0.6 fields', () => {
+  assert.deepEqual(L.policySummary({ require_approval: { first_contact: true, has_links: true, recipients_over: 5 }, can_approve: true, inboxes: ['a@x.com'] }),
+    ['holds: first contact, links, over 5 recipients', 'can approve', 'inboxes a@x.com']);
+  assert.deepEqual(L.policySummary({ require_approval: { always: true } }), ['holds: every email']);
+  assert.equal(L.holdReasonLabel('first_contact'), 'First contact');
+  assert.equal(L.holdReasonLabel('recipients_over'), 'Many recipients');
+  assert.equal(L.holdReasonLabel('something_new'), 'Something new');
+});
+
+test('parseAllowedIPs', () => {
+  assert.equal(L.parseAllowedIPs(''), null);
+  assert.equal(L.parseAllowedIPs('  \n '), null);
+  assert.deepEqual(L.parseAllowedIPs('203.0.113.7\n10.0.0.0/8, 2001:DB8::/32\n::1\n::ffff:192.0.2.1'),
+    ['203.0.113.7', '10.0.0.0/8', '2001:db8::/32', '::1', '::ffff:192.0.2.1']);
+  assert.deepEqual(L.parseAllowedIPs('2001:db8:0:0:0:0:0:1'), ['2001:db8:0:0:0:0:0:1']);
+  for (const bad of ['256.1.1.1', '10.0.0.0/33', '10.0.0', 'example.com', '2001:db8::/129', '1::2::3', '10.0.0.0/8/1', '1:2:3:4:5:6:7:8:9']) {
+    assert.throws(() => L.parseAllowedIPs(bad), /is not an address or CIDR prefix/, bad);
+  }
+  assert.throws(() => L.parseAllowedIPs(Array.from({ length: 101 }, (_, i) => `10.0.0.${i}`).join('\n')), /at most 100/);
+});
+
+test('expiry inputs round-trip in the local zone', () => {
+  const now = Date.parse('2026-11-20T10:00:00Z');
+  assert.equal(L.expiryFromInput('', now), null);
+  const iso = L.expiryFromInput('2026-12-01T09:30', now);
+  assert.equal(L.localInputValue(iso), '2026-12-01T09:30');
+  assert.equal(new Date(iso).toISOString(), iso);
+  assert.throws(() => L.expiryFromInput('2026-01-01T00:00', now), /in the future/);
+  assert.throws(() => L.expiryFromInput('tomorrow', now), /enter a date and time/);
+  assert.equal(L.localInputValue(null), '');
+  assert.equal(L.localInputValue('nonsense'), '');
+});
+
+test('keyAccessSummary and isExpired', () => {
+  const now = Date.parse('2026-11-20T10:00:00Z');
+  assert.deepEqual(L.keyAccessSummary({ allowed_ips: null, expires_at: null }, now), []);
+  assert.deepEqual(L.keyAccessSummary({ allowed_ips: ['10.0.0.0/8', '203.0.113.7', '::1'], expires_at: '2026-11-23T10:00:00Z' }, now),
+    ['from 10.0.0.0/8, 203.0.113.7 +1', 'expires in 3 d']);
+  assert.deepEqual(L.keyAccessSummary({ expires_at: '2026-11-19T10:00:00Z' }, now), ['expired 1 d ago']);
+  assert.ok(L.isExpired({ expires_at: '2026-11-19T10:00:00Z' }, now));
+  assert.ok(!L.isExpired({ expires_at: null }, now));
+});
+
+test('trustBadge maps the sender verdict', () => {
+  assert.deepEqual([L.trustBadge('authenticated').tone, L.trustBadge('authenticated').label], ['ok', 'Authenticated']);
+  assert.deepEqual([L.trustBadge('unauthenticated').tone, L.trustBadge('unauthenticated').label], ['warn', 'Unauthenticated']);
+  assert.deepEqual([L.trustBadge('failed').tone, L.trustBadge('failed').label], ['bad', 'Failed authentication']);
+  assert.deepEqual([L.trustBadge(undefined).tone, L.trustBadge(undefined).label], ['muted', 'Not checked']);
+  assert.equal(L.trustBadge('__proto__').label, 'Not checked');
+  assert.equal(L.suspiciousLabel('conceal_from_user'), 'Asks to hide something from the user');
+  assert.equal(L.suspiciousLabel('new_rule'), 'New rule');
+});
+
+test('authRows and authTone', () => {
+  const rows = L.authRows({
+    trust: 'authenticated', reason: 'dkim aligned',
+    spf: { result: 'pass', domain: 'example.org' },
+    spf_helo: { result: 'none' },
+    dkim: [{ result: 'pass', domain: 'example.org', selector: 's1', aligned: true }, { result: 'fail', domain: 'esp.net', aligned: false, reason: 'body hash' }],
+    dmarc: { result: 'pass', from_domain: 'example.org', policy: 'reject', spf_aligned: true, dkim_aligned: true },
+  });
+  assert.deepEqual(rows, [
+    ['SPF (envelope sender)', 'pass', 'example.org'],
+    ['SPF (HELO)', 'none', ''],
+    ['DKIM signature 1', 'pass', 'd=example.org · s=s1 · aligned'],
+    ['DKIM signature 2', 'fail', 'd=esp.net · not aligned · body hash'],
+    ['DMARC', 'pass', 'From domain example.org · policy p=reject · SPF aligned · DKIM aligned'],
+  ]);
+  assert.deepEqual(L.authRows({ spf: { result: 'fail' }, dkim: [] }), [['SPF (envelope sender)', 'fail', ''], ['DKIM', 'none', 'no signature']]);
+  assert.deepEqual(L.authRows(null), []);
+  assert.deepEqual(L.authRows([1]), []);
+  assert.equal(L.authTone('pass'), 'ok');
+  assert.equal(L.authTone('FAIL'), 'bad');
+  assert.equal(L.authTone('softfail'), 'warn');
+  assert.equal(L.authTone('none'), 'muted');
+});
+
+test('buildSendBody and checkVerdict', () => {
+  assert.deepEqual(L.buildSendBody({ from: ' a@x.com ', to: 'B@y.com, c@z.com', subject: 'Hi', text: 'Body', stream: 'transactional' }),
+    { from: 'a@x.com', to: ['B@y.com', 'c@z.com'], subject: 'Hi', text: 'Body' });
+  assert.deepEqual(L.buildSendBody({ from: 'a@x.com', to: 'b@y.com', subject: 'S', text: 'T', stream: 'broadcast' }).stream, 'broadcast');
+  assert.deepEqual(L.checkVerdict({ ok: true, would: 'send', warnings: [] }), { tone: 'ok', title: 'Ready to send' });
+  assert.deepEqual(L.checkVerdict({ ok: false, would: 'send', warnings: [{ code: 'no_text_part' }] }), { tone: 'warn', title: 'Would send, with a warning' });
+  assert.equal(L.checkVerdict({ would: 'send', warnings: [{}, {}] }).title, 'Would send, with 2 warnings');
+  assert.deepEqual(L.checkVerdict({ would: 'hold', hold_reasons: ['always'] }), { tone: 'warn', title: 'Would be held for approval' });
+  assert.deepEqual(L.checkVerdict({ would: 'refuse', refusals: [{}] }), { tone: 'bad', title: 'Would be refused' });
+});
+
+test('outcomeShares add up to 100', () => {
+  const shares = L.outcomeShares({ attempts: 412, accepted: 398, deferred: 11, bounced: 3, unknown: 0 });
+  assert.deepEqual(shares.map((x) => [x.key, x.percent]), [['accepted', 96], ['deferred', 3], ['bounced', 1]]);
+  assert.equal(shares.reduce((a, x) => a + x.percent, 0), 100);
+  const thirds = L.outcomeShares({ accepted: 1, deferred: 1, bounced: 1, unknown: 0 });
+  assert.equal(thirds.reduce((a, x) => a + x.percent, 0), 100);
+  assert.deepEqual(L.outcomeShares({ accepted: 0 }), []);
+  assert.deepEqual(L.outcomeShares(null), []);
+});
+
+test('insight windows and providers', () => {
+  const data = { windows: [{ window: '24h', total: { attempts: 1 }, by_provider: [{ provider: 'yahoo', attempts: 2 }, { provider: 'google', attempts: 9 }], by_sending_ip: [] }] };
+  assert.equal(L.insightWindow(data, '24h').total.attempts, 1);
+  assert.equal(L.insightWindow(data, '7d').total.attempts, 0);
+  assert.deepEqual(L.insightWindow(null, '30d').by_provider, []);
+  assert.deepEqual(L.byAttempts(data.windows[0].by_provider).map((g) => g.provider), ['google', 'yahoo']);
+  assert.equal(L.providerLabel('google'), 'Google');
+  assert.equal(L.providerLabel('other'), 'Other');
+  assert.equal(L.providerLabel(''), 'Unknown');
+});
+
+test('rateBar and pauseCounts', () => {
+  assert.deepEqual(L.rateBar(0.075, 0.05), { value: 80, limit: 53.3 });
+  assert.deepEqual(L.rateBar(0.01, 0.05), { value: 16, limit: 80 });
+  assert.deepEqual(L.rateBar(0, 0), { value: 0, limit: 0 });
+  assert.equal(L.pauseCounts({ reason: 'bounce_rate', bounces: 45, recipients: 600 }), '45 bounces of 600 recipients');
+  assert.equal(L.pauseCounts({ reason: 'complaint_rate', complaints: 1, recipients: 1200 }), '1 complaint of 1,200 recipients');
+  assert.equal(L.pauseCounts({ reason: 'bounce_rate', bounces: 1 }), '1 bounce');
+});
+
+test('dkimState reads the rotation and Ed25519 steps', () => {
+  const active = { selector: 'omw1', algorithm: 'rsa', state: 'active', signs: true };
+  assert.deepEqual(L.dkimState([active]), { rotation: 'idle', next: null, ed25519: 'off', edKey: null, retiring: [] });
+  const next = { selector: 'omw2', algorithm: 'rsa', state: 'pending', signs: false };
+  const ed = { selector: 'omwe1', algorithm: 'ed25519', state: 'pending', signs: false };
+  const s1 = L.dkimState([active, next, ed]);
+  assert.equal(s1.rotation, 'pending');
+  assert.equal(s1.next.selector, 'omw2');
+  assert.equal(s1.ed25519, 'pending');
+  const prev = { selector: 'omw0', algorithm: 'rsa', state: 'retiring', signs: false };
+  const s2 = L.dkimState([active, prev, { ...ed, state: 'active', signs: true }]);
+  assert.equal(s2.rotation, 'idle');
+  assert.equal(s2.ed25519, 'active');
+  assert.deepEqual(s2.retiring.map((k) => k.selector), ['omw0']);
+  assert.equal(L.dkimState(null).rotation, 'idle');
+});
+
+test('audit log helpers', () => {
+  const names = new Map([['6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', 'ops']]);
+  assert.equal(L.auditActor({ actor: 'cli' }, names), 'Operator (CLI)');
+  assert.equal(L.auditActor({ actor: 'system' }, names), 'System');
+  assert.equal(L.auditActor({ actor: 'api_key', actor_key_id: '6a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d' }, names), 'Key ops');
+  assert.equal(L.auditActor({ actor: 'api_key', actor_key_id: 'ffffffff-4e5f-4a6b-8c7d-9e0f1a2b3c4d' }, names), 'Key ffffffff…');
+  assert.equal(L.auditActor({ actor: 'api_key' }), 'API key');
+  assert.equal(L.shortHash('a'.repeat(64)), `${'a'.repeat(12)}…`);
+  assert.equal(L.shortHash(''), '');
+  assert.ok(L.AUDIT_ACTIONS.includes('api_key.created'));
+});
+
+test('suppression filters and reasons', () => {
+  assert.deepEqual(L.suppressionQuery({}), {});
+  assert.deepEqual(L.suppressionQuery({ address: ' Jane@Example.org ', domain: '@Example.org', reason: ' Hard_Bounce', stream: 'broadcast' }),
+    { address: 'jane@example.org', domain: 'example.org', reason: 'hard_bounce', stream: 'broadcast' });
+  assert.deepEqual(L.suppressionQuery({ stream: 'everything' }), {});
+  assert.equal(L.listPath('/suppressions/export', L.suppressionQuery({ domain: 'a.com' })), '/suppressions/export?domain=a.com');
+  assert.equal(L.checkSuppressionReason(''), '');
+  assert.equal(L.checkSuppressionReason('customer_request'), '');
+  assert.match(L.checkSuppressionReason('Customer Request'), /short name/);
+  assert.match(L.checkSuppressionReason('x'.repeat(33)), /short name/);
+  assert.equal(L.datedFilename('suppressions', 'csv', new Date(2026, 10, 20, 9)), 'suppressions-2026-11-20.csv');
+});
+
+test('webhookHealth', () => {
+  const now = Date.parse('2026-11-20T10:00:00Z');
+  assert.equal(L.webhookHealth({ consecutive_failures: 0 }, now).label, 'Healthy');
+  assert.equal(L.webhookHealth({ consecutive_failures: 3 }, now).tone, 'warn');
+  assert.equal(L.webhookHealth({ consecutive_failures: 5, paused_until: '2026-11-20T10:05:00Z' }, now).label, 'Breaker open');
+  assert.equal(L.webhookHealth({ consecutive_failures: 0, paused_until: '2026-11-20T09:00:00Z' }, now).label, 'Healthy');
+  assert.ok(L.ROTATE_OVERLAPS.some(([s]) => s === 0));
+  assert.equal(L.ROTATE_OVERLAPS[0][0], 86400);
+});
+
+test('lookups ignore prototype names from the API', () => {
+  for (const k of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+    assert.equal(L.statusTone(k), 'muted', k);
+    assert.equal(typeof L.statusLabel(k), 'string', k);
+    assert.equal(L.trustBadge(k).label, 'Not checked', k);
+    assert.equal(typeof L.suspiciousLabel(k), 'string', k);
+    assert.equal(typeof L.providerLabel(k), 'string', k);
+    assert.equal(L.PAUSE_SCOPES[k], undefined, k);
+    assert.equal(L.STREAM_LABELS[k], undefined, k);
+    assert.equal(L.classifyError({ status: 409, code: k }).title, 'Conflict', k);
+    assert.equal(typeof L.holdReasonLabel(k), 'string', k);
   }
 });

@@ -42,7 +42,10 @@ import (
 )
 
 // dns answers with whatever the test publishes.
-type dns struct{ txt map[string][]string }
+type dns struct {
+	txt map[string][]string
+	mx  map[string][]*net.MX // none unless a test publishes some
+}
 
 func (d *dns) LookupTXT(_ context.Context, name string) ([]string, error) {
 	if v, ok := d.txt[name]; ok {
@@ -52,6 +55,9 @@ func (d *dns) LookupTXT(_ context.Context, name string) ([]string, error) {
 }
 
 func (d *dns) LookupMX(_ context.Context, name string) ([]*net.MX, error) {
+	if v, ok := d.mx[name]; ok {
+		return v, nil
+	}
 	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 }
 

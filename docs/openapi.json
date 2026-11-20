@@ -343,6 +343,15 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "thread_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Only one conversation: the email with this id and the replies sent in its thread (`POST /messages/{id}/reply`). A received message's `thread_id` names its conversation."
           }
         ],
         "responses": {
@@ -3940,6 +3949,202 @@
         }
       }
     },
+    "/overview": {
+      "get": {
+        "operationId": "getOverview",
+        "tags": [
+          "Insights"
+        ],
+        "summary": "The project at a glance",
+        "description": "What a dashboard's home page shows: the queue (deliveries not final, by status, and the age of the oldest), sending outcomes over 24 hours and 7 days with a daily series, held emails, active pauses, each domain's problems (verification, DMARC, the inbound MX, DKIM rotation, reported authentication problems), receiving counts, and every worker with its self-check and its IP's warm-up. Workers are shared by every project of the installation. Read-only and cheap: every count uses an index, and at most the newest 100,000 emails of 7 days are read.\n\nNeeds a `full_access` key.",
+        "security": [
+          {
+            "apiKey": [
+              "full_access"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The overview.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Overview"
+                },
+                "examples": {
+                  "overview": {
+                    "summary": "Overview",
+                    "value": {
+                      "object": "overview",
+                      "generated_at": "2026-11-20T10:00:00Z",
+                      "queue": {
+                        "queued": 3,
+                        "scheduled": 1,
+                        "sending": 2,
+                        "deferred": 4,
+                        "held": 1,
+                        "oldest_queued_at": "2026-11-20T09:41:00Z",
+                        "oldest_age_seconds": 1140
+                      },
+                      "sending": {
+                        "truncated": false,
+                        "windows": [
+                          {
+                            "window": "24h",
+                            "emails": 120,
+                            "recipients": 130,
+                            "delivered": 124,
+                            "bounced": 2,
+                            "complained": 0,
+                            "suppressed": 1,
+                            "delivery_rate": 0.9538,
+                            "bounce_rate": 0.0154,
+                            "complaint_rate": 0
+                          },
+                          {
+                            "window": "7d",
+                            "emails": 840,
+                            "recipients": 901,
+                            "delivered": 870,
+                            "bounced": 12,
+                            "complained": 1,
+                            "suppressed": 4,
+                            "delivery_rate": 0.9656,
+                            "bounce_rate": 0.0133,
+                            "complaint_rate": 0.0011
+                          }
+                        ],
+                        "daily": [
+                          {
+                            "day": "2026-11-14",
+                            "recipients": 110,
+                            "delivered": 107,
+                            "bounced": 2,
+                            "complained": 0
+                          },
+                          {
+                            "day": "2026-11-15",
+                            "recipients": 95,
+                            "delivered": 93,
+                            "bounced": 1,
+                            "complained": 0
+                          },
+                          {
+                            "day": "2026-11-16",
+                            "recipients": 140,
+                            "delivered": 136,
+                            "bounced": 2,
+                            "complained": 1
+                          },
+                          {
+                            "day": "2026-11-17",
+                            "recipients": 160,
+                            "delivered": 155,
+                            "bounced": 3,
+                            "complained": 0
+                          },
+                          {
+                            "day": "2026-11-18",
+                            "recipients": 150,
+                            "delivered": 146,
+                            "bounced": 1,
+                            "complained": 0
+                          },
+                          {
+                            "day": "2026-11-19",
+                            "recipients": 126,
+                            "delivered": 121,
+                            "bounced": 1,
+                            "complained": 0
+                          },
+                          {
+                            "day": "2026-11-20",
+                            "recipients": 120,
+                            "delivered": 112,
+                            "bounced": 2,
+                            "complained": 0
+                          }
+                        ]
+                      },
+                      "held_emails": 1,
+                      "active_pauses": 0,
+                      "domains": [
+                        {
+                          "id": "9b2c4d6e-8f0a-4b1c-9d2e-3f4a5b6c7d8e",
+                          "name": "acme.com",
+                          "status": "verified",
+                          "claim_expires_at": null,
+                          "dmarc": "verified",
+                          "inbound": "verified",
+                          "inboxes": 2,
+                          "dkim_rotation": "pending",
+                          "ed25519": "off",
+                          "auth_issues": 0,
+                          "problems": [
+                            "DKIM rotation waiting for its DNS record"
+                          ]
+                        }
+                      ],
+                      "receiving": {
+                        "enabled": true,
+                        "inbound_mx": "mx.mail.acme.com",
+                        "inboxes": 2,
+                        "messages_24h": 14,
+                        "held_messages": 1
+                      },
+                      "workers": [
+                        {
+                          "name": "w1",
+                          "kind": "direct",
+                          "role": "delivery",
+                          "ip": "203.0.113.7",
+                          "version": "v0.6.0",
+                          "draining": false,
+                          "last_seen_at": "2026-11-20T09:59:52Z",
+                          "online": true,
+                          "self_check": {
+                            "ok": true,
+                            "problems": [],
+                            "checked_at": "2026-11-20T08:00:00Z"
+                          },
+                          "warmup": {
+                            "enabled": true,
+                            "started": true,
+                            "warm": false,
+                            "day": 3,
+                            "remaining": 1830,
+                            "cap": 2000,
+                            "providers": [
+                              {
+                                "provider": "google",
+                                "cap": 1000,
+                                "used": 120
+                              },
+                              {
+                                "provider": "microsoft",
+                                "cap": 1000,
+                                "used": 50
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/FullAccessRequired"
+          }
+        }
+      }
+    },
     "/domains/{id}/dkim": {
       "parameters": [
         {
@@ -5961,6 +6166,11 @@
             ],
             "format": "uuid",
             "description": "Pass as `before` to get the next page; null on the last page."
+          },
+          "thread_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Present when the list was filtered with `thread_id`: the thread it was filtered by."
           }
         }
       },
@@ -8660,6 +8870,456 @@
               "type": "object"
             },
             "description": "The 50 most recent reports."
+          }
+        }
+      },
+      "Overview": {
+        "type": "object",
+        "description": "The project at a glance, for a dashboard. Rates are fractions (0.07 is 7%) of every recipient of the emails created in the window, counted by when each email was created.",
+        "required": [
+          "object",
+          "generated_at",
+          "queue",
+          "sending",
+          "held_emails",
+          "active_pauses",
+          "domains",
+          "receiving",
+          "workers"
+        ],
+        "properties": {
+          "object": {
+            "const": "overview"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "queue": {
+            "type": "object",
+            "description": "The project's deliveries that are not final yet.",
+            "required": [
+              "queued",
+              "scheduled",
+              "sending",
+              "deferred",
+              "held",
+              "oldest_queued_at",
+              "oldest_age_seconds"
+            ],
+            "properties": {
+              "queued": {
+                "type": "integer",
+                "description": "Due now, waiting for a worker."
+              },
+              "scheduled": {
+                "type": "integer",
+                "description": "Queued for a `scheduled_at` in the future."
+              },
+              "sending": {
+                "type": "integer"
+              },
+              "deferred": {
+                "type": "integer",
+                "description": "Waiting for a retry."
+              },
+              "held": {
+                "type": "integer",
+                "description": "Recipients waiting for approval."
+              },
+              "oldest_queued_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "When the oldest delivery that is queued (and due), deferred or sending became due: its email's creation, or its `scheduled_at` when later."
+              },
+              "oldest_age_seconds": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          },
+          "sending": {
+            "type": "object",
+            "required": [
+              "truncated",
+              "windows",
+              "daily"
+            ],
+            "properties": {
+              "truncated": {
+                "type": "boolean",
+                "description": "More than 100,000 emails were created in 7 days: only the newest 100,000 are counted."
+              },
+              "windows": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "window",
+                    "emails",
+                    "recipients",
+                    "delivered",
+                    "bounced",
+                    "complained",
+                    "suppressed",
+                    "delivery_rate",
+                    "bounce_rate",
+                    "complaint_rate"
+                  ],
+                  "properties": {
+                    "window": {
+                      "enum": [
+                        "24h",
+                        "7d"
+                      ]
+                    },
+                    "emails": {
+                      "type": "integer",
+                      "description": "Emails created in the window."
+                    },
+                    "recipients": {
+                      "type": "integer",
+                      "description": "Their recipients: the denominator of every rate."
+                    },
+                    "delivered": {
+                      "type": "integer"
+                    },
+                    "bounced": {
+                      "type": "integer"
+                    },
+                    "complained": {
+                      "type": "integer",
+                      "description": "Recipients with a complaint (`email.complained`)."
+                    },
+                    "suppressed": {
+                      "type": "integer",
+                      "description": "Recipients not sent to because they were suppressed."
+                    },
+                    "delivery_rate": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "description": "delivered / recipients; null without recipients."
+                    },
+                    "bounce_rate": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "description": "bounced / recipients."
+                    },
+                    "complaint_rate": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "description": "complained / recipients."
+                    }
+                  }
+                }
+              },
+              "daily": {
+                "type": "array",
+                "description": "The last 7 UTC days, oldest first, today (partial) last; days without mail are zeros.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "day",
+                    "recipients",
+                    "delivered",
+                    "bounced",
+                    "complained"
+                  ],
+                  "properties": {
+                    "day": {
+                      "type": "string",
+                      "format": "date"
+                    },
+                    "recipients": {
+                      "type": "integer"
+                    },
+                    "delivered": {
+                      "type": "integer"
+                    },
+                    "bounced": {
+                      "type": "integer"
+                    },
+                    "complained": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "held_emails": {
+            "type": "integer",
+            "description": "Emails with at least one recipient waiting for approval (`GET /emails/held`)."
+          },
+          "active_pauses": {
+            "type": "integer",
+            "description": "Circuit-breaker pauses in force (`GET /pauses?active=true`)."
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "status",
+                "claim_expires_at",
+                "dmarc",
+                "inbound",
+                "inboxes",
+                "dkim_rotation",
+                "ed25519",
+                "auth_issues",
+                "problems"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "verified",
+                    "failed"
+                  ]
+                },
+                "claim_expires_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "dmarc": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "verified",
+                    "failed",
+                    "missing"
+                  ],
+                  "description": "The DMARC record's status at the last check."
+                },
+                "inbound": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The INBOUND (MX) record's status when the server receives mail (`OMW_INBOUND_MX`); null otherwise."
+                },
+                "inboxes": {
+                  "type": "integer"
+                },
+                "dkim_rotation": {
+                  "type": "string",
+                  "enum": [
+                    "idle",
+                    "pending"
+                  ],
+                  "description": "`pending`: a new key waits for its DNS record (`POST /domains/{id}/dkim/rotate`)."
+                },
+                "ed25519": {
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "pending",
+                    "active"
+                  ]
+                },
+                "auth_issues": {
+                  "type": "integer",
+                  "description": "Authentication problems receivers reported (`GET /domains/{id}/dkim`)."
+                },
+                "problems": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "What needs attention, in words; empty when healthy."
+                }
+              }
+            }
+          },
+          "receiving": {
+            "type": "object",
+            "required": [
+              "enabled",
+              "inbound_mx",
+              "inboxes",
+              "messages_24h",
+              "held_messages"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "description": "The server receives mail for inboxes (`OMW_INBOUND_MX` is set)."
+              },
+              "inbound_mx": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "inboxes": {
+                "type": "integer"
+              },
+              "messages_24h": {
+                "type": "integer",
+                "description": "Messages received in the last 24 hours."
+              },
+              "held_messages": {
+                "type": "integer",
+                "description": "Messages held from agent keys until released."
+              }
+            }
+          },
+          "workers": {
+            "type": "array",
+            "description": "Every worker and inbound node of the installation: they are shared by all projects.",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "kind",
+                "role",
+                "ip",
+                "version",
+                "draining",
+                "last_seen_at",
+                "online",
+                "self_check",
+                "warmup"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "description": "`direct` or `relay`, as the worker last announced."
+                },
+                "role": {
+                  "type": "string",
+                  "description": "What its token may do: `delivery`, `inbound`, `relay`, or `any` for tokens older than roles."
+                },
+                "ip": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "draining": {
+                  "type": "boolean"
+                },
+                "last_seen_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "online": {
+                  "type": "boolean",
+                  "description": "Seen in the last 2 minutes (workers send a heartbeat every 20 seconds)."
+                },
+                "self_check": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "The worker's start-up checks (EHLO name, A record, reverse DNS, port 25).",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "skipped": {
+                      "type": "string"
+                    },
+                    "problems": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "checked_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time"
+                    }
+                  }
+                },
+                "warmup": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "The warm-up of the worker's IP; null for inbound nodes, relays and workers without an IP.",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean",
+                      "description": "`OMW_WARMUP`; when false every IP counts as warm."
+                    },
+                    "started": {
+                      "type": "boolean"
+                    },
+                    "warm": {
+                      "type": "boolean"
+                    },
+                    "day": {
+                      "type": "integer"
+                    },
+                    "remaining": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "Messages it may still send today, all providers together; null when warm."
+                    },
+                    "cap": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "providers": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "provider": {
+                            "type": "string"
+                          },
+                          "cap": {
+                            "type": "integer"
+                          },
+                          "used": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

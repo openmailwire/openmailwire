@@ -49,7 +49,7 @@ Emails:
 - `POST /emails`: queue one email. `from`, `to`, `subject`, and `text` and/or `html`; optional `cc`, `bcc`, `reply_to`, `headers`, `tags`, `attachments`, `scheduled_at`, `expires_at`, `retry_uncertain`. Returns `{"id"}`.
 - `POST /emails/batch`: queue 1 to 100 emails (same fields, no attachments) all or nothing. Returns `{"data":[{"id"}]}`.
 - `POST /emails/raw`: queue a complete MIME message: `{"raw": "<base64>", "mail_from"?, "rcpts"?}`. Returns `{"id"}`.
-- `GET /emails`: list emails, newest first: `?limit=20&before=<id>&api_key_id=<id>`. Follow `next_before` while `has_more`.
+- `GET /emails`: list emails, newest first: `?limit=20&before=<id>&api_key_id=<id>`. Follow `next_before` while `has_more`. `?thread_id=<id>` lists one conversation: the email with that id and the replies sent in its thread.
 - `GET /emails/{id}`: one email with `recipients[]` (status per recipient), `attempts[]` and `events[]`.
 - `POST /emails/{id}/cancel`: cancel the recipients still queued and never attempted.
 - `POST /emails/check`: what a send would do (`would`: send, hold or refuse), every refusal, warnings and the size. Sends nothing.
@@ -86,6 +86,7 @@ Webhooks (full access):
 - `POST /webhooks/{id}/rotate-secret`: `{"overlap_seconds": 86400}`. Returns the new `signing_secret` once; both secrets sign until the overlap ends.
 - `DELETE /webhooks/{id}`: stop sending to it.
 - `GET /insights`: acceptance, deferral and bounce rates and time to acceptance per mailbox provider and sending IP, for 24h, 7d and 30d.
+- `GET /overview`: the project at a glance (full access): queue depth and the oldest queued age, sending outcomes for 24h and 7d with a daily series, held emails, active pauses, each domain's problems, receiving counts, and the workers with their self-check and warm-up.
 
 API keys (full access):
 - `POST /api-keys`: create `{"name", "permission", "policy", "allowed_ips"?, "expires_at"?}`. Returns `token` (`omw_…`) once.

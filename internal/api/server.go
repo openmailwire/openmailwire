@@ -71,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api-keys/{id}", s.withFullAccess(s.deleteAPIKey))
 	mux.Handle("GET /audit-log", s.withFullAccess(s.listAuditLog))
 	mux.Handle("GET /audit-log/verify", s.withFullAccess(s.verifyAuditLog))
+	mux.Handle("GET /overview", s.withFullAccess(s.getOverview)) // the dashboard's home (overview.go)
 
 	mux.Handle("POST /internal/worker/heartbeat", s.withWorker(s.heartbeat))
 	mux.Handle("POST /internal/worker/lease", s.withWorker(s.lease))
