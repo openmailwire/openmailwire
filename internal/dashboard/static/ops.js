@@ -62,8 +62,8 @@ export function decisionForm(ctx, email, { recipients, onDecided }) {
   const n = (recipients || []).length;
   const decide = async (verb) => {
     const q = verb === 'approve'
-      ? `Approve this email and send it to ${plural(n, 'recipient', 'recipients')} now?`
-      : `Reject this email? Nothing is ever sent to its ${plural(n, 'recipient', 'recipients')}.`;
+      ? `It goes to ${plural(n, 'recipient', 'recipients')} now, and the decision is recorded with your key.`
+      : `Nothing is ever sent to its ${plural(n, 'recipient', 'recipients')}, and the decision is recorded with your key.`;
     if (!await confirmed(q, { title: verb === 'approve' ? 'Approve and send?' : 'Reject this email?', confirm: verb === 'approve' ? 'Approve and send' : 'Reject', danger: verb !== 'approve' })) return;
     status.replaceChildren();
     await withBusy(form, async () => {
