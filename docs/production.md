@@ -40,9 +40,29 @@ Set `OMW_SPF_INCLUDE=_spf.mail.example.net` and `OMW_BOUNCE_MX=bounces.example.n
 
 The return-path domain needs an MX (or an A record) even if you do not process bounces: many receivers refuse envelope senders whose domain cannot receive mail. Point `bounces.example.net` at an inbound node (section 6) and bounces are processed too.
 
+### Automatic DNS with Cloudflare
+
+When the zone that holds `OMW_SPF_INCLUDE` is at Cloudflare, the control plane can keep that record up to date itself:
+
+1. In Cloudflare: My Profile → API Tokens → Create Token → Create Custom Token.
+   - Permissions: **Zone → DNS → Edit**. Nothing else is needed.
+   - Zone Resources: Include → Specific zone → the zone of `OMW_SPF_INCLUDE` (e.g. `example.net`). Never "All zones".
+   - Optionally restrict it to your control planes' IP addresses (Client IP Address Filtering) and give it an end date you will renew.
+2. Set `OMW_CLOUDFLARE_TOKEN` (with `OMW_SPF_INCLUDE`) on the control plane, from a secret store, not a file in the repository.
+3. Check it once by hand: `openmailwire dns sync --dry-run`, then `openmailwire dns sync`. It prints the record before and after.
+
+From then on the control plane checks every 5 minutes. The record lists the IPs that direct delivery workers announced in a heartbeat within the last 7 days (`OMW_PUBLIC_IP`), each once, IPv4 first, ending in `-all`; inbound nodes and relay workers are left out. It is written only when that list changes (and read again at most hourly to repair a manual edit), never when no worker is live, since an SPF record that authorizes no one would stop all mail. A failure (a revoked token, Cloudflare unavailable) is logged and retried later, backing off up to an hour; a 429 from Cloudflare is waited out (its `Retry-After`, at most 30 seconds) and never retried in a loop.
+
+So a new worker's IP is authorized within about 5 minutes of its first heartbeat. To send nothing before that, drain it before its first start (`openmailwire workers drain <name>`; a drained worker still announces its IP) and resume it once `openmailwire dns sync` shows the IP. A worker that stops drops out of the record 7 days after its last heartbeat.
+
+This token is the operator's own. It is never used for customers' domains: `POST /domains/{id}/dns/auto` takes the domain owner's token (see [Automatic DNS with Cloudflare](../README.md#automatic-dns-with-cloudflare) in the README), with Zone → DNS → Edit on their zone only, and Zone → Email Routing → Read optionally. A token a customer chooses to remember is sealed with `OMW_SECRET_KEYS` (table `dns_automation`, migration `0012`) and resealed by `openmailwire rotate-secrets` like every other secret; deleting the domain deletes it.
+
+`OMW_CLOUDFLARE_API_BASE` changes the API's address; leave it unset in production (tests point it at a local fake).
+
 ## 3. Each sending domain
 
 - Publish what `POST /domains` returns, then call `POST /domains/{id}/verify`.
+- Or, when the domain's DNS is at Cloudflare, let OpenMailWire publish it: `POST /domains/{id}/dns/auto` with a token of the domain's owner (Zone → DNS → Edit on that zone). It leaves the domain's own MX records and DMARC policy alone, and with `remember: true` it also publishes DKIM rotations and Ed25519, and deletes rotated-out DKIM records after their overlap.
 - DKIM keys are 2048-bit. Their TXT value is longer than 255 characters. Most DNS dashboards split it automatically; with raw zone files, split it into quoted strings yourself.
 - **Signatures.** `From`, `To`, `Subject`, `Date`, `Message-ID`, `Reply-To` and `Cc` are oversigned: a copy of one of them added in transit breaks the signature instead of being shown to the reader. Optionally, `POST /domains/{id}/dkim/ed25519` `{"enabled": true}` adds an Ed25519 signature (RFC 8463) next to the RSA one: publish the `DKIM_ED25519` record it returns, then call it again. Receivers that do not know Ed25519 ignore that signature and use the RSA one.
 - **Rotating the DKIM key** (once or twice a year, or at once if the key may have leaked), with two selectors and an overlap:
