@@ -35,6 +35,7 @@ var SealedColumns = []SealedColumn{
 	{"inbound_messages", "id", "raw"},
 	{"dkim_keys", "id", "private_key"},           // extra and rotated DKIM keys (0008)
 	{"inbound_messages", "id", "snippet_sealed"}, // list snippets (0009)
+	{"dns_automation", "domain_id", "api_token"}, // remembered DNS provider tokens (0011)
 }
 
 // macRootName names the secret_values row holding the root of the keys

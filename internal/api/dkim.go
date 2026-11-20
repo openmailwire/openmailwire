@@ -271,11 +271,15 @@ func (s *Server) rotateDKIM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		next := keys[len(keys)-1]
-		writeJSON(w, http.StatusAccepted, map[string]any{
+		out := map[string]any{
 			"object": "dkim_rotation", "status": "pending", "record": next.Record, "keys": keys,
 			"message": "publish the TXT record " + next.Record.Name + ", then call POST /domains/" + d.ID +
 				"/dkim/rotate again to switch signing to the new key. Mail is signed with the current key until then.",
-		})
+		}
+		if auto := s.dnsAutoPublish(r, d, "dkim_rotate", "DKIM_NEXT"); auto != nil { // lane G: a remembered DNS token publishes it
+			out["dns_auto"] = auto
+		}
+		writeJSON(w, http.StatusAccepted, out)
 		return
 	}
 	if ok, why := s.published(ctx, pending.Record.Name, pending.extra.Public); !ok {
@@ -328,13 +332,18 @@ func (s *Server) setEd25519(w http.ResponseWriter, r *http.Request) {
 			ed = &keys[i]
 		}
 	}
+	var dnsAuto map[string]any // lane G: what a remembered DNS token published
 	reply := func(status int, state, msg string) {
 		keys, err := s.dkimKeysOf(ctx, d)
 		if err != nil {
 			s.internal(w, "dkim keys", err)
 			return
 		}
-		writeJSON(w, status, map[string]any{"object": "dkim_ed25519", "status": state, "keys": keys, "message": msg})
+		out := map[string]any{"object": "dkim_ed25519", "status": state, "keys": keys, "message": msg}
+		if dnsAuto != nil {
+			out["dns_auto"] = dnsAuto
+		}
+		writeJSON(w, status, out)
 	}
 	switch {
 	case !*req.Enabled:
@@ -362,6 +371,7 @@ func (s *Server) setEd25519(w http.ResponseWriter, r *http.Request) {
 			s.internal(w, "add dkim key", err)
 			return
 		}
+		dnsAuto = s.dnsAutoPublish(r, d, "ed25519", "DKIM_ED25519")
 		reply(http.StatusAccepted, "pending", "publish the DKIM_ED25519 TXT record, then call this endpoint with {\"enabled\": true} again to start signing with Ed25519")
 	case ed.State == "active":
 		reply(http.StatusOK, "active", "new mail carries an Ed25519 signature next to the RSA one")

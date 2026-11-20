@@ -73,6 +73,7 @@ type Control struct {
 	// InboundConcurrency caps the inbound messages the control plane
 	// processes at once; more wait, then are deferred.
 	InboundConcurrency int
+	DNSAutomation      // Cloudflare (lane G, dns.go)
 }
 
 // DefaultFBLTrustedDomains sign the feedback-loop reports of the large
@@ -181,6 +182,9 @@ func LoadControl() (Control, error) {
 		return c, err
 	}
 	if c.InboundConcurrency, err = envInt("OMW_INBOUND_CONCURRENCY", 8); err != nil {
+		return c, err
+	}
+	if c.DNSAutomation, err = LoadDNSAutomation(c.SPFInclude); err != nil { // lane G
 		return c, err
 	}
 	return c, nil
