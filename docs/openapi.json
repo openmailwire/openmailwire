@@ -4432,6 +4432,31 @@
               }
             }
           },
+          "429": {
+            "description": "Too many runs for this domain in a short time (`rate_limit_exceeded`): 10 at once, then one every 6 seconds. Wait `Retry-After`; runs are idempotent.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "rate_limit_exceeded": {
+                    "summary": "rate_limit_exceeded",
+                    "value": {
+                      "statusCode": 429,
+                      "name": "rate_limit_exceeded",
+                      "message": "acme.com had 10 DNS runs in a short time; wait 6 seconds. A run is idempotent: repeating it changes nothing that the last run did not"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "503": {
             "description": "Cloudflare could not be reached, failed, or kept rate-limiting (`dns_provider_unavailable`). Records changed before are kept; the call is safe to repeat after `Retry-After`.",
             "content": {

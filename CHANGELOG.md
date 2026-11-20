@@ -12,7 +12,7 @@
 - **MCP tool `setup_domain_dns`** (destructive, full access) runs it with the remembered token only: an agent never handles a DNS token, and without one it is told to ask a person to connect Cloudflare. It supports `dry_run`.
 - Audit log: `dns.applied`, `dns.token_remembered`, `dns.token_forgotten`. The token never appears in answers, logs or the audit log.
 - **Operator SPF include:** with `OMW_CLOUDFLARE_TOKEN` and `OMW_SPF_INCLUDE`, the control plane keeps that TXT record listing the IPs delivery workers announced within 7 days (`v=spf1 ip4:… ip6:… -all`), checking every 5 minutes and writing only when it changes. `openmailwire dns sync [--dry-run]` runs it once and prints the difference.
-- Cloudflare calls have strict timeouts, wait out a 429's `Retry-After` (at most 30 s, a few times) and retry only requests that are safe to repeat. `OMW_CLOUDFLARE_API_BASE` points them elsewhere (tests; `http` only to loopback).
+- Runs are limited per domain (10 at once, then one every 6 seconds: `429 rate_limit_exceeded`), and Cloudflare calls have strict timeouts, wait out a 429's `Retry-After` (at most 30 s, a few times) and retry only requests that are safe to repeat. `OMW_CLOUDFLARE_API_BASE` points them elsewhere (tests; `http` only to loopback).
 
 ### Sending and receiving locally
 - `docker-compose.yml`: an `inbound` node (profile `inbound`, token `OMW_INBOUND_TOKEN` of role inbound, port 2525 on 127.0.0.1) and SMTP `submission` (profile `submission`, 127.0.0.1:1587) with a self-signed certificate.

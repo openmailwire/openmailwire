@@ -59,8 +59,49 @@ func (s *Server) dnsRoutes(mux *http.ServeMux) {
 
 // dnsState is the control plane's in-memory state for DNS automation.
 type dnsState struct {
-	locks [64]sync.Mutex // one run per domain at a time (by hash)
-	spf   spfSyncState
+	locks  [64]sync.Mutex // one run per domain at a time (by hash)
+	budget dnsRunBudget
+	spf    spfSyncState
+}
+
+// Runs per domain through the API (and MCP): dnsRunBurst at once, then one
+// every dnsRunEvery, so that no loop, an agent's say, can wear out the
+// owner's Cloudflare API allowance (1,200 requests per 5 minutes).
+const (
+	dnsRunBurst = 10
+	dnsRunEvery = 6 * time.Second
+)
+
+// dnsRunBudget is a per-domain rate limit (GCRA).
+type dnsRunBudget struct {
+	mu   sync.Mutex
+	next map[string]time.Time // when each domain's budget is full again, minus one run
+}
+
+// allow reports whether a run for the domain may start now, or how long
+// to wait.
+func (b *dnsRunBudget) allow(domainID string, now time.Time) (bool, time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.next == nil {
+		b.next = map[string]time.Time{}
+	}
+	tat := b.next[domainID]
+	if tat.Before(now) {
+		tat = now
+	}
+	if window := dnsRunEvery * (dnsRunBurst - 1); tat.Sub(now) > window {
+		return false, tat.Sub(now) - window
+	}
+	b.next[domainID] = tat.Add(dnsRunEvery)
+	if len(b.next) > 10000 {
+		for k, v := range b.next {
+			if v.Before(now) {
+				delete(b.next, k)
+			}
+		}
+	}
+	return true, 0
 }
 
 func (s *Server) dnsLock(domainID string) *sync.Mutex {
@@ -179,6 +220,12 @@ func (s *Server) applyDNSAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ok, wait := s.dns.budget.allow(d.ID, time.Now()); !ok {
+		(&policyError{Status: http.StatusTooManyRequests, Name: "rate_limit_exceeded", RetryAfter: wait, Message: fmt.Sprintf(
+			"%s had %d DNS runs in a short time; wait %d seconds. A run is idempotent: repeating it changes nothing that the last run did not",
+			d.Name, dnsRunBurst, int(wait.Seconds())+1)}).write(w)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), dnsAutoTimeout)
 	defer cancel()
 	lock := s.dnsLock(d.ID)

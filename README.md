@@ -320,6 +320,7 @@ What it publishes, and what it leaves alone:
 | `dns_provider_auth_failed` | 422 | Cloudflare refused the token: invalid, expired, or without Zone → DNS → Edit for the zone. |
 | `dns_zone_not_found` | 422 | No zone the token can see holds the domain. Add the zone, give the token access to it, or pass `zone_id`. |
 | `dns_provider_unavailable` | 503 | Cloudflare failed or kept rate-limiting. Retry after `Retry-After`; runs are safe to repeat. |
+| `rate_limit_exceeded` | 429 | More than 10 runs for one domain in a short time (then one every 6 seconds), so that no loop wears out the Cloudflare account's API allowance. |
 
 Operators can let the control plane keep their SPF include (`OMW_SPF_INCLUDE`) listing the live workers' IPs at Cloudflare: see [docs/production.md](docs/production.md#automatic-dns-with-cloudflare).
 

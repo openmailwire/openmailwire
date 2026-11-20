@@ -384,6 +384,25 @@ func TestDNSAutoErrors(t *testing.T) {
 		t.Fatalf("after the failures: %d %v", code, run)
 	}
 
+	// No loop can hammer Cloudflare: runs per domain are rate-limited.
+	var limited *http.Response
+	for range 12 {
+		req, _ := http.NewRequest("POST", d.ts.URL+path, strings.NewReader(`{"api_token":"`+cfToken+`","dry_run":true}`))
+		req.Header.Set("Authorization", "Bearer "+d.apiKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 429 {
+			limited = resp
+			break
+		}
+	}
+	if limited == nil || limited.Header.Get("Retry-After") == "" {
+		t.Fatal("no 429 after many runs in a row")
+	}
+
 	// Sending-only keys cannot use any of it.
 	agent, _ := keysNewKey(d.env, "agent", "sending_access", nil)
 	for _, m := range []string{"POST", "GET", "DELETE"} {
