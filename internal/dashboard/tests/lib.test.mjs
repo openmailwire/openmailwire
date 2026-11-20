@@ -810,3 +810,14 @@ test('DNS automation helpers', () => {
   assert.equal(down.detail, 'timeout');
   assert.equal(L.classifyError({ status: 404, code: 'not_found', message: 'no such endpoint' }, 'automatic DNS setup').kind, 'unavailable');
 });
+
+test('middle shortens long values in the middle', () => {
+  assert.equal(L.middle('short', 10), 'short');
+  const v = `v=DKIM1; k=rsa; p=${'A'.repeat(300)}IDAQAB`;
+  const m = L.middle(v, 40);
+  assert.equal(m.length, 40);
+  assert.ok(m.startsWith('v=DKIM1; k=rsa;'));
+  assert.ok(m.endsWith('IDAQAB'));
+  assert.ok(m.includes('…'));
+  assert.equal(L.middle(null, 5), '');
+});

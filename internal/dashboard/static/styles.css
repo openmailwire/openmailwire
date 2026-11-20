@@ -150,7 +150,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; overflow-wrap: anywher
   background: rgba(255, 255, 255, .07);
   padding: 3px 8px; border-radius: 6px;
 }
-.menu-btn { display: none; }
+.topbar .menu-btn { display: none; }
 .nav-count {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;
@@ -767,7 +767,18 @@ kbd {
 .preview-frame { display: block; width: 100%; height: 26rem; border: 1px solid var(--line); border-radius: 6px; background: #FFFFFF; }
 .preview-box pre.body { margin: 0; min-height: 10rem; }
 .file-input { font: inherit; max-width: 100%; }
-.sticky-actions { position: sticky; bottom: 0; z-index: 2; padding: 10px 0; background: var(--surface); border-top: 1px solid var(--line); }
+.sticky-actions { padding-top: 6px; }
+@media (min-width: 721px) {
+  .sticky-actions { position: sticky; bottom: 0; z-index: 2; padding: 10px 0; background: var(--surface); border-top: 1px solid var(--line); }
+}
+.file-input::file-selector-button {
+  font: inherit; font-size: 13.5px; font-weight: 600; margin-right: 10px;
+  min-height: 36px; padding: 6px 14px; border-radius: 7px; cursor: pointer;
+  color: var(--text); background: var(--surface); border: 1px solid var(--line-strong);
+}
+.file-input::file-selector-button:hover { background: var(--surface-2); }
+.panel > .form-actions, .panel-warn .form-actions { margin-top: 12px; }
+@media (min-width: 1000px) { .tile-span2 { grid-column: span 2; } }
 .cf-zone { margin-bottom: 8px; }
 .cf-body .steps { margin-bottom: 12px; }
 .cf-body .form { margin-top: 4px; }
@@ -775,7 +786,7 @@ kbd {
 /* ---- medium screens: the nav becomes a menu ---- */
 
 @media (max-width: 959px) {
-  .menu-btn { display: inline-flex; }
+  .topbar .menu-btn { display: inline-flex; }
   .shell { display: block; }
   .nav {
     display: none;

@@ -139,6 +139,14 @@ export function formatCount(n) {
   return Number(n).toLocaleString('en-US');
 }
 
+// middle shortens a long value in the middle: "v=DKIM1; p=MIIB…IDAQAB".
+export function middle(s, n = 64) {
+  const str = String(s ?? '');
+  if (str.length <= n) return str;
+  const head = Math.ceil((n - 1) * 0.6);
+  return `${str.slice(0, head)}…${str.slice(str.length - (n - 1 - head))}`;
+}
+
 export function truncate(s, n) {
   const str = String(s ?? '');
   return str.length > n ? `${str.slice(0, Math.max(0, n - 1))}…` : str;
@@ -1208,7 +1216,7 @@ export function setupSteps(s) {
   const inbound = target ? (target.records || []).find((r) => r.record === 'INBOUND') : null;
   const inboxes = Array.isArray(st.inboxes) ? st.inboxes : [];
   const send = [
-    { id: 'domain', title: 'Add a sending domain', done: domains.length > 0, route: '#/domains' },
+    { id: 'domain', title: 'Add a sending domain', done: domains.length > 0, route: '#/domains', domain: target },
     { id: 'dns', title: 'Publish its DNS records', done: recordsDone || Boolean(verified), route: target ? `#/domains/${encodeURIComponent(target.id)}` : '#/domains', domain: target },
     { id: 'verify', title: 'Verify the domain', done: Boolean(verified), route: target ? `#/domains/${encodeURIComponent(target.id)}` : '#/domains' },
     { id: 'key', title: 'Create a key for your agent', done: agentKey === true, unknown: agentKey === null, route: '#/api-keys' },

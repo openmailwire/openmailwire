@@ -108,7 +108,7 @@ function heldCard(ctx, e, keys) {
       ['Why held', reasonChips(e.hold_reasons)],
       ['From', mono(e.from)],
       ['Waiting', mono(waiting.join(', '))],
-      ['To', mono(L.addressList(e.to).join(', '))],
+      ['To', L.addressList(e.to).join(', ') === waiting.join(', ') ? null : mono(L.addressList(e.to).join(', '))],
       ['Cc', L.addressList(e.cc).length ? mono(L.addressList(e.cc).join(', ')) : null],
       ['Bcc', L.addressList(e.bcc).length ? mono(L.addressList(e.bcc).join(', ')) : null],
       ['Sent by', keyName(keys, e.api_key_id)],

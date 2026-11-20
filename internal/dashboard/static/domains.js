@@ -42,7 +42,7 @@ function keysTable(keys) {
     { label: 'Algorithm', cell: (k) => (k.algorithm === 'ed25519' ? 'Ed25519' : 'RSA') },
     { label: 'State', class: 'col-status', cell: (k) => badge(k.state) },
     { label: 'Record name', class: 'col-name', cell: (k) => (k.record ? copyable(k.record.name, `${k.selector} record name`) : muted('—')) },
-    { label: 'Record value', class: 'col-value', cell: (k) => (k.record ? copyable(k.record.value, `${k.selector} record value`) : muted('—')) },
+    { label: 'Record value', class: 'col-value', cell: (k) => (k.record ? copyable(k.record.value, `${k.selector} record value`, 64) : muted('—')) },
     {
       label: 'Notes',
       cell: (k) => h('span', { class: 'status-cell' },
@@ -273,7 +273,7 @@ function changesTable(changes) {
     { label: 'Record', cell: (c) => h('strong', {}, c.record || '—') },
     { label: 'Type', cell: (c) => c.type || '—' },
     { label: 'Name', class: 'col-name', cell: (c) => mono(c.name || '—') },
-    { label: 'Value', class: 'col-value', cell: (c) => h('span', { class: 'mono small' }, c.value || '—') },
+    { label: 'Value', class: 'col-value', cell: (c) => h('span', { class: 'mono small', title: c.value || null }, L.middle(c.value || '—', 72)) },
     { label: 'Notes', cell: (c) => (c.detail ? h('span', { class: 'small' }, c.detail) : muted('—')) },
   ], changes, 'DNS changes');
 }

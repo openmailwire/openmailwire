@@ -128,7 +128,7 @@ function domainsTile(o) {
       h('p', {}, link(route('domains', d.id), d.name), ' ', badge(d.status)),
       h('ul', { class: 'problems' }, d.problems.map((p) => h('li', {}, p))))));
   }
-  return tile(bad.length ? `Domains needing attention (${bad.length})` : 'Domains', '#/domains', 'Domains', content);
+  return tile(bad.length ? `Domains needing attention (${bad.length})` : 'Domains', '#/domains', 'Domains', content, bad.length ? 'tile-span2' : '');
 }
 
 function workersTile(o) {
@@ -182,14 +182,14 @@ function recordLines(records) {
   return h('ul', { class: 'mini-records' }, list.map((r) => h('li', { class: r.status === 'verified' ? 'done' : '' },
     h('span', { class: 'mini-head' }, h('strong', {}, r.record), ' ', badge(r.status)),
     h('span', { class: 'mini-row' }, muted(`${r.type} `), copyable(r.name, `${r.record} record name`)),
-    h('span', { class: 'mini-row' }, muted('value '), copyable(r.value, `${r.record} record value`)))));
+    h('span', { class: 'mini-row' }, muted('value '), copyable(r.value, `${r.record} record value`, 48)))));
 }
 
 function stepDetail(step, st) {
   const domainRoute = step.domain ? route('domains', step.domain.id) : '#/domains';
   switch (step.id) {
     case 'domain':
-      return step.done ? muted((st.domains[0] || {}).name || '') : link('#/domains', 'Add a domain');
+      return step.done ? muted((step.domain || {}).name || '') : link('#/domains', 'Add a domain');
     case 'dns':
       if (step.done || !step.domain) return step.done ? muted('Every required record is published.') : muted('Add a domain first.');
       return [

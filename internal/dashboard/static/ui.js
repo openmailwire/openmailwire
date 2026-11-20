@@ -260,9 +260,12 @@ export function copyButton(value, what) {
   return btn;
 }
 
-// copyable shows a value in monospace with a copy button.
-export function copyable(value, what) {
-  return h('span', { class: 'copyable' }, h('code', { class: 'mono' }, value), copyButton(value, what));
+// copyable shows a value in monospace with a copy button. Long values
+// (DKIM keys) are shortened on screen; the button copies all of it.
+export function copyable(value, what, max = 0) {
+  const v = String(value ?? '');
+  const shown = max && v.length > max ? L.middle(v, max) : v;
+  return h('span', { class: 'copyable' }, h('code', { class: 'mono', title: shown === v ? null : v }, shown), copyButton(v, what));
 }
 
 export function panel(title, ...children) {

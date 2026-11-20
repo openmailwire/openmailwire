@@ -144,8 +144,8 @@ export async function pageCompose(ctx) {
     if (previewMode.value === 'html' && html.value.trim()) {
       setPreview(frame, html.value);
       put(previewBox, frame);
-    } else if (previewMode.value === 'html') {
-      put(previewBox, emptyState('No HTML body. Write one to preview it here.'));
+    } else if (previewMode.value === 'html' && !text.value) {
+      put(previewBox, emptyState('Nothing to preview yet. Write the text, or an HTML version, on the left.'));
     } else {
       textPreview.textContent = text.value || (html.value ? '(No text part: receivers that cannot show HTML see nothing. Add one.)' : '');
       put(previewBox, text.value || html.value ? textPreview : emptyState('No text body yet.'));

@@ -426,7 +426,7 @@ function recordsTable(records) {
     },
     { label: 'Type', cell: (r) => (r.priority ? `${r.type} ${r.priority}` : r.type) },
     { label: 'Name', class: 'col-name', cell: (r) => copyable(r.name, `${r.record} record name`) },
-    { label: 'Value', class: 'col-value', cell: (r) => copyable(r.value, `${r.record} record value`) },
+    { label: 'Value', class: 'col-value', cell: (r) => copyable(r.value, `${r.record} record value`, 72) },
     {
       label: 'Status',
       class: 'col-status',
