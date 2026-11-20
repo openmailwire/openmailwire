@@ -1,13 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Dashboard: overview, Compose, Mail
-
-- A new **overview** home page: sending rates, queue, held emails, pauses, domains needing attention, receiving, workers and recent emails, with a setup checklist for sending and receiving. It is backed by `GET /overview` (full access).
-- **Compose** sends with every option and a pre-send check; **Mail** reads every inbox the key may read, in threads, with trust badges, release and reply.
-- Pages for held emails, suppressions, pauses, project settings, insights, the audit log, DKIM rotation, DMARC/TLS reports, Cloudflare DNS setup, webhook secret rotation and every API-key field. Keyboard shortcuts, live refresh, and the same strict security rules as before.
-- On a multi-tenant install, `GET /overview` shows workers without their names, addresses or versions, except to the projects listed in `OMW_OPERATOR_PROJECTS`.
+## v0.7.0: great dashboard, send and receive out of the box, automatic DNS with Cloudflare
 
 ### Automatic DNS with Cloudflare
 - **`POST /domains/{id}/dns/auto`** `{"provider": "cloudflare", "api_token", "zone_id"?, "dry_run"?, "remember"?}` publishes every record a domain needs at Cloudflare (API v4), then verifies the domain: DKIM (with a key waiting in a rotation, the previous key during its overlap, and Ed25519), the return path's SPF and MX, DMARC, TLS-RPT (`_smtp._tls`), and the `INBOUND` MX when `OMW_INBOUND_MX` is set.
@@ -56,7 +49,7 @@ The Node, Python, Go and PHP SDKs in [`sdks/`](sdks) cover every v0.6.0 endpoint
 - The security rules are unchanged and tested: strict CSP, no HTML sinks, API data as text only, the key in `sessionStorage` only. `localStorage` holds only non-secret settings; HTML is rendered only for Compose's preview, in a frame with no permissions; a Cloudflare token never reaches storage or a URL.
 
 ### API
-- `GET /overview` (full access): queue counts and the oldest waiting recipient, sending rates for 24 hours and 7 days with daily counts, held emails, active pauses, domain health, receiving, and workers with their self-check and warm-up.
+- `GET /overview` (full access): queue counts and the oldest waiting recipient, sending rates for 24 hours and 7 days with daily counts, held emails, active pauses, domain health, receiving, and workers with their self-check and warm-up. On a multi-tenant install, workers are shown without their names, addresses or versions, except to the projects listed in `OMW_OPERATOR_PROJECTS` (a single-tenant install sees everything).
 - `GET /emails?thread_id=<id>` lists the emails of one conversation (the email and the replies sent in its thread), and echoes `thread_id`.
 - Migration `0011` adds a partial index for counting held inbound messages.
 
