@@ -191,8 +191,10 @@ func (s *Server) retireDomainDKIM(ctx context.Context, a store.DNSAutomation) er
 	for _, k := range keys {
 		n := name(k.Selector)
 		if k.State == "retiring" {
-			retiring = append(retiring, n)
 			if k.RetireAt == nil || k.RetireAt.After(now) {
+				// Still in its overlap: tracked, so that it is retired
+				// when the overlap ends.
+				retiring = append(retiring, n)
 				needed = append(needed, n)
 			}
 			continue

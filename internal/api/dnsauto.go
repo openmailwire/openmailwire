@@ -347,6 +347,16 @@ func (s *Server) wantedRecords(ctx context.Context, d store.Domain, only map[str
 	view := s.view(ctx, d)
 	bounce := s.bounceHost()
 	ra := view.ReportAddresses
+	// A rotated-out key past its overlap is listed until the sweep removes
+	// it, but its record is no longer needed (and is being retired).
+	expired := map[string]bool{}
+	if keys, err := s.Store.DKIMKeys(ctx, d.ID); err == nil {
+		for _, k := range keys {
+			if k.State == "retiring" && k.RetireAt != nil && !k.RetireAt.After(time.Now()) {
+				expired[dnsprovider.Canon(k.Selector+"._domainkey."+d.Name)] = true
+			}
+		}
+	}
 	var out []wantRecord
 	add := func(w wantRecord) {
 		if only == nil || only[w.kind] {
@@ -357,6 +367,9 @@ func (s *Server) wantedRecords(ctx context.Context, d store.Domain, only map[str
 	for _, rec := range view.Records {
 		switch rec.Record {
 		case "DKIM", "DKIM_NEXT", "DKIM_PREVIOUS", "DKIM_ED25519":
+			if expired[dnsprovider.Canon(rec.Name)] {
+				continue
+			}
 			add(wantRecord{kind: rec.Record, typ: "TXT", name: rec.Name, value: rec.Value})
 		case "SPF":
 			add(wantRecord{kind: "SPF", typ: "TXT", name: rec.Name, value: rec.Value})
